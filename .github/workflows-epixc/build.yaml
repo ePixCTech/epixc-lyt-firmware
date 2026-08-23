@@ -1,0 +1,64 @@
+name: ePixC firmware
+
+on:
+  push:
+    branches: [master, main]
+    paths:
+      - "wled00/**"
+      - "usermods/pixc_connect_blink/**"
+      - "platformio_override.ini"
+      - "tools/WLED_ESP32_8MB_epixc.csv"
+  pull_request:
+    paths:
+      - "wled00/**"
+      - "usermods/pixc_connect_blink/**"
+      - "platformio_override.ini"
+      - "tools/WLED_ESP32_8MB_epixc.csv"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: PixC_V1 (ESP32-S3)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Cache PlatformIO
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio
+            ~/.cache/pip
+          key: pio-${{ hashFiles('platformio.ini', 'platformio_override.ini') }}
+
+      - run: pip install --upgrade platformio
+
+      - name: Build
+        run: pio run -e PixC_V1
+
+      # A partition table is written by the flasher and CANNOT be changed over OTA, so a
+      # unit's layout is fixed for its life. If a build ever produces an image larger than
+      # the 3 MB slot, the fleet cannot be updated at all — and PlatformIO's own size check
+      # would only warn. Fail instead.
+      - name: Check the image fits the OTA slot
+        run: |
+          set -euo pipefail
+          BIN=$(ls build_output/release/*.bin | head -1)
+          SIZE=$(stat -c%s "$BIN")
+          SLOT=$((3 * 1024 * 1024))
+          echo "image $SIZE bytes of $SLOT ($((SIZE * 100 / SLOT))% of the slot)"
+          if [ "$SIZE" -gt "$SLOT" ]; then
+            echo "::error::Image exceeds the 3 MB OTA slot — devices in the field could not take this update."
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: epixc-firmware
+          path: build_output/release/*.bin
