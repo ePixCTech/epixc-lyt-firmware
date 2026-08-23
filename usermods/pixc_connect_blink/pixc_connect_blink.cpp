@@ -43,6 +43,8 @@ class PixcConnectBlink : public Usermod {
     unsigned long _start = 0;
     unsigned long _lastState = 0;
     unsigned long _lastHealth = 0;
+    unsigned long _lastPower = 0;
+    bool _statePending = false;      // set by onStateChange, drained in loop()
     byte _savedCol[4] = {0, 0, 0, 0};
     byte _savedBri = 0;
     uint8_t _savedFx = 0;
@@ -63,7 +65,11 @@ class PixcConnectBlink : public Usermod {
 
     static constexpr unsigned long kStateIntervalMs  = 5000;
     static constexpr unsigned long kHealthIntervalMs = 30000;
+    static constexpr unsigned long kPowerIntervalMs  = 30000;
     static constexpr unsigned long kProvisionRetryMs = 10000;
+    // A state change can be a slider being dragged. Without a floor, one drag is a
+    // publish per frame; with it, the cloud still sees the change within 250 ms.
+    static constexpr unsigned long kStateChangeMinMs = 250;
 
     // Ask the PixC API which broker to use, then point WLED's MQTT at it. The
     // broker is dynamic (dev LAN IP rotates), so it is never hardcoded — fetched.
@@ -109,11 +115,32 @@ class PixcConnectBlink : public Usermod {
 
     void publishAnnounce() {
       char buf[160];
-      const char* ledType = strip.hasWhiteChannel() ? "SK6812" : "WS2812B";
+      // led_channels, NOT a chip name. hasWhiteChannel() only reveals the channel
+      // count; it cannot tell a 5 V WS2812B from a 12 V WS2815. Publishing a guessed
+      // chip name meant the device overwrote the strip model the app had set
+      // accurately, destroying the one value the server needs to know the voltage.
+      // The app owns led_chip; the device owns led_channels, which is what it knows.
+      const char* ledChannels = strip.hasWhiteChannel() ? "RGBW" : "RGB";
       snprintf(buf, sizeof(buf),
-        "{\"fw_version\":\"%s\",\"led_type\":\"%s\",\"led_count\":%u}",
-        versionString, ledType, strip.getLengthTotal());
+        "{\"fw_version\":\"%s\",\"led_channels\":\"%s\",\"led_count\":%u}",
+        versionString, ledChannels, strip.getLengthTotal());
       publishKind("announce", buf);
+    }
+
+    // Estimated current draw. AMPS ONLY — deliberately not watts.
+    //
+    // BusManager::currentMilliamps() is WLED's Automatic Brightness Limiter estimate
+    // ("estimate used current from summed colors"); there is no shunt on the board, so
+    // this is arithmetic over the framebuffer, not a measurement. Voltage is NOT applied
+    // here: the strip could be 5 V, 12 V or 24 V, the device cannot tell, and a
+    // hardcoded 5.0 made reported power wrong by up to 4.8x. The server multiplies by
+    // the voltage implied by led_chip, so a wrong voltage is a config change instead of
+    // a fleet reflash.
+    void publishPower() {
+      char buf[96];
+      snprintf(buf, sizeof(buf), "{\"amps\":%.3f,\"estimated\":true}",
+               BusManager::currentMilliamps() / 1000.0f);
+      publishKind("power", buf);
     }
 
     void publishState() {
@@ -154,7 +181,7 @@ class PixcConnectBlink : public Usermod {
       serializeConfigToFS();
     }
 
-    // Factory reset: wipe config + Wi-Fi credentials and reboot back into PixC-AP.
+    // Factory reset: wipe config + Wi-Fi credentials and reboot back into ePixC-AP.
     void factoryReset() {
       WLED_FS.remove("/cfg.json");
       WLED_FS.remove("/wsec.json");
@@ -277,7 +304,7 @@ class PixcConnectBlink : public Usermod {
 
   public:
     void setup() override {
-      // PixC-AP is a recovery hotspot, not an always-on beacon: once the device
+      // ePixC-AP is a recovery hotspot, not an always-on beacon: once the device
       // joins the home Wi-Fi the AP is torn down (WLED shuts it on connect for
       // any non-ALWAYS behaviour). It only (re)opens when the station can't
       // connect — after the ~30s grace below — so a mispaired/dropped device is
@@ -291,11 +318,20 @@ class PixcConnectBlink : public Usermod {
         strlcpy(mqttServer, PIXC_MQTT_HOST, MQTT_MAX_SERVER_LEN + 1);
         mqttPort = PIXC_MQTT_PORT;
       }
-      // Force the PixC topic scheme before MQTT connects so WLED subscribes
-      // pixc/d/{mac}/api and publishes its LWT under the same prefix.
-      // "pixc/d/" (7) + 12-char MAC = 19 chars, within MQTT_MAX_TOPIC_LEN (32).
-      snprintf(mqttDeviceTopic, MQTT_MAX_TOPIC_LEN + 1, "pixc/d/%s",
+      // Force the ePixC topic scheme before MQTT connects so WLED subscribes
+      // epixc/v1/d/{mac}/api and publishes its LWT under the same prefix.
+      // "epixc/v1/d/" (11) + 12-char MAC = 23 chars, within MQTT_MAX_TOPIC_LEN (32).
+      // The version lives in the TOPIC, not in the payload: the topic is already the
+      // routing key, so the broker ACL, the subscriber and the version all move
+      // together, and a device publishing every few seconds carries no extra field.
+      snprintf(mqttDeviceTopic, MQTT_MAX_TOPIC_LEN + 1, "epixc/v1/d/%s",
                escapedMac.c_str());
+
+      // WLED core subscribes mqttGroupTopic plus its /col and /api children, and the
+      // default is "wled/all" — a channel EVERY device joins, on which one compromised
+      // device could command the entire fleet. Nothing in ePixC ever publishes there.
+      // The broker ACL also denies wled/#, so this is the first of two layers.
+      mqttGroupTopic[0] = 0;
     }
 
     // Called by WLED when the station connects to Wi-Fi — fetch the broker.
@@ -407,8 +443,19 @@ class PixcConnectBlink : public Usermod {
         _announced = true;
         publishAnnounce();
         publishState();
+        publishPower();
         _lastState = now;
         _lastHealth = now;
+        _lastPower = now;
+      }
+      // A state change reported by WLED — an Alexa command, a LAN call, a physical
+      // button, a preset firing. Publishing only on the timer meant any of those was
+      // invisible to the cloud for up to kStateIntervalMs, so the app could show
+      // lights on moments after they were turned off by voice.
+      if (_statePending && now - _lastState >= kStateChangeMinMs) {
+        _statePending = false;
+        _lastState = now;
+        publishState();
       }
       if (now - _lastState >= kStateIntervalMs) {
         _lastState = now;
@@ -418,6 +465,17 @@ class PixcConnectBlink : public Usermod {
         _lastHealth = now;
         publishHealth();
       }
+      if (now - _lastPower >= kPowerIntervalMs) {
+        _lastPower = now;
+        publishPower();
+      }
+    }
+
+    // WLED fires this on every state change, from led.cpp. Only a flag is set: this
+    // runs inside the state-change path, and publishing from here would put MQTT I/O
+    // on it. loop() does the actual publish.
+    void onStateChange(uint8_t) override {
+      _statePending = true;
     }
 
     uint16_t getId() override { return USERMOD_ID_UNSPECIFIED; }
