@@ -1,5 +1,7 @@
 #include "wled.h"
 #include <HTTPClient.h>
+#include <Update.h>
+#include "mbedtls/sha256.h"
 
 // PixC API host the device calls to learn its MQTT broker (see provision()).
 // In prod this is the fixed API domain; in dev it's the Mac LAN IP, pushed by
@@ -52,6 +54,12 @@ class PixcConnectBlink : public Usermod {
     uint16_t _apiPort = PIXC_API_PORT;
     bool _provisioned = false;          // got the broker from the API yet?
     unsigned long _lastProvisionTry = 0;
+
+    // OTA (cloud-triggered, MQTT-pull). The trigger arrives on `pixc/d/{mac}/ota`;
+    // the actual HTTP download + flash is deferred to loop() so it never blocks
+    // the MQTT receive callback. Progress is reported on `.../ota/progress`.
+    bool _otaPending = false;
+    String _otaJob, _otaUrl, _otaSha, _otaVer;
 
     static constexpr unsigned long kStateIntervalMs  = 5000;
     static constexpr unsigned long kHealthIntervalMs = 30000;
@@ -153,6 +161,120 @@ class PixcConnectBlink : public Usermod {
       doReboot = true;
     }
 
+    // Report OTA progress to the cloud on `pixc/d/{mac}/ota/progress`. `status`
+    // is one of downloading/installing/done/failed (pixc-mqtt treats done|failed
+    // as terminal). Failures carry the reason in `err`.
+    void publishOtaProgress(const char* status, int percent, const char* err = nullptr) {
+      if (!WLED_MQTT_CONNECTED) return;
+      char buf[224];
+      if (err && err[0]) {
+        snprintf(buf, sizeof(buf), "{\"job_id\":\"%s\",\"status\":\"%s\",\"percent\":%d,\"error\":\"%s\"}",
+                 _otaJob.c_str(), status, percent, err);
+      } else {
+        snprintf(buf, sizeof(buf), "{\"job_id\":\"%s\",\"status\":\"%s\",\"percent\":%d}",
+                 _otaJob.c_str(), status, percent);
+      }
+      publishKind("ota/progress", buf);
+    }
+
+    static void hex32(const uint8_t* d, char* out /* >=65 */) {
+      static const char* H = "0123456789abcdef";
+      for (int i = 0; i < 32; i++) { out[i*2] = H[d[i] >> 4]; out[i*2+1] = H[d[i] & 0xF]; }
+      out[64] = 0;
+    }
+
+    // Download the firmware image over HTTP and flash it to the inactive OTA
+    // partition, verifying SHA-256 before committing the new image as bootable.
+    // Streams in chunks so a ~1.8MB image fits in RAM. Blocking by design — runs
+    // from loop(), and the hardware watchdog is disabled (WLED_WATCHDOG_TIMEOUT=0).
+    void runOta() {
+      if (WiFi.status() != WL_CONNECTED || _otaUrl.length() == 0) {
+        publishOtaProgress("failed", 0, "no wifi");
+        return;
+      }
+      DEBUG_PRINTF("[PixC] OTA start v%s <- %s\n", _otaVer.c_str(), _otaUrl.c_str());
+      publishOtaProgress("downloading", 0);
+
+      WiFiClient client;
+      HTTPClient http;
+      http.setConnectTimeout(8000);
+      http.setTimeout(20000);
+      if (!http.begin(client, _otaUrl)) { publishOtaProgress("failed", 0, "begin"); return; }
+      int code = http.GET();
+      if (code != HTTP_CODE_OK) {
+        char e[24]; snprintf(e, sizeof(e), "http %d", code);
+        publishOtaProgress("failed", 0, e); http.end(); return;
+      }
+      int total = http.getSize();                       // -1 if chunked/unknown
+      if (!Update.begin(total > 0 ? (size_t)total : UPDATE_SIZE_UNKNOWN)) {
+        publishOtaProgress("failed", 0, "no space"); http.end(); return;
+      }
+
+      mbedtls_sha256_context sha;
+      mbedtls_sha256_init(&sha);
+      mbedtls_sha256_starts(&sha, 0);                   // 0 = SHA-256 (not SHA-224)
+
+      WiFiClient* stream = http.getStreamPtr();
+      uint8_t buf[1024];
+      size_t written = 0;
+      int remaining = total;
+      int lastPct = -1;
+      unsigned long lastData = millis();
+      bool ok = true;
+      const char* failMsg = nullptr;
+
+      while (http.connected() && (remaining > 0 || remaining < 0)) {
+        size_t avail = stream->available();
+        if (avail) {
+          int n = stream->readBytes(buf, avail > sizeof(buf) ? sizeof(buf) : avail);
+          if (n <= 0) { yield(); continue; }
+          if (Update.write(buf, n) != (size_t)n) { ok = false; failMsg = "flash write"; break; }
+          mbedtls_sha256_update(&sha, buf, n);
+          written += n;
+          if (remaining > 0) {
+            remaining -= n;
+            int pct = (int)((written * 90ULL) / (size_t)total);   // 0..90 while downloading
+            if (pct != lastPct && pct % 10 == 0) { publishOtaProgress("downloading", pct); lastPct = pct; }
+          }
+          lastData = millis();
+        } else {
+          if (millis() - lastData > 20000) { ok = false; failMsg = "stalled"; break; }
+          delay(1);
+        }
+        if (remaining == 0) break;
+        yield();
+      }
+      http.end();
+
+      uint8_t digest[32];
+      mbedtls_sha256_finish(&sha, digest);
+      mbedtls_sha256_free(&sha);
+
+      if (ok && _otaSha.length() == 64) {
+        char got[65]; hex32(digest, got);
+        if (!_otaSha.equalsIgnoreCase(got)) { ok = false; failMsg = "sha256 mismatch"; }
+      }
+
+      if (!ok) {
+        Update.abort();
+        DEBUG_PRINTF("[PixC] OTA failed: %s\n", failMsg ? failMsg : "?");
+        publishOtaProgress("failed", 0, failMsg);
+        return;
+      }
+
+      publishOtaProgress("installing", 95);
+      if (!Update.end(true)) {           // commit: set the new image bootable
+        char e[40]; snprintf(e, sizeof(e), "finalize %u", Update.getError());
+        publishOtaProgress("failed", 0, e);
+        return;
+      }
+
+      DEBUG_PRINTLN("[PixC] OTA done; rebooting");
+      publishOtaProgress("done", 100);
+      delay(1200);                       // let the QoS0 progress publish flush
+      doReboot = true;                   // WLED reboots from its own loop
+    }
+
   public:
     void setup() override {
       // PixC-AP is a recovery hotspot, not an always-on beacon: once the device
@@ -209,6 +331,7 @@ class PixcConnectBlink : public Usermod {
         String base = mqttDeviceTopic;
         mqtt->subscribe((base + "/cfg").c_str(), 0);
         mqtt->subscribe((base + "/reset").c_str(), 0);
+        mqtt->subscribe((base + "/ota").c_str(), 0);
       }
 
       if (!_blinkDone) {
@@ -235,6 +358,19 @@ class PixcConnectBlink : public Usermod {
         factoryReset();
         return true;
       }
+      // Exact `/ota` (not `/ota/progress`, which we only publish). Stage the job
+      // and let loop() run the blocking download/flash.
+      if (base + "/ota" == topic) {
+        DynamicJsonDocument doc(512);
+        if (!deserializeJson(doc, payload)) {
+          _otaJob = (const char*)(doc["job_id"] | "");
+          _otaUrl = (const char*)(doc["url"] | "");
+          _otaVer = (const char*)(doc["version"] | "");
+          _otaSha = (const char*)(doc["sha256"] | "");
+          if (_otaUrl.length() > 0 && !_otaPending) _otaPending = true;
+        }
+        return true;
+      }
       return false;
     }
 
@@ -258,6 +394,14 @@ class PixcConnectBlink : public Usermod {
       }
 
       if (!WLED_MQTT_CONNECTED) return;
+
+      // A cloud OTA was staged by onMqttMessage — run it now (blocking) so it
+      // stays off the MQTT receive callback.
+      if (_otaPending) {
+        _otaPending = false;
+        runOta();
+        return;
+      }
 
       if (!_announced) {
         _announced = true;
