@@ -2,7 +2,7 @@
 
 #include <stddef.h>
 
-/// GET [url] over TLS, verifying the server against the pinned ISRG Root X1 and nothing else.
+/// GET [url] over TLS, verifying the server against the two pinned roots and nothing else.
 ///
 /// Returns the number of body bytes written to [out], or -1 on any failure — a failed handshake, a
 /// certificate that does not chain to the pinned root, a non-200 status, or an empty body.

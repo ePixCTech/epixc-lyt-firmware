@@ -22,10 +22,11 @@ int pixcHttpsGet(const char* url, char* out, size_t cap) {
   // The one line that makes this worth doing. Without `cert_pem` the client completes a handshake
   // with any certificate, so an https:// URL on its own proves nothing at all.
   //
-  // Pinned at the ROOT rather than the leaf or intermediate: a leaf pin breaks every 90 days when
-  // Let's Encrypt renews, and fixing that needs an OTA that depends on the connection which just
-  // broke. Flash is memory-mapped on ESP32, so the PROGMEM array is directly usable here.
-  cfg.cert_pem = PIXC_ISRG_ROOT_X1;
+  // Two roots, pinned at the root rather than the leaf: ISRG Root X1 for a Caddy-terminated
+  // Let's Encrypt certificate, GTS Root R4 for Cloudflare's edge. Which one a device meets depends
+  // on whether the DNS record is proxied — see pixc_roots.h. Flash is memory-mapped on ESP32, so
+  // the PROGMEM array is directly usable here with no copy to RAM.
+  cfg.cert_pem = PIXC_TRUSTED_ROOTS;
   cfg.timeout_ms = 8000;
   // A redirect is another host answering the question of which broker to trust, which is the
   // question this whole path exists to answer safely.
@@ -40,8 +41,8 @@ int pixcHttpsGet(const char* url, char* out, size_t cap) {
   if (err != ESP_OK) {
     // Overwhelmingly a certificate that did not chain to the pinned root, or an unreachable host.
     // Named explicitly because the bare error code has sent people looking at Wi-Fi for hours.
-    ESP_LOGW(TAG, "provisioning refused: TLS failed (%s) - certificate did not chain to the "
-                  "pinned ISRG Root X1, or the host is unreachable", esp_err_to_name(err));
+    ESP_LOGW(TAG, "provisioning refused: TLS failed (%s) - certificate did not chain to either "
+                  "pinned root, or the host is unreachable", esp_err_to_name(err));
     esp_http_client_cleanup(c);
     return -1;
   }

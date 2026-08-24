@@ -4,21 +4,36 @@
 // is directly readable — which is what lets `cert_pem` point straight at it with no copy to RAM.
 #include <pgmspace.h>
 
-// ISRG Root X1 — the Let's Encrypt root that anchors api.epixc.in.
+// The roots ePixC devices trust, as one bundle.
 //
-// Pinned at the ROOT, not at the leaf or the intermediate. A leaf pin breaks every 90 days when
-// Let's Encrypt renews, and an intermediate pin breaks whenever they rotate one — both turn a
-// certificate renewal into a fleet-wide outage that can only be fixed by an OTA that itself
-// depends on the connection that just broke. The root is valid to 2035-06-04.
+// mbedTLS's `x509_crt_parse` accepts concatenated PEMs and stops at the first that validates the
+// chain, so a bundle is simply a two-entry trust store. Kept as one array rather than two because
+// two PROGMEM literals cannot be concatenated at compile time, and building the bundle on the heap
+// during a handshake is memory the handshake needs.
 //
-// ~1.9 KB of PROGMEM against 2 MB spare in the slot.
+// **Two roots, not one.** Ticket 10 decided this before there was evidence for it: baking exactly
+// one root means a CA transition takes the fleet offline, and Let's Encrypt has rearranged its
+// roots before. The evidence arrived on 2026-08-25 and is sharper than the argument — `epixc.in`
+// resolves to Cloudflare (104.21.x / 172.67.x) and is served by **Google Trust Services WE1,
+// chaining to GTS Root R4**, not by Let's Encrypt at all.
 //
-// Ticket 33 chose this over signing the provisioning response, because response signing inherits
-// ticket 16's unresolved key decision and D34 — the S3's mbedTLS has no Ed25519 — so it would have
-// traded a fixable problem for a blocked one.
+// So which root a device needs turns on something nobody would file as a firmware decision:
+// **whether `api.epixc.in` is proxied through Cloudflare or DNS-only.** Deployment says DNS-only,
+// with Caddy terminating TLS on the box and taking a Let's Encrypt certificate — ISRG Root X1. The
+// apex is proxied and gives GTS Root R4. Enabling the orange cloud for `api.epixc.in`, which is one
+// click in a dashboard, would otherwise stop every controller provisioning, silently.
 //
-// Source: https://letsencrypt.org/certs/isrgrootx1.pem
-static const char PIXC_ISRG_ROOT_X1[] PROGMEM = R"EOF(
+// Both are pinned at the **root**, never the leaf or intermediate: a leaf pin breaks at every
+// 90-day renewal, and repairing that needs an OTA over the connection that just broke.
+//
+// ~2 KB of PROGMEM against a slot that is 48% used.
+//
+// Sources: https://letsencrypt.org/certs/isrgrootx1.pem  (ISRG Root X1, valid to 2035-06-04)
+//          https://i.pki.goog/r4.crt                     (GTS Root R4,  valid to 2036-06-22)
+// Fetched from each CA's own endpoint rather than scraped from a served chain: what a server
+// presents may be a cross-signed variant of the same key, and a trust store holds the self-signed
+// root.
+static const char PIXC_TRUSTED_ROOTS[] PROGMEM = R"CERTS(
 -----BEGIN CERTIFICATE-----
 MIIFazCCA1OgAwIBAgIRAIIQz7DSQONZRGPgu2OCiwAwDQYJKoZIhvcNAQELBQAw
 TzELMAkGA1UEBhMCVVMxKTAnBgNVBAoTIEludGVybmV0IFNlY3VyaXR5IFJlc2Vh
@@ -50,4 +65,17 @@ oyi3B43njTOQ5yOf+1CceWxG1bQVs5ZufpsMljq4Ui0/1lvh+wjChP4kqKOJ2qxq
 mRGunUHBcnWEvgJBQl9nJEiU0Zsnvgc/ubhPgXRR4Xq37Z0j4r7g1SgEEzwxA57d
 emyPxgcYxn/eR44/KJ4EBs+lVDR3veyJm+kXQ99b21/+jh5Xos1AnX5iItreGCc=
 -----END CERTIFICATE-----
-)EOF";
+-----BEGIN CERTIFICATE-----
+MIICCTCCAY6gAwIBAgINAgPlwGjvYxqccpBQUjAKBggqhkjOPQQDAzBHMQswCQYD
+VQQGEwJVUzEiMCAGA1UEChMZR29vZ2xlIFRydXN0IFNlcnZpY2VzIExMQzEUMBIG
+A1UEAxMLR1RTIFJvb3QgUjQwHhcNMTYwNjIyMDAwMDAwWhcNMzYwNjIyMDAwMDAw
+WjBHMQswCQYDVQQGEwJVUzEiMCAGA1UEChMZR29vZ2xlIFRydXN0IFNlcnZpY2Vz
+IExMQzEUMBIGA1UEAxMLR1RTIFJvb3QgUjQwdjAQBgcqhkjOPQIBBgUrgQQAIgNi
+AATzdHOnaItgrkO4NcWBMHtLSZ37wWHO5t5GvWvVYRg1rkDdc/eJkTBa6zzuhXyi
+QHY7qca4R9gq55KRanPpsXI5nymfopjTX15YhmUPoYRlBtHci8nHc8iMai/lxKvR
+HYqjQjBAMA4GA1UdDwEB/wQEAwIBhjAPBgNVHRMBAf8EBTADAQH/MB0GA1UdDgQW
+BBSATNbrdP9JNqPV2Py1PsVq8JQdjDAKBggqhkjOPQQDAwNpADBmAjEA6ED/g94D
+9J+uHXqnLrmvT/aDHQ4thQEd0dlq7A/Cr8deVl5c1RxYIigL9zC2L7F8AjEA8GE8
+p/SgguMh1YQdc4acLa/KNJvxn7kjNuK8YAOdgLOaVsjh4rsUecrNIdSUtUlD
+-----END CERTIFICATE-----
+)CERTS";
