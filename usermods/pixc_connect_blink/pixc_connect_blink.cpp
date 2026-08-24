@@ -3,15 +3,22 @@
 #include <Update.h>
 #include "mbedtls/sha256.h"
 
-// PixC API host the device calls to learn its MQTT broker (see provision()).
-// In prod this is the fixed API domain; in dev it's the Mac LAN IP, pushed by
-// the app during pairing via usermod config (um.PixcConnect.apiHost). The
-// broker location itself is NOT hardcoded — it is fetched from the API.
+// ePixC API host the device calls to learn its MQTT broker (see provision()).
+// Normally written by the app during pairing (um.PixcConnect.apiHost); this is
+// only the fallback for a unit that never completed setup. The broker itself is
+// never hardcoded — it is always fetched from this API.
+//
+// The default used to be "api.pixc.app", a domain ePixC does not own. Anyone who
+// registered it would have been asked, by every un-paired unit, which MQTT broker
+// to connect to. The real host is api.epixc.in (see deploy/caddy/Caddyfile).
+//
+// The dev LAN address lives in the PixC_V1_dev build env, not here, so it cannot
+// reach a release build by being the value someone forgot to change back.
 #ifndef PIXC_API_HOST
-  #define PIXC_API_HOST "api.pixc.app"
+  #define PIXC_API_HOST "api.epixc.in"
 #endif
 #ifndef PIXC_API_PORT
-  #define PIXC_API_PORT 8080
+  #define PIXC_API_PORT 443
 #endif
 // Last-resort broker fallback ONLY if the API can't be reached at all.
 #ifndef PIXC_MQTT_HOST
@@ -75,6 +82,22 @@ class PixcConnectBlink : public Usermod {
     // broker is dynamic (dev LAN IP rotates), so it is never hardcoded — fetched.
     void fetchProvisionConfig() {
       if (WiFi.status() != WL_CONNECTED || _apiHost.length() == 0) return;
+
+      // This call decides which MQTT broker the device trusts, and it is still
+      // plaintext HTTP with an unverified reply — so anyone on the same Wi-Fi can
+      // answer first and name their own broker, bypassing both the per-device
+      // credential and MQTT TLS. Ticket 33 replaces it with HTTPS and a pinned
+      // ISRG Root X1; that needs a bench unit to validate the handshake, the same
+      // wait ticket 10's TLS work is in.
+      //
+      // Until then: REFUSE to speak plaintext to a TLS port. Doing it anyway would
+      // send a provisioning request in the clear to :443, fail confusingly, and
+      // hide the fact that the fallback host is unreachable by design right now.
+      if (_apiPort == 443) {
+        DEBUG_PRINTLN(F("[ePixC] provisioning skipped: port 443 needs TLS (ticket 33)"));
+        return;
+      }
+
       char url[200];
       snprintf(url, sizeof(url), "http://%s:%u/api/v1/provision?mac=%s",
                _apiHost.c_str(), _apiPort, escapedMac.c_str());
