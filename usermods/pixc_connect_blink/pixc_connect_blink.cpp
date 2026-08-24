@@ -2,6 +2,9 @@
 #include <HTTPClient.h>
 #include <Update.h>
 #include "mbedtls/sha256.h"
+// esp_reset_reason(). Reached through Arduino's headers on ESP32 anyway, but named here because
+// this file uses it directly and an implicit include is a trap when the framework moves.
+#include <esp_system.h>
 
 // ePixC API host the device calls to learn its MQTT broker (see provision()).
 // Normally written by the app during pairing (um.PixcConnect.apiHost); this is
@@ -52,6 +55,10 @@ class PixcConnectBlink : public Usermod {
     unsigned long _lastHealth = 0;
     unsigned long _lastPower = 0;
     bool _statePending = false;      // set by onStateChange, drained in loop()
+    // Whether the boot event has gone out yet. One per power cycle, not per MQTT reconnect:
+    // "this unit restarted" and "this unit lost the broker for a moment" are different facts and
+    // support needs to tell them apart.
+    bool _bootReported = false;
     byte _savedCol[4] = {0, 0, 0, 0};
     byte _savedBri = 0;
     uint8_t _savedFx = 0;
@@ -176,6 +183,41 @@ class PixcConnectBlink : public Usermod {
         colPri[0], colPri[1], colPri[2], colPri[3], effectCurrent,
         seg.palette, seg.speed, seg.intensity);
       publishKind("state", buf);
+    }
+
+    // Something worth writing down happened. Lands in `device_events` via the gateway and is read
+    // back by the app's device history.
+    //
+    // The topic has been ingested since the broker cutover and **nothing has ever published it**,
+    // so the table could only ever be empty. Two events to start, both answering the question
+    // support actually gets when a customer says "it stopped working": did it restart, and did it
+    // lose Wi-Fi.
+    void publishEvent(const char* type, const char* extraJson = nullptr) {
+      char buf[192];
+      if (extraJson != nullptr) {
+        snprintf(buf, sizeof(buf), "{\"type\":\"%s\",%s}", type, extraJson);
+      } else {
+        snprintf(buf, sizeof(buf), "{\"type\":\"%s\"}", type);
+      }
+      publishKind("event", buf);
+    }
+
+    // Why this boot happened, in esp_reset_reason()'s terms. A panic or a brownout loop is the
+    // single most useful thing to know about a unit that "keeps going offline", and it is
+    // indistinguishable from a Wi-Fi problem from the outside.
+    static const char* resetReasonName() {
+      switch (esp_reset_reason()) {
+        case ESP_RST_POWERON:  return "power_on";
+        case ESP_RST_SW:       return "software";
+        case ESP_RST_PANIC:    return "panic";
+        case ESP_RST_INT_WDT:  return "int_watchdog";
+        case ESP_RST_TASK_WDT: return "task_watchdog";
+        case ESP_RST_WDT:      return "watchdog";
+        case ESP_RST_BROWNOUT: return "brownout";
+        case ESP_RST_DEEPSLEEP:return "deep_sleep";
+        case ESP_RST_EXT:      return "external";
+        default:               return "unknown";
+      }
     }
 
     void publishHealth() {
@@ -381,6 +423,20 @@ class PixcConnectBlink : public Usermod {
 
     void onMqttConnect(bool /*sessionPresent*/) override {
       _announced = false; // re-announce on every (re)connect
+
+      // First broker connection since power-on is a boot; every later one is a reconnect. The
+      // uptime is carried because it turns "it rebooted" into "it rebooted four minutes in",
+      // which is the difference between a power problem and a firmware one.
+      char extra[128];
+      if (!_bootReported) {
+        _bootReported = true;
+        snprintf(extra, sizeof(extra), "\"reason\":\"%s\",\"fw_version\":\"%s\"",
+                 resetReasonName(), versionString);
+        publishEvent("boot", extra);
+      } else {
+        snprintf(extra, sizeof(extra), "\"uptime\":%lu", (unsigned long)(millis() / 1000));
+        publishEvent("reconnect", extra);
+      }
 
       // Subscribe the PixC control subtopics the core doesn't handle. `/api`
       // (state commands) is subscribed by WLED core; `/cfg` carries config
