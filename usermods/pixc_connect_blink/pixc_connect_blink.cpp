@@ -5,6 +5,10 @@
 // esp_reset_reason(). Reached through Arduino's headers on ESP32 anyway, but named here because
 // this file uses it directly and an implicit include is a trap when the framework moves.
 #include <esp_system.h>
+// The TLS fetch lives in its own translation unit: ESP-IDF's HTTP client header and
+// ESPAsyncWebServer both declare HTTP_GET/HTTP_PATCH, and a WLED usermod needs both. See
+// pixc_https.cpp for why Arduino's WiFiClientSecure is not an option here.
+#include "pixc_https.h"
 
 // ePixC API host the device calls to learn its MQTT broker (see provision()).
 // Normally written by the app during pairing (um.PixcConnect.apiHost); this is
@@ -85,56 +89,85 @@ class PixcConnectBlink : public Usermod {
     // publish per frame; with it, the cloud still sees the change within 250 ms.
     static constexpr unsigned long kStateChangeMinMs = 250;
 
-    // Ask the PixC API which broker to use, then point WLED's MQTT at it. The
-    // broker is dynamic (dev LAN IP rotates), so it is never hardcoded — fetched.
+    // Ask the ePixC API which broker to use, then point WLED's MQTT at it. The broker is dynamic
+    // (the bench Mac's address rotates, and production can move it without reflashing), so it is
+    // never hardcoded — always fetched.
+    //
+    // **This call decides which MQTT broker the device trusts**, which makes it the most
+    // security-sensitive request the firmware makes: whoever answers it names the broker, and a
+    // wrong answer bypasses both the per-device credential and MQTT TLS at once. Ticket 33.
+    //
+    // Production therefore goes over **HTTPS with a pinned ISRG Root X1** and refuses on a failed
+    // chain. It never falls back to plaintext — a fallback would mean an attacker who can break
+    // the TLS connection (trivially, by refusing it) gets the plaintext path back, which is the
+    // same as having no TLS at all.
+    //
+    // Port 80/8080 stays plaintext for bench work. That is deliberate and safe in the shipped
+    // build because `default_envs` names only `PixC_V1`, whose compiled default is
+    // `api.epixc.in:443`; the LAN address lives in `PixC_V1_dev`, which a release build cannot
+    // reach.
     void fetchProvisionConfig() {
       if (WiFi.status() != WL_CONNECTED || _apiHost.length() == 0) return;
 
-      // This call decides which MQTT broker the device trusts, and it is still
-      // plaintext HTTP with an unverified reply — so anyone on the same Wi-Fi can
-      // answer first and name their own broker, bypassing both the per-device
-      // credential and MQTT TLS. Ticket 33 replaces it with HTTPS and a pinned
-      // ISRG Root X1; that needs a bench unit to validate the handshake, the same
-      // wait ticket 10's TLS work is in.
-      //
-      // Until then: REFUSE to speak plaintext to a TLS port. Doing it anyway would
-      // send a provisioning request in the clear to :443, fail confusingly, and
-      // hide the fact that the fallback host is unreachable by design right now.
-      if (_apiPort == 443) {
-        DEBUG_PRINTLN(F("[ePixC] provisioning skipped: port 443 needs TLS (ticket 33)"));
+      const bool useTls = (_apiPort == 443);
+
+      // A TLS handshake needs roughly 40 KB of heap for the record buffers and the certificate
+      // chain. Attempting one below that does not fail cleanly — it fails somewhere inside
+      // mbedTLS. Better to skip and retry in ten seconds, by which time whatever ate the heap may
+      // have finished.
+      if (useTls && ESP.getFreeHeap() < 50000) {
+        DEBUG_PRINTF("[ePixC] provisioning deferred: %u bytes free, need ~50k for TLS\n",
+                     (unsigned)ESP.getFreeHeap());
         return;
       }
 
       char url[200];
-      snprintf(url, sizeof(url), "http://%s:%u/api/v1/provision?mac=%s",
-               _apiHost.c_str(), _apiPort, escapedMac.c_str());
+      snprintf(url, sizeof(url), "%s://%s:%u/api/v1/provision?mac=%s",
+               useTls ? "https" : "http", _apiHost.c_str(), _apiPort, escapedMac.c_str());
+
+      char body[768];
+      const int len = useTls ? pixcHttpsGet(url, body, sizeof(body))
+                             : httpGet(url, body, sizeof(body));
+      if (len <= 0) return;
+
+      DynamicJsonDocument doc(640);
+      if (deserializeJson(doc, body, len)) return;
+      JsonObject d = doc["data"].isNull() ? doc.as<JsonObject>() : doc["data"].as<JsonObject>();
+      // API serializes snake_case (mqtt_host/mqtt_port); accept camelCase too.
+      const char* host = d["mqtt_host"] | (d["mqttHost"] | "");
+      int port = d["mqtt_port"] | (d["mqttPort"] | PIXC_MQTT_PORT);
+      if (host && strlen(host) > 0) {
+        strlcpy(mqttServer, host, MQTT_MAX_SERVER_LEN + 1);
+        mqttPort = port;
+        mqttEnabled = true;
+        _provisioned = true;
+        DEBUG_PRINTF("[ePixC] broker from API over %s: %s:%d\n",
+                     useTls ? "HTTPS" : "HTTP", mqttServer, mqttPort);
+        // Force WLED to (re)connect MQTT to the new broker.
+        if (mqtt != nullptr && mqtt->connected()) mqtt->disconnect();
+        initMqtt();
+      }
+    }
+
+    // Plaintext GET, bench only. Reached only when the port is not 443, which a release build
+    // cannot arrange: `default_envs` names `PixC_V1`, whose compiled host is api.epixc.in:443.
+    int httpGet(const char* url, char* out, size_t cap) {
       WiFiClient client;
       HTTPClient http;
       http.setConnectTimeout(4000);
-      if (!http.begin(client, url)) return;
-      int code = http.GET();
-      if (code == 200) {
-        DynamicJsonDocument doc(640);
-        if (!deserializeJson(doc, http.getString())) {
-          JsonObject d = doc["data"].isNull() ? doc.as<JsonObject>()
-                                              : doc["data"].as<JsonObject>();
-          // API serializes snake_case (mqtt_host/mqtt_port); accept camelCase too.
-          const char* host = d["mqtt_host"] | (d["mqttHost"] | "");
-          int port = d["mqtt_port"] | (d["mqttPort"] | PIXC_MQTT_PORT);
-          if (host && strlen(host) > 0) {
-            strlcpy(mqttServer, host, MQTT_MAX_SERVER_LEN + 1);
-            mqttPort = port;
-            mqttEnabled = true;
-            _provisioned = true;
-            DEBUG_PRINTF("[PixC] broker from API: %s:%d\n", mqttServer, mqttPort);
-            // Force WLED to (re)connect MQTT to the new broker.
-            if (mqtt != nullptr && mqtt->connected()) mqtt->disconnect();
-            initMqtt();
-          }
-        }
+      if (!http.begin(client, url)) return -1;
+      int len = -1;
+      if (http.GET() == 200) {
+        String payload = http.getString();
+        len = payload.length() < cap ? payload.length() : cap - 1;
+        memcpy(out, payload.c_str(), len);
+        out[len] = 0;
       }
       http.end();
+      return len;
     }
+
+
 
     void publishKind(const char* kind, const char* payload) {
       if (!WLED_MQTT_CONNECTED) return;
