@@ -66,6 +66,10 @@ class PixcConnectBlink : public Usermod {
     unsigned long _lastHealth = 0;
     unsigned long _lastPower = 0;
     bool _statePending = false;      // set by onStateChange, drained in loop()
+    // Last seen realtimeMode, so a stream starting or stopping publishes immediately instead of
+    // waiting for the 5 s timer. WLED does not call onStateChange for realtime lock: the segment
+    // config never changes, only what is being drawn over it.
+    uint8_t _lastRealtime = 0;
     // Whether the boot event has gone out yet. One per power cycle, not per MQTT reconnect:
     // "this unit restarted" and "this unit lost the broker for a moment" are different facts and
     // support needs to tell them apart.
@@ -220,15 +224,44 @@ class PixcConnectBlink : public Usermod {
       publishKind("power", buf);
     }
 
+    // WLED's name for whatever is streaming, matching the strings its own UI shows so the app and
+    // the device's web page never disagree about what took the strip over.
+    static const char* realtimeSourceName(uint8_t mode) {
+      switch (mode) {
+        case REALTIME_MODE_UDP:      return "UDP";
+        case REALTIME_MODE_HYPERION: return "Hyperion";
+        case REALTIME_MODE_E131:     return "E1.31";
+        case REALTIME_MODE_ADALIGHT: return "USB Adalight/TPM2";
+        case REALTIME_MODE_ARTNET:   return "Art-Net";
+        case REALTIME_MODE_TPM2NET:  return "tpm2.net";
+        case REALTIME_MODE_DDP:      return "DDP";
+        case REALTIME_MODE_DMX:      return "DMX";
+        default:                     return "";
+      }
+    }
+
     void publishState() {
-      char buf[224];
+      char buf[288];
       Segment& seg = strip.getSegment(strip.getMainSegmentId());
-      // WLED-native shape (pixc-mqtt prefers on/bri/seg[].col/fx).
+      // `live` is not decoration, and it is not the same question as `on`.
+      //
+      // While something streams over DDP or E1.31, WLED holds a realtimeLock and draws that
+      // instead of the segment. Everything else in this payload — bri, col, fx — is the
+      // *configured* state, which is no longer what is on the strip. Without this flag the cloud
+      // cannot tell the difference, so the app confidently showed the last colour it set while a
+      // PC played video on the wall, and a brightness drag appeared to work and changed nothing
+      // anyone could see. Ticket 37.
+      //
+      // `lor` (WLED's live override) is reported too, because it decides who wins: with an
+      // override set, cloud commands do take effect despite the stream.
       snprintf(buf, sizeof(buf),
-        "{\"on\":%s,\"bri\":%u,\"seg\":[{\"col\":[[%u,%u,%u,%u]],\"fx\":%u,\"pal\":%u,\"sx\":%u,\"ix\":%u}]}",
+        "{\"on\":%s,\"bri\":%u,\"seg\":[{\"col\":[[%u,%u,%u,%u]],\"fx\":%u,\"pal\":%u,\"sx\":%u,\"ix\":%u}]"
+        ",\"live\":%s,\"live_source\":\"%s\",\"live_override\":%u}",
         (bri > 0 ? "true" : "false"), bri,
         colPri[0], colPri[1], colPri[2], colPri[3], effectCurrent,
-        seg.palette, seg.speed, seg.intensity);
+        seg.palette, seg.speed, seg.intensity,
+        (realtimeMode ? "true" : "false"), realtimeSourceName(realtimeMode),
+        (unsigned)realtimeOverride);
       publishKind("state", buf);
     }
 
@@ -681,6 +714,13 @@ class PixcConnectBlink : public Usermod {
       // button, a preset firing. Publishing only on the timer meant any of those was
       // invisible to the cloud for up to kStateIntervalMs, so the app could show
       // lights on moments after they were turned off by voice.
+      // A stream starting or stopping is a state change WLED never reports, because the segment
+      // config is untouched — only what is drawn over it changes. Publishing on the 5 s timer alone
+      // meant up to five seconds of the app showing a colour that is not on the wall.
+      if (realtimeMode != _lastRealtime) {
+        _lastRealtime = realtimeMode;
+        _statePending = true;
+      }
       if (_statePending && now - _lastState >= kStateChangeMinMs) {
         _statePending = false;
         _lastState = now;
