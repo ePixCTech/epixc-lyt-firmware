@@ -2,6 +2,10 @@
 #include <HTTPClient.h>
 #include <Update.h>
 #include "mbedtls/sha256.h"
+#include "mbedtls/pk.h"
+#include "mbedtls/md.h"
+// The public half of the firmware signing key. Empty by default, which refuses every update.
+#include "pixc_ota_pubkey.h"
 // esp_reset_reason(). Reached through Arduino's headers on ESP32 anyway, but named here because
 // this file uses it directly and an implicit include is a trap when the framework moves.
 #include <esp_system.h>
@@ -79,7 +83,7 @@ class PixcConnectBlink : public Usermod {
     // the actual HTTP download + flash is deferred to loop() so it never blocks
     // the MQTT receive callback. Progress is reported on `.../ota/progress`.
     bool _otaPending = false;
-    String _otaJob, _otaUrl, _otaSha, _otaVer;
+    String _otaJob, _otaUrl, _otaSha, _otaVer, _otaSigUrl;
 
     static constexpr unsigned long kStateIntervalMs  = 5000;
     static constexpr unsigned long kHealthIntervalMs = 30000;
@@ -308,6 +312,55 @@ class PixcConnectBlink : public Usermod {
       out[64] = 0;
     }
 
+    // Fetch the detached signature for the image being installed.
+    //
+    // Small — a P-256 signature is 70-72 bytes of DER — so it is read whole rather than streamed.
+    // Fetched *after* the image so a signature cannot be swapped between the check and the flash:
+    // both come from the same URLs the same command named.
+    bool fetchSignature(uint8_t* out, size_t cap, size_t* outLen) {
+      if (_otaSigUrl.length() == 0) return false;
+      WiFiClient client;
+      HTTPClient http;
+      http.setConnectTimeout(8000);
+      http.setTimeout(10000);
+      if (!http.begin(client, _otaSigUrl)) return false;
+      if (http.GET() != HTTP_CODE_OK) { http.end(); return false; }
+      int len = http.getSize();
+      if (len <= 0 || (size_t)len > cap) { http.end(); return false; }
+      int got = http.getStreamPtr()->readBytes(out, (size_t)len);
+      http.end();
+      if (got != len) return false;
+      *outLen = (size_t)len;
+      return true;
+    }
+
+    // Verify a detached ECDSA P-256 signature over the image's SHA-256 digest.
+    //
+    // This is the check that makes an OTA safe to apply: the SHA-256 alone only proves the image
+    // arrived intact from whoever sent it, and the digest travels in the same MQTT command as the
+    // URL. The signature proves it came from the holder of the ePixC signing key, which no broker,
+    // proxy or DNS answer can forge.
+    //
+    // Returns a failure reason, or nullptr when the image is trustworthy.
+    const char* verifySignature(const uint8_t* digest) {
+      if (sizeof(PIXC_OTA_PUBKEY_PEM) <= 1) return "no signing key in firmware";
+
+      uint8_t sig[80];
+      size_t sigLen = 0;
+      if (!fetchSignature(sig, sizeof(sig), &sigLen)) return "signature fetch";
+
+      mbedtls_pk_context pk;
+      mbedtls_pk_init(&pk);
+      // The length includes the terminating NUL: mbedtls treats a PEM as a NUL-counted buffer.
+      int rc = mbedtls_pk_parse_public_key(&pk, (const unsigned char*)PIXC_OTA_PUBKEY_PEM,
+                                           sizeof(PIXC_OTA_PUBKEY_PEM));
+      if (rc != 0) { mbedtls_pk_free(&pk); return "bad signing key"; }
+
+      rc = mbedtls_pk_verify(&pk, MBEDTLS_MD_SHA256, digest, 32, sig, sigLen);
+      mbedtls_pk_free(&pk);
+      return rc == 0 ? nullptr : "signature mismatch";
+    }
+
     // Download the firmware image over HTTP and flash it to the inactive OTA
     // partition, verifying SHA-256 before committing the new image as bootable.
     // Streams in chunks so a ~1.8MB image fits in RAM. Blocking by design — runs
@@ -375,9 +428,25 @@ class PixcConnectBlink : public Usermod {
       mbedtls_sha256_finish(&sha, digest);
       mbedtls_sha256_free(&sha);
 
-      if (ok && _otaSha.length() == 64) {
-        char got[65]; hex32(digest, got);
-        if (!_otaSha.equalsIgnoreCase(got)) { ok = false; failMsg = "sha256 mismatch"; }
+      // Integrity first, then provenance. The digest is cheap and rules out a truncated download
+      // before a signature check that costs a round trip.
+      //
+      // The digest is required now rather than checked only when present: it used to be skipped
+      // entirely if the command carried no `sha256`, so a command with the field omitted flashed
+      // whatever arrived.
+      if (ok) {
+        if (_otaSha.length() != 64) {
+          ok = false;
+          failMsg = "no sha256 in command";
+        } else {
+          char got[65]; hex32(digest, got);
+          if (!_otaSha.equalsIgnoreCase(got)) { ok = false; failMsg = "sha256 mismatch"; }
+        }
+      }
+
+      if (ok) {
+        const char* sigFail = verifySignature(digest);
+        if (sigFail != nullptr) { ok = false; failMsg = sigFail; }
       }
 
       if (!ok) {
@@ -515,6 +584,9 @@ class PixcConnectBlink : public Usermod {
           _otaUrl = (const char*)(doc["url"] | "");
           _otaVer = (const char*)(doc["version"] | "");
           _otaSha = (const char*)(doc["sha256"] | "");
+          // The signature the image has to carry. The gateway has always sent this field and the
+          // firmware ignored it, which is why an unsigned image was applied without complaint.
+          _otaSigUrl = (const char*)(doc["sig_url"] | "");
           if (_otaUrl.length() > 0 && !_otaPending) _otaPending = true;
         }
         return true;
