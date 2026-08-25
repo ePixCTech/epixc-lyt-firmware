@@ -1,0 +1,172 @@
+# ePixC firmware CI. THIS FILE IS OURS, NOT UPSTREAM'S.
+#
+# It has to live in .github/workflows/ because that is the only directory GitHub Actions scans.
+# It sat in .github/workflows-epixc/ from c7fe580d until now, to keep upstream merges clean, which
+# meant it never ran once — and neither did the OTA size gate below, the one check in this repo
+# whose failure mode is a fleet that can never be updated again.
+#
+# The filename is the merge-conflict defence instead. Upstream WLED's workflow files are
+# build.yml, nightly.yml, pr-merge.yaml, release.yml, stale.yml, test.yaml, usermods.yml and
+# wled-ci.yml; nothing upstream is or plausibly will be prefixed "epixc-". So an upstream merge
+# adds and changes files beside this one and never touches it.
+#
+# If a future merge does somehow conflict here: KEEP THIS FILE. It is not an ePixC edit of an
+# upstream workflow, it is a separate workflow that only ePixC has. Do not modify or disable the
+# stock WLED workflows to make room for it — they are upstream's and stay untouched.
+
+name: ePixC firmware
+
+on:
+  push:
+    branches: [master, main, dev]
+  pull_request:
+    branches: [master, main, dev]
+  workflow_dispatch:
+
+# Deliberately no `paths:` filter. The size gate is the point of this workflow, and the inputs that
+# move image size are not confined to a listable set of directories — platformio.ini and
+# pio-scripts/ arrive through upstream merges, package.json sets the version in the artifact name,
+# usermods/audioreactive/ is compiled in. A path list that misses one of those does not fail; it
+# silently skips the gate, which is the failure this workflow exists to prevent. A wasted CI minute
+# is the cheaper mistake.
+#
+# Also deliberately no tag trigger: upstream WLED tags releases here (see release.yml, `tags: '*'`)
+# and an ePixC build has no business running on those.
+
+permissions:
+  contents: read
+
+concurrency:
+  group: epixc-firmware-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # Every stock WLED workflow in this repo sets this; the actions here are the same vintage.
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  build:
+    name: PixC_V1 (ESP32-S3)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # pio-scripts/build_ui.py runs `npm ci` and `npm run build` as a pre-action and aborts the
+      # build if node is missing, so the web UI toolchain is a hard dependency of `pio run`, not an
+      # optional extra. Pin it to .nvmrc rather than taking whatever the runner image ships.
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: ".nvmrc"
+          cache: "npm"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Cache PlatformIO
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio/.cache
+            ~/.buildcache
+          key: pio-${{ runner.os }}-PixC_V1-${{ hashFiles('platformio.ini', 'platformio_override.ini') }}
+          restore-keys: pio-${{ runner.os }}-PixC_V1-
+
+      # requirements.txt pins platformio==6.1.17, which is the version this fork's build is known
+      # to work under. `pip install --upgrade platformio` floated to whatever was newest that day.
+      - name: Install PlatformIO
+        run: pip install -r requirements.txt
+
+      # build_output/ is where pio-scripts/output_bins.py drops the release copy, and it is
+      # gitignored, so a cached or reused workspace could leave an older binary sitting there for
+      # the gate to measure instead. Start empty.
+      - name: Clear previous build output
+        run: rm -rf build_output
+
+      - name: Build
+        run: pio run -e PixC_V1
+
+      # A partition table is written by the flasher and CANNOT be changed over OTA, so a unit's
+      # layout is fixed for its life. If a build ever produces an image larger than the OTA slot,
+      # the fleet cannot be updated at all — and PlatformIO's own size check would only warn.
+      # Fail instead.
+      #
+      # The slot size is read from the partition binary this build just produced, not hardcoded, so
+      # the gate cannot drift from tools/WLED_ESP32_8MB_epixc.csv — and the CSV is checked against
+      # that binary too, in case board_build.partitions ever stops pointing at it and the board's
+      # own default_8MB.csv (larger app slots) silently takes over.
+      - name: Check the image fits the OTA slot
+        run: |
+          python3 - <<'PY'
+          import glob, hashlib, os, struct, sys
+
+          ENV = "PixC_V1"
+          CSV = "tools/WLED_ESP32_8MB_epixc.csv"
+          build_dir = os.path.join(".pio", "build", ENV)
+          app_bin = os.path.join(build_dir, "firmware.bin")
+          part_bin = os.path.join(build_dir, "partitions.bin")
+
+          def fail(msg):
+              print(f"::error::{msg}")
+              sys.exit(1)
+
+          for path in (app_bin, part_bin):
+              if not os.path.isfile(path):
+                  fail(f"{path} is missing — the build did not produce what this gate measures")
+
+          # Parse the flashed partition table. Entries are 32 bytes, magic 0xAA 0x50.
+          built = {}
+          blob = open(part_bin, "rb").read()
+          for i in range(0, len(blob), 32):
+              entry = blob[i:i + 32]
+              if entry[:2] != b"\xaa\x50":
+                  break
+              ptype, subtype = entry[2], entry[3]
+              _offset, size = struct.unpack("<II", entry[4:12])
+              name = entry[12:28].rstrip(b"\x00").decode()
+              if ptype == 0x00 and subtype in (0x10, 0x11):   # app / ota_0, ota_1
+                  built[name] = size
+          if not built:
+              fail("the built partition table declares no OTA app slots")
+
+          # The same numbers as read from the CSV in the repo, so the two cannot disagree unnoticed.
+          declared = {}
+          for line in open(CSV):
+              line = line.split("#", 1)[0].strip()
+              if not line:
+                  continue
+              cols = [c.strip() for c in line.split(",")]
+              if len(cols) >= 5 and cols[1] == "app":
+                  declared[cols[0]] = int(cols[4], 0)
+          if declared != built:
+              fail(f"{CSV} declares {declared} but the build flashed {built} — "
+                   "board_build.partitions is not pointing at the ePixC table")
+
+          slot = min(built.values())
+          size = os.path.getsize(app_bin)
+
+          # The uploaded artifact is what a device is actually asked to swallow. Prove it is the
+          # image just measured, not a leftover from another env or an earlier version — PixC_V1
+          # and PixC_V1_dev share WLED_RELEASE_NAME and so land on the same release filename.
+          release = sorted(glob.glob("build_output/release/*.bin"))
+          if len(release) != 1:
+              fail(f"expected exactly one release binary, found {release}")
+          sha = lambda p: hashlib.sha256(open(p, "rb").read()).hexdigest()
+          if sha(release[0]) != sha(app_bin):
+              fail(f"{release[0]} is not the image this build produced")
+
+          print("partitions: " + ", ".join(f"{n} {s} bytes" for n, s in sorted(built.items())))
+          print(f"artifact:   {release[0]}")
+          print(f"image {size} bytes of {slot} ({size * 100 // slot}% of the slot)")
+          if size > slot:
+              fail("Image exceeds the OTA slot — devices in the field could not take this update.")
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: epixc-firmware
+          # The map goes with it: when the size gate does eventually fire, the map is what says why.
+          path: |
+            build_output/release/*.bin
+            build_output/map/PixC_V1.map
