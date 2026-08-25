@@ -155,7 +155,16 @@
 
 #include "src/dependencies/e131/ESPAsyncE131.h"
 #ifndef WLED_DISABLE_MQTT
-#include <AsyncMqttClient.h>
+  #ifdef PIXC_MQTT_ESP_IDF
+    // AsyncMqttClient cannot do TLS on the ESP32 — `setSecure()` is compiled out unless
+    // ASYNC_TCP_SSL_ENABLED, and AsyncTCP for this chip has no SSL to enable. ePixC's broker is
+    // TLS-only. `PixcMqttClient` presents the same surface over ESP-IDF's esp-mqtt, so everything
+    // below this line is unchanged and there is still exactly one connection.
+    #include "pixc_mqtt_client.h"
+    using AsyncMqttClient = PixcMqttClient;
+  #else
+    #include <AsyncMqttClient.h>
+  #endif
 #endif
 
 #define ARDUINOJSON_DECODE_UNICODE 0
@@ -502,7 +511,7 @@ WLED_GLOBAL bool mqttEnabled _INIT(false);
 WLED_GLOBAL char mqttStatusTopic[MQTT_MAX_TOPIC_LEN + 8] _INIT("");         // this must be global because of async handlers
 WLED_GLOBAL char mqttDeviceTopic[MQTT_MAX_TOPIC_LEN + 1] _INIT("");         // main MQTT topic (individual per device, default is wled/mac)
 WLED_GLOBAL char mqttGroupTopic[MQTT_MAX_TOPIC_LEN + 1]  _INIT("wled/all"); // second MQTT topic (for example to group devices)
-WLED_GLOBAL char mqttServer[MQTT_MAX_SERVER_LEN + 1]     _INIT("");         // both domains and IPs should work (no SSL)
+WLED_GLOBAL char mqttServer[MQTT_MAX_SERVER_LEN + 1]     _INIT("");         // domains and IPs both work; TLS when the port is 8883 (PIXC_MQTT_ESP_IDF)
 WLED_GLOBAL char mqttUser[41] _INIT("");                   // optional: username for MQTT auth
 WLED_GLOBAL char mqttPass[65] _INIT("");                   // optional: password for MQTT auth
 WLED_GLOBAL char mqttClientID[41] _INIT("");               // override the client ID
