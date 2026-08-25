@@ -9,6 +9,9 @@
 // esp_reset_reason(). Reached through Arduino's headers on ESP32 anyway, but named here because
 // this file uses it directly and an implicit include is a trap when the framework moves.
 #include <esp_system.h>
+// esp_ota_get_state_partition() / esp_ota_mark_app_valid_cancel_rollback(): the app half of
+// bootloader rollback. See _confirmImageIfPending().
+#include <esp_ota_ops.h>
 // The TLS fetch lives in its own translation unit: ESP-IDF's HTTP client header and
 // ESPAsyncWebServer both declare HTTP_GET/HTTP_PATCH, and a WLED usermod needs both. See
 // pixc_https.cpp for why Arduino's WiFiClientSecure is not an option here.
@@ -67,6 +70,13 @@ class PixcConnectBlink : public Usermod {
     // "this unit restarted" and "this unit lost the broker for a moment" are different facts and
     // support needs to tell them apart.
     bool _bootReported = false;
+
+    // True when this boot is running an image the bootloader has marked PENDING_VERIFY — i.e. a
+    // freshly installed OTA that will be rolled back on the next boot unless this firmware says it
+    // is working. False on an ordinary boot, and also on a build whose bootloader does not have
+    // rollback compiled in, which is why it is reported rather than assumed.
+    bool _awaitingConfirm = false;
+    bool _confirmed = false;
     byte _savedCol[4] = {0, 0, 0, 0};
     byte _savedBri = 0;
     uint8_t _savedFx = 0;
@@ -478,6 +488,16 @@ class PixcConnectBlink : public Usermod {
       // still reachable for re-provisioning.
       apBehavior = AP_BEHAVIOR_NO_CONN;
       mqttEnabled = true;
+
+      // Is this boot on probation? Only true when the bootloader actually armed rollback, which
+      // makes this a runtime fact rather than a claim about a prebuilt binary: the Tasmota
+      // framework this fork used to build against had CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE off,
+      // so the rollback API linked and did nothing.
+      esp_ota_img_states_t otaState;
+      const esp_partition_t* running = esp_ota_get_running_partition();
+      if (running != nullptr && esp_ota_get_state_partition(running, &otaState) == ESP_OK) {
+        _awaitingConfirm = (otaState == ESP_OTA_IMG_PENDING_VERIFY);
+      }
       // Broker is NOT hardcoded — it is fetched from the PixC API (see
       // fetchProvisionConfig) on every Wi-Fi connect. Only seed the last-resort
       // fallback if a build-time broker was explicitly provided.
@@ -523,22 +543,47 @@ class PixcConnectBlink : public Usermod {
       return true;
     }
 
+    // Tell the bootloader this image works, so it stops being a candidate for rollback.
+    //
+    // "Works" is defined as: it reached the broker. That is the whole point of the firmware — a
+    // build that boots but cannot talk to the cloud is exactly the build that should be rolled
+    // back, and it is the failure a bad OTA most plausibly produces. Confirming in setup(), which
+    // is the obvious place, would confirm every image including one that never connects again.
+    void confirmImageIfPending() {
+      if (!_awaitingConfirm || _confirmed) return;
+      _confirmed = true;
+      if (esp_ota_mark_app_valid_cancel_rollback() == ESP_OK) {
+        DEBUG_PRINTLN("[PixC] OTA image confirmed; rollback cancelled");
+      } else {
+        DEBUG_PRINTLN("[PixC] OTA image confirm FAILED; this image may be rolled back");
+      }
+    }
+
     void onMqttConnect(bool /*sessionPresent*/) override {
       _announced = false; // re-announce on every (re)connect
 
       // First broker connection since power-on is a boot; every later one is a reconnect. The
       // uptime is carried because it turns "it rebooted" into "it rebooted four minutes in",
       // which is the difference between a power problem and a firmware one.
-      char extra[128];
+      char extra[192];
       if (!_bootReported) {
         _bootReported = true;
-        snprintf(extra, sizeof(extra), "\"reason\":\"%s\",\"fw_version\":\"%s\"",
-                 resetReasonName(), versionString);
+        // `rollback_armed` says whether the bootloader put this image on probation. It is the only
+        // honest way to know: the API links either way, and with the option off nothing ever
+        // reverts. A fleet where this is false everywhere is a fleet with no rollback, whatever the
+        // build was supposed to do.
+        snprintf(extra, sizeof(extra),
+                 "\"reason\":\"%s\",\"fw_version\":\"%s\",\"rollback_armed\":%s",
+                 resetReasonName(), versionString, _awaitingConfirm ? "true" : "false");
         publishEvent("boot", extra);
       } else {
         snprintf(extra, sizeof(extra), "\"uptime\":%lu", (unsigned long)(millis() / 1000));
         publishEvent("reconnect", extra);
       }
+
+      // Reaching the broker is the proof. Done after the event publish so the record of this boot
+      // exists before the image stops being reversible.
+      confirmImageIfPending();
 
       // Subscribe the PixC control subtopics the core doesn't handle. `/api`
       // (state commands) is subscribed by WLED core; `/cfg` carries config
