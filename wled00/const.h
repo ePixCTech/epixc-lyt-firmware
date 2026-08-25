@@ -44,7 +44,10 @@ constexpr size_t  WLED_MAX_USERMOD_PALETTES     = WLED_USERMOD_PALETTE_ID_BASE -
 
 //Defaults
 #define DEFAULT_CLIENT_SSID "Your_Network"
-#define DEFAULT_AP_SSID     "ePixC-AP"
+// The brand half of the softAP name, kept separate so it is written once. The unique-SSID
+// build in wled.h appends a MAC suffix to this base instead of repeating the name.
+#define DEFAULT_AP_BASE     "ePixC"
+#define DEFAULT_AP_SSID     DEFAULT_AP_BASE "-AP"
 #define DEFAULT_AP_PASS     "wled1234"
 #define DEFAULT_OTA_PASS    "wledota"
 #define DEFAULT_MDNS_NAME   "x"

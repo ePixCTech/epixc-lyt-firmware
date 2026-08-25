@@ -229,6 +229,10 @@ using PSRAMDynamicJsonDocument = BasicJsonDocument<PSRAM_Allocator>;
   #define WLED_AP_SSID DEFAULT_AP_SSID
 #endif
 
+#ifndef WLED_AP_BASE
+  #define WLED_AP_BASE DEFAULT_AP_BASE
+#endif
+
 #ifndef WLED_AP_PASS
   #define WLED_AP_PASS DEFAULT_AP_PASS
 #endif
@@ -1044,7 +1048,7 @@ WLED_GLOBAL volatile uint8_t jsonBufferLock _INIT(0);
       apSSID, \
       sizeof(apSSID)-1, \
       PSTR("%s-%s"), \
-      "PixC", \
+      WLED_AP_BASE, \
       escapedMac.c_str()+6 \
     ); \
   } while(0)
