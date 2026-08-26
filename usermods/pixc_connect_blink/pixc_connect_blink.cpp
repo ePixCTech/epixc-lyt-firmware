@@ -99,6 +99,28 @@ class PixcConnectBlink : public Usermod {
     bool _otaPending = false;
     String _otaJob, _otaUrl, _otaSha, _otaVer, _otaSigUrl;
 
+    // True when this image was built with no signing key baked in. Compile-time constant, so the
+    // release build pays nothing for it and the branches below vanish.
+    //
+    // Derived from the key itself, not from EPIXC_OTA_UNSIGNED_DEV_BUILD: the flag says what
+    // someone intended, the key says what actually got compiled in, and only the second one
+    // decides whether verifySignature() can ever return nullptr. On such an image OTA is not
+    // "likely to fail" — every update is refused, permanently, and the only fix is a cable.
+    static constexpr bool kOtaDisabled = (sizeof(PIXC_OTA_PUBKEY_PEM) <= 1);
+
+    // The version this firmware reports — to the app, to the cloud, and to whoever is reading a
+    // support ticket. An image that can never take an update says so here, because this is the
+    // one field every consumer of a device's state already looks at. Without it, a bench build
+    // and a shipping build are distinguishable only by reading the binary, and a dev image
+    // flashed onto a customer unit would look exactly like a healthy one until the day an update
+    // was published and that single device silently refused it.
+    static const char* fwVersion() {
+      if (!kOtaDisabled) return versionString;
+      static char v[WLED_VERSION_MAX_LEN + 16];
+      if (v[0] == '\0') snprintf(v, sizeof(v), "%s-UNSIGNED-DEV", versionString);
+      return v;
+    }
+
     static constexpr unsigned long kStateIntervalMs  = 5000;
     static constexpr unsigned long kHealthIntervalMs = 30000;
     static constexpr unsigned long kPowerIntervalMs  = 30000;
@@ -204,7 +226,7 @@ class PixcConnectBlink : public Usermod {
       const char* ledChannels = strip.hasWhiteChannel() ? "RGBW" : "RGB";
       snprintf(buf, sizeof(buf),
         "{\"fw_version\":\"%s\",\"led_channels\":\"%s\",\"led_count\":%u}",
-        versionString, ledChannels, strip.getLengthTotal());
+        fwVersion(), ledChannels, strip.getLengthTotal());
       publishKind("announce", buf);
     }
 
@@ -309,7 +331,7 @@ class PixcConnectBlink : public Usermod {
         "{\"rssi\":%d,\"signal\":%d,\"ssid\":\"%s\",\"ip\":\"%s\",\"free_heap\":%u,\"uptime\":%lu,\"fw_version\":\"%s\"}",
         (int)WiFi.RSSI(), signal, ssid.c_str(), ip.c_str(),
         (unsigned)ESP.getFreeHeap(),
-        (unsigned long)(millis() / 1000), versionString);
+        (unsigned long)(millis() / 1000), fwVersion());
       publishKind("health", buf);
     }
 
@@ -514,6 +536,18 @@ class PixcConnectBlink : public Usermod {
 
   public:
     void setup() override {
+      // Say it out loud, once, at boot. The build-time guard in pixc_ota_pubkey.h means nobody
+      // reaches this state by accident — only by setting EPIXC_OTA_UNSIGNED_DEV_BUILD — but the
+      // image outlives the decision, and the person holding the board later is not necessarily
+      // the person who built it.
+      if (kOtaDisabled) {
+        DEBUG_PRINTLN(F("[ePixC] ********************************************************"));
+        DEBUG_PRINTLN(F("[ePixC] *  UNSIGNED DEV BUILD - NO OTA SIGNING KEY COMPILED IN  *"));
+        DEBUG_PRINTLN(F("[ePixC] *  Every firmware update WILL BE REFUSED on this unit.  *"));
+        DEBUG_PRINTLN(F("[ePixC] *  Not shippable. Do not flash onto a customer device.  *"));
+        DEBUG_PRINTLN(F("[ePixC] ********************************************************"));
+      }
+
       // ePixC-AP is a recovery hotspot, not an always-on beacon: once the device
       // joins the home Wi-Fi the AP is torn down (WLED shuts it on connect for
       // any non-ALWAYS behaviour). It only (re)opens when the station can't
@@ -607,7 +641,7 @@ class PixcConnectBlink : public Usermod {
         // build was supposed to do.
         snprintf(extra, sizeof(extra),
                  "\"reason\":\"%s\",\"fw_version\":\"%s\",\"rollback_armed\":%s",
-                 resetReasonName(), versionString, _awaitingConfirm ? "true" : "false");
+                 resetReasonName(), fwVersion(), _awaitingConfirm ? "true" : "false");
         publishEvent("boot", extra);
       } else {
         snprintf(extra, sizeof(extra), "\"uptime\":%lu", (unsigned long)(millis() / 1000));

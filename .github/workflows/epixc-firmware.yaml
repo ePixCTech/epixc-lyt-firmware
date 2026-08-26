@@ -84,6 +84,83 @@ jobs:
       - name: Clear previous build output
         run: rm -rf build_output
 
+      # The public half of the ePixC firmware signing key, baked into the image.
+      #
+      # It is NOT committed: usermods/pixc_connect_blink/pixc_ota_pubkey.h ships with an empty
+      # default, and a static_assert in that header refuses to compile it. That is deliberate —
+      # an empty key means the device rejects every update, and until now the only place that
+      # showed up was a customer's device after an update had already been published.
+      #
+      # So the release build fails here, in about ten seconds, instead of there.
+      #
+      # >>> THE FOUNDER MUST CREATE THIS REPOSITORY SECRET, NAMED EXACTLY:
+      # >>>
+      # >>>     EPIXC_OTA_PUBKEY_PEM
+      # >>>
+      # >>> Value: the PEM public half of the ePixC signing key, whole, including the BEGIN and
+      # >>> END lines — the output of
+      # >>>
+      # >>>     openssl pkey -inform DER -in ota-sec1.der -pubout -outform PEM
+      # >>>
+      # >>> which is the same key material as ADMIN_SIGNING_PUBKEY_B64 in
+      # >>> epixc-backend/deploy/.env.example, in PEM rather than base64-DER. It must be the
+      # >>> public half of the SAME pair the admin service signs with, or every device will
+      # >>> reject every update this pipeline produces.
+      # >>>
+      # >>> The PRIVATE half never comes near GitHub. A public key in a repository secret is not
+      # >>> secret-keeping, it is just the only place a workflow can read a value from; publishing
+      # >>> it would cost nothing, since it is compiled into every shipped binary anyway.
+      #
+      # Secrets are not exposed to workflows triggered by a pull request from a fork, so this step
+      # fails there. That is the correct outcome for this repo — a fork cannot produce a shippable
+      # ePixC image — and the message below says so rather than looking like a broken build.
+      - name: Bake in the OTA signing public key
+        env:
+          OTA_PUBKEY_PEM: ${{ secrets.EPIXC_OTA_PUBKEY_PEM }}
+        run: |
+          set -euo pipefail
+          if [ -z "${OTA_PUBKEY_PEM}" ]; then
+            echo "::error::Repository secret EPIXC_OTA_PUBKEY_PEM is not set (or this is a fork PR, which cannot read secrets). Without it the firmware is built with no signing key and would refuse every OTA update once installed. Create the secret from: openssl pkey -inform DER -in ota-sec1.der -pubout -outform PEM"
+            exit 1
+          fi
+          printf '%s\n' "${OTA_PUBKEY_PEM}" > "${RUNNER_TEMP}/ota_pub.pem"
+
+          # Prove it is the curve both halves agree on before it is compiled in. A wrong curve
+          # parses fine on the device and then fails to verify anything the admin service signs.
+          if ! openssl pkey -pubin -in "${RUNNER_TEMP}/ota_pub.pem" -noout -text | grep -q 'NIST CURVE: P-256'; then
+            echo "::error::EPIXC_OTA_PUBKEY_PEM is not an ECDSA P-256 public key. The device verifies with mbedTLS and the admin service signs SHA256withECDSA over prime256v1; nothing else interoperates."
+            exit 1
+          fi
+
+          python3 - <<'PY'
+          import os
+
+          header = "usermods/pixc_connect_blink/pixc_ota_pubkey.h"
+          pem = open(os.path.join(os.environ["RUNNER_TEMP"], "ota_pub.pem")).read().strip()
+
+          # One C string literal per PEM line, trailing newline included: mbedtls_pk_parse_public
+          # _key is handed sizeof(), so the PEM has to be NUL-terminated and newline-terminated.
+          lines = [l.strip() for l in pem.splitlines() if l.strip()]
+          define = "#define PIXC_OTA_PUBKEY_PEM \\\n" + " \\\n".join(
+              '  "%s\\n"' % l for l in lines)
+
+          src = open(header).read()
+          empty = '#define PIXC_OTA_PUBKEY_PEM ""'
+          if src.count(empty) != 1:
+              raise SystemExit(
+                  "::error::%s no longer contains exactly one empty-key define; this step patches "
+                  "it by exact text and must not guess" % header)
+          open(header, "w").write(src.replace(empty, define))
+          print("baked in a %d-line P-256 public key" % len(lines))
+          PY
+
+          # Belt and braces: the build would fail on the static_assert anyway, but a patch step
+          # that silently no-ops is exactly the class of thing this whole change is about.
+          if grep -q '^#define PIXC_OTA_PUBKEY_PEM ""' usermods/pixc_connect_blink/pixc_ota_pubkey.h; then
+            echo "::error::the signing key was not written into the header; the build would produce an image that refuses every OTA"
+            exit 1
+          fi
+
       - name: Build
         run: pio run -e PixC_V1
 
@@ -147,8 +224,9 @@ jobs:
           size = os.path.getsize(app_bin)
 
           # The uploaded artifact is what a device is actually asked to swallow. Prove it is the
-          # image just measured, not a leftover from another env or an earlier version — PixC_V1
-          # and PixC_V1_dev share WLED_RELEASE_NAME and so land on the same release filename.
+          # image just measured, not a leftover from another env or an earlier version. PixC_V1_dev
+          # now carries its own WLED_RELEASE_NAME (..._UNSIGNED_DEV) so the two no longer collide
+          # on one filename, which makes a stray bench binary here visible rather than confusable.
           release = sorted(glob.glob("build_output/release/*.bin"))
           if len(release) != 1:
               fail(f"expected exactly one release binary, found {release}")
@@ -161,6 +239,49 @@ jobs:
           print(f"image {size} bytes of {slot} ({size * 100 // slot}% of the slot)")
           if size > slot:
               fail("Image exceeds the OTA slot — devices in the field could not take this update.")
+          PY
+
+      # Bootloader rollback is the other half of a safe OTA: without it, an image that flashes
+      # successfully and then cannot reach the broker is a brick until someone drives to it.
+      #
+      # It is not a source-level decision. It is CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE in the
+      # sdkconfig of whichever prebuilt Arduino framework the build linked against, and this fork
+      # has TWO candidates installed at different times: the Tasmota fork of arduino-esp32 has it
+      # OFF, upstream espressif32 has it ON. `esp_ota_mark_app_valid_cancel_rollback()` links and
+      # returns ESP_OK either way, so the difference is invisible in the code and invisible at
+      # build time, and only shows as `rollback_armed: false` on a device's boot event — which is
+      # to say, in the field.
+      #
+      # The framework is read out of the map file this build just produced, so this cannot drift
+      # from what was actually linked.
+      - name: Check bootloader rollback is compiled in
+        run: |
+          python3 - <<'PY'
+          import glob, os, re, sys
+
+          mapfile = "build_output/map/PixC_V1.map"
+          if not os.path.isfile(mapfile):
+              print(f"::error::{mapfile} is missing — cannot tell which framework was linked")
+              sys.exit(1)
+
+          pkgs = set(re.findall(r"packages/(framework-arduinoespressif32[^/\s]*)", open(mapfile, errors="ignore").read()))
+          if len(pkgs) != 1:
+              print(f"::error::expected exactly one Arduino framework package in the link, found {sorted(pkgs)}")
+              sys.exit(1)
+          pkg = pkgs.pop()
+
+          hits = glob.glob(os.path.expanduser(f"~/.platformio/packages/{pkg}/tools/**/esp32s3/sdkconfig"), recursive=True)
+          if len(hits) != 1:
+              print(f"::error::could not locate a single esp32s3 sdkconfig in {pkg}, found {hits}")
+              sys.exit(1)
+
+          cfg = open(hits[0]).read()
+          if "CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y" not in cfg:
+              print(f"::error::{pkg} was built with CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE off. "
+                    "A failed OTA would leave the device on the broken image with no automatic "
+                    "revert, and nothing in the firmware can compensate — the bootloader is prebuilt.")
+              sys.exit(1)
+          print(f"{pkg}: CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y")
           PY
 
       - uses: actions/upload-artifact@v4
