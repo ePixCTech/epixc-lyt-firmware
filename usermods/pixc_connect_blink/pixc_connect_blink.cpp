@@ -20,6 +20,9 @@
 // ESPAsyncWebServer both declare HTTP_GET/HTTP_PATCH, and a WLED usermod needs both. See
 // pixc_https.cpp for why Arduino's WiFiClientSecure is not an option here.
 #include "pixc_https.h"
+// The RGB/RGBW width table, and the build-time assertion that the compiled-in bus is a width the
+// cloud is able to set. Read the header before touching applyLedWidth().
+#include "pixc_led_bus.h"
 
 // ePixC API host the device calls to learn its MQTT broker (see provision()).
 // Normally written by the app during pairing (um.PixcConnect.apiHost); this is
@@ -78,6 +81,13 @@ class PixcConnectBlink : public Usermod {
     // "this unit restarted" and "this unit lost the broker for a moment" are different facts and
     // support needs to tell them apart.
     bool _bootReported = false;
+
+    // A config push changed the bus width and the re-init has not finished yet. The cloud's record
+    // of `led_channels` is written from the announce, so until this goes out the server still
+    // believes the device is whatever width it was before — and `led_channels` is the only
+    // evidence anywhere that the push actually landed. Set by applyLedWidth(), drained in loop()
+    // once WLED::loop() has cleared doInitBusses.
+    bool _reannouncePending = false;
 
     // True when this boot is running an image the bootloader has marked PENDING_VERIFY — i.e. a
     // freshly installed OTA that will be rolled back on the next boot unless this firmware says it
@@ -359,9 +369,88 @@ class PixcConnectBlink : public Usermod {
       publishKind("health", buf);
     }
 
+    // Put the LED bus on the width the cloud says the customer's reel is: "RGB" or "RGBW".
+    //
+    // The device keeps its own wiring. Pin, length, colour order, reversal, skip, frequency and
+    // both current limits are read back off the LIVE buses and handed straight back — the only
+    // fields this rewrites are the bus type and the auto-white mode. That is the whole reason the
+    // cloud sends a two-value string instead of an `hw.led.ins` array: it cannot express a pin, so
+    // it cannot get one wrong. See pixc_led_bus.h.
+    //
+    // Returns true if a re-init was staged.
+    //
+    // The equality check at the top is load-bearing, not an optimisation. This runs on EVERY
+    // config push, and a config push happens whenever anything about the device changes in the
+    // cloud — a rename, a room move, a brightness plan. Re-initialising the buses tears down and
+    // rebuilds them (WLED::loop() -> WS2812FX::finalizeInit(), wled00/wled.cpp:217-226), and with
+    // `autoSegments` on, makeAutoSegments() clears and rebuilds the segment list
+    // (wled00/FX_fcn.cpp:1988-1998). Doing that on every rename would drop a customer's segments
+    // because they renamed their lamp. So: same width, no work, no visible event at all.
+    bool applyLedWidth(const char* channels) {
+      const pixc_led_bus::Width* want = pixc_led_bus::find(channels);
+      if (want == nullptr) return false;   // unknown width: leave the strip exactly as it is
+
+      size_t busCount = BusManager::getNumBusses();
+      if (busCount == 0) return false;
+
+      // The auto-white mode counts as part of the width, not as a separate preference. It decides
+      // where the white byte comes from, and a four-channel bus with the wrong mode is a strip
+      // whose white die is driven by the wrong thing — which is a fault of the same kind as not
+      // driving it at all.
+      //
+      // It is also the state some units are already in. The app used to rewrite the bus over the
+      // LAN with rgbwm=1 (AUTO_BRIGHTER), which derives white from RGB and *ignores* the app's own
+      // white value — so on those units the white control was plumbed end to end and did nothing.
+      // Comparing the mode as well as the type is what lets a push correct them; comparing only
+      // the type would leave them alone forever, because their type is already right.
+      //
+      // The cost is that a mode set by hand in WLED's own LED settings page is overwritten by the
+      // next cloud push. That is the deliberate consequence of the cloud owning the width.
+      bool changed = false;
+      for (size_t i = 0; i < busCount; i++) {
+        const Bus* bus = BusManager::getBus(i);
+        if (bus == nullptr) continue;
+        // getType() keeps bit 7 (the off-refresh hack); the width lives in the low seven bits.
+        if ((bus->getType() & 0x7F) != want->type ||
+            bus->getAutoWhiteMode() != want->autoWhite) { changed = true; break; }
+      }
+      if (!changed) return false;
+
+      // Rebuild the staged config from the live buses. busConfigs is a leftover-prone global —
+      // WLED's own deserializer appends to it without clearing (wled00/cfg.cpp:220-253), so two
+      // pushes inside one loop iteration would produce duplicate buses. Clear it first.
+      busConfigs.clear();
+      for (size_t i = 0; i < busCount; i++) {
+        const Bus* bus = BusManager::getBus(i);
+        if (bus == nullptr) break;
+        uint8_t pins[OUTPUT_MAX_PINS] = {255, 255, 255, 255, 255};
+        bus->getPins(pins);
+        // Bit 7 back on if this bus needed off-refresh, because BusConfig's constructor reads the
+        // flag out of the type byte rather than taking it separately.
+        uint8_t type = want->type | (bus->isOffRefreshRequired() ? 0x80 : 0x00);
+        busConfigs.emplace_back(type, pins, bus->getStart(), bus->getLength(),
+                                bus->getColorOrder(), bus->isReversed(), bus->skippedLeds(),
+                                want->autoWhite, bus->getFrequency(), bus->getLEDCurrent(),
+                                bus->getMaxCurrent(), bus->getDriverType());
+      }
+      // Finalisation is deferred to WLED::loop(), which is also where the result gets written to
+      // cfg.json (configNeedsWrite). Doing it here would tear the buses down underneath whatever
+      // is drawing.
+      doInitBusses = true;
+      _reannouncePending = true;
+      DEBUG_PRINTF("[ePixC] LED bus -> %s (type %u, aw %u)\n",
+                   want->channels, (unsigned)want->type, (unsigned)want->autoWhite);
+      return true;
+    }
+
     // Apply a WLED config fragment pushed by the cloud over `pixc/d/{mac}/cfg`
     // (power plan -> def.bri, restore-on-power -> def.on, slow-fade -> light.tr.dur).
     // Only native WLED cfg keys take effect; unknown keys are ignored safely.
+    //
+    // `pixc.led_channels` is the one exception: a key the core knows nothing about, read here.
+    // The cloud has to be able to say how wide the strip is, and there is no native WLED cfg key
+    // that says it without also saying which pin it is on — which the cloud has no business
+    // knowing. See pixc_led_bus.h for the boundary and why it is drawn there.
     void applyCfg(const char* payload) {
       // This WLED fork uses ArduinoJson v6 — JsonDocument is abstract; use a
       // sized DynamicJsonDocument. The cfg fragment (def/light/pixc) is small.
@@ -369,7 +458,15 @@ class PixcConnectBlink : public Usermod {
       if (deserializeJson(doc, payload)) return;
       JsonObject root = doc.as<JsonObject>();
       deserializeConfig(root, false);
-      serializeConfigToFS();
+
+      bool busChange = applyLedWidth(root["pixc"]["led_channels"] | (const char*)nullptr);
+
+      // Only write now if the buses are staying put. When they are not, WLED::loop() re-inits them
+      // and sets configNeedsWrite itself, and serializing at this moment would persist the buses
+      // as they are about to stop being — the width would be correct in RAM and stale on flash
+      // until the next push. WLED's own deserializer refuses the save for the same reason
+      // (wled00/cfg.cpp:770).
+      if (!busChange) serializeConfigToFS();
     }
 
     // Factory reset: wipe config + Wi-Fi credentials and reboot back into ePixC-AP.
@@ -865,6 +962,23 @@ class PixcConnectBlink : public Usermod {
         _lastHealth = now;
         _lastPower = now;
       }
+      // A bus-width change has finished re-initialising. Say so.
+      //
+      // `led_channels` is device-reported by design — it is the one part of the strip's identity
+      // the device can actually observe (strip.hasWhiteChannel()). That property is now also the
+      // only receipt that a width push worked: the cloud asked for RGBW, and this is the device
+      // answering with what it ended up on. If the re-init fell back to a placeholder bus for want
+      // of memory (wled00/FX_fcn.cpp:1231-1236) the announce says RGB, and the disagreement is
+      // visible in the devices table instead of only on the customer's wall.
+      //
+      // Gated on doInitBusses because WLED::loop() runs the re-init AFTER usermods
+      // (wled00/wled.cpp:82 vs :217), so on the iteration the push arrives the buses are still the
+      // old ones. One extra loop is nothing; announcing the old width would be wrong forever.
+      if (_reannouncePending && !doInitBusses) {
+        _reannouncePending = false;
+        publishAnnounce();
+      }
+
       // A state change reported by WLED — an Alexa command, a LAN call, a physical
       // button, a preset firing. Publishing only on the timer meant any of those was
       // invisible to the cloud for up to kStateIntervalMs, so the app could show
