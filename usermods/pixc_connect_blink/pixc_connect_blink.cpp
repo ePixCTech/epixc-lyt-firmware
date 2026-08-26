@@ -384,18 +384,11 @@ class PixcConnectBlink : public Usermod {
     // both come from the same URLs the same command named.
     bool fetchSignature(uint8_t* out, size_t cap, size_t* outLen) {
       if (_otaSigUrl.length() == 0) return false;
-      WiFiClient client;
-      HTTPClient http;
-      http.setConnectTimeout(8000);
-      http.setTimeout(10000);
-      if (!http.begin(client, _otaSigUrl)) return false;
-      if (http.GET() != HTTP_CODE_OK) { http.end(); return false; }
-      int len = http.getSize();
-      if (len <= 0 || (size_t)len > cap) { http.end(); return false; }
-      int got = http.getStreamPtr()->readBytes(out, (size_t)len);
-      http.end();
-      if (got != len) return false;
-      *outLen = (size_t)len;
+      // Over TLS against the pinned roots, like the image, and read by LENGTH rather than as a
+      // string: a DER signature contains NUL bytes, so anything that NUL-terminates corrupts it.
+      const int got = pixcHttpsGetBinary(_otaSigUrl.c_str(), out, cap, 10000);
+      if (got <= 0) return false;
+      *outLen = (size_t)got;
       return true;
     }
 
@@ -426,68 +419,110 @@ class PixcConnectBlink : public Usermod {
       return rc == 0 ? nullptr : "signature mismatch";
     }
 
-    // Download the firmware image over HTTP and flash it to the inactive OTA
-    // partition, verifying SHA-256 before committing the new image as bootable.
-    // Streams in chunks so a ~1.8MB image fits in RAM. Blocking by design — runs
-    // from loop(), and the hardware watchdog is disabled (WLED_WATCHDOG_TIMEOUT=0).
+    // Download the firmware image over TLS and flash it to the inactive OTA partition, verifying
+    // SHA-256 and then the detached signature before committing the new image as bootable.
+    // Streams in chunks so a ~1.8MB image never has to fit in RAM. Blocking by design — runs from
+    // loop(), and the hardware watchdog is disabled (WLED_WATCHDOG_TIMEOUT=0).
+    //
+    // **Why this is TLS with the same pinned roots as everything else**, rather than the plaintext
+    // fetch it used to be, or a deliberately weaker transport chosen to keep CA risk apart.
+    //
+    // It used to build a bare `WiFiClient` and hand it to `HTTPClient::begin()` with an https URL.
+    // That call ACCEPTS the scheme — it sets `_port = 443` and `_secure = true` and returns true —
+    // but `_secure` only ever reaches cookie handling; `connect()` calls `_client->connect()` on
+    // the plain client it was given. So the device opened a TCP socket to Caddy's TLS listener and
+    // wrote a plaintext request into it. That connection cannot complete, which means the cloud
+    // OTA download could never have worked against production at all.
+    //
+    // The reflex worry about fixing it this way is blast radius: PIXC_TRUSTED_ROOTS also gates the
+    // provisioning fetch, `PixC_V1` sets WLED_DISABLE_OTA so a shipped unit has no local update
+    // path, and the only repair channel for a bad root is an OTA — so putting the download behind
+    // the same roots looks like betting both halves on one CA event.
+    //
+    // It is not, because the download is already strictly downstream of those roots. Reaching this
+    // function requires, in order: `fetchProvisionConfig()` to succeed over HTTPS pinned to
+    // PIXC_TRUSTED_ROOTS (and `connected()` clears `_provisioned` on every Wi-Fi connect, so this
+    // happens every boot — the broker is never remembered across one); then an MQTT connection on
+    // 8883, which `pixc_mqtt_client.cpp` also pins to PIXC_TRUSTED_ROOTS; then an `ota` command
+    // arriving on that connection to set `_otaPending`; then the `WLED_MQTT_CONNECTED` gate in
+    // loop(). If both roots go bad, no OTA command is ever delivered and the fleet is unreachable
+    // long before the download's trust store matters.
+    //
+    // That also disposes of the alternatives, which all pay something for nothing:
+    //   - plaintext, leaning on the signature: gives up confidentiality and lets a network
+    //     attacker choose which signed version a unit installs (an old one with a known bug is
+    //     still correctly signed), and buys no recoverability, since the command that starts the
+    //     download still needs the roots.
+    //   - `setInsecure()`: encrypts against a passive observer but authenticates nobody, so an
+    //     active attacker substitutes the image freely — and again buys no recoverability.
+    //   - a DIFFERENT root pinned for the firmware host: strictly worse. It cannot help (the
+    //     command channel still needs the original roots) and it ADDS a second independent CA that
+    //     can break OTA, turning one failure mode into two.
+    //
+    // The signature is what makes a bad image unflashable; TLS is what makes the download reach
+    // the right server at all. They answer different questions, and this one is reachability.
     void runOta() {
       if (WiFi.status() != WL_CONNECTED || _otaUrl.length() == 0) {
         publishOtaProgress("failed", 0, "no wifi");
         return;
       }
+
+      // A TLS handshake needs roughly 40 KB of heap for the record buffers and the certificate
+      // chain, and failing inside mbedTLS reads as a mysterious OTA failure rather than as memory
+      // pressure. Say so instead; the job can be retried.
+      if (ESP.getFreeHeap() < 50000) {
+        publishOtaProgress("failed", 0, "low memory");
+        return;
+      }
+
       DEBUG_PRINTF("[PixC] OTA start v%s <- %s\n", _otaVer.c_str(), _otaUrl.c_str());
       publishOtaProgress("downloading", 0);
 
-      WiFiClient client;
-      HTTPClient http;
-      http.setConnectTimeout(8000);
-      http.setTimeout(20000);
-      if (!http.begin(client, _otaUrl)) { publishOtaProgress("failed", 0, "begin"); return; }
-      int code = http.GET();
-      if (code != HTTP_CODE_OK) {
-        char e[24]; snprintf(e, sizeof(e), "http %d", code);
-        publishOtaProgress("failed", 0, e); http.end(); return;
+      int status = 0;
+      int total = -1;                                   // -1 if chunked/unknown
+      PixcHttpsStream* stream = pixcHttpsOpen(_otaUrl.c_str(), &status, &total, 20000);
+      if (stream == nullptr) {
+        char e[32];
+        if (status > 0) snprintf(e, sizeof(e), "http %d", status);
+        else            snprintf(e, sizeof(e), "tls/connect");
+        publishOtaProgress("failed", 0, e);
+        return;
       }
-      int total = http.getSize();                       // -1 if chunked/unknown
+
       if (!Update.begin(total > 0 ? (size_t)total : UPDATE_SIZE_UNKNOWN)) {
-        publishOtaProgress("failed", 0, "no space"); http.end(); return;
+        publishOtaProgress("failed", 0, "no space"); pixcHttpsClose(stream); return;
       }
 
       mbedtls_sha256_context sha;
       mbedtls_sha256_init(&sha);
       mbedtls_sha256_starts(&sha, 0);                   // 0 = SHA-256 (not SHA-224)
 
-      WiFiClient* stream = http.getStreamPtr();
       uint8_t buf[1024];
       size_t written = 0;
-      int remaining = total;
       int lastPct = -1;
-      unsigned long lastData = millis();
       bool ok = true;
       const char* failMsg = nullptr;
 
-      while (http.connected() && (remaining > 0 || remaining < 0)) {
-        size_t avail = stream->available();
-        if (avail) {
-          int n = stream->readBytes(buf, avail > sizeof(buf) ? sizeof(buf) : avail);
-          if (n <= 0) { yield(); continue; }
-          if (Update.write(buf, n) != (size_t)n) { ok = false; failMsg = "flash write"; break; }
-          mbedtls_sha256_update(&sha, buf, n);
-          written += n;
-          if (remaining > 0) {
-            remaining -= n;
-            int pct = (int)((written * 90ULL) / (size_t)total);   // 0..90 while downloading
-            if (pct != lastPct && pct % 10 == 0) { publishOtaProgress("downloading", pct); lastPct = pct; }
-          }
-          lastData = millis();
-        } else {
-          if (millis() - lastData > 20000) { ok = false; failMsg = "stalled"; break; }
-          delay(1);
+      while (true) {
+        const int n = pixcHttpsRead(stream, buf, sizeof(buf));
+        if (n < 0) { ok = false; failMsg = "read"; break; }
+        if (n == 0) break;                              // end of body, clean or otherwise
+        if (Update.write(buf, n) != (size_t)n) { ok = false; failMsg = "flash write"; break; }
+        mbedtls_sha256_update(&sha, buf, n);
+        written += n;
+        if (total > 0) {
+          int pct = (int)((written * 90ULL) / (size_t)total);   // 0..90 while downloading
+          if (pct != lastPct && pct % 10 == 0) { publishOtaProgress("downloading", pct); lastPct = pct; }
+          if (written >= (size_t)total) break;
         }
-        if (remaining == 0) break;
         yield();
       }
-      http.end();
+
+      // A connection cut mid-image ends the loop exactly like a clean finish. The SHA-256 below
+      // would catch it anyway — that is the guarantee, and it does not depend on this check — but
+      // "stalled" is a far more useful thing to put in front of support than "sha256 mismatch".
+      if (ok && !pixcHttpsComplete(stream)) { ok = false; failMsg = "stalled"; }
+      pixcHttpsClose(stream);
 
       uint8_t digest[32];
       mbedtls_sha256_finish(&sha, digest);
