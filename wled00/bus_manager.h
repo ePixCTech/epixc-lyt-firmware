@@ -526,6 +526,14 @@ struct BusConfig {
   #endif
 #endif
 
+// standby (quiescent) current per LED, in mA, added to the estimate even when the LED is dark
+// (upstream figures: WS2812 ~0.7mA, WS2815 ~2mA). Hoisted out of BusDigital::estimateCurrent()
+// so a fork can set it from build flags instead of patching the .cpp; the default of 1 is the
+// value that was hardcoded there, so behaviour is unchanged unless overridden.
+#ifndef LED_STANDBY_MILLIAMPS
+  #define LED_STANDBY_MILLIAMPS 1
+#endif
+
 namespace BusManager {
 
   extern std::vector<std::unique_ptr<Bus>> busses;
