@@ -1,3 +1,43 @@
+# ePixC LYT firmware — a modified version of WLED
+
+**This is a Derivative Work of WLED and it has been modified.** EUPL v1.2 Article 5 requires that
+notice to be prominent, and to carry the date, so it is the first thing in this file rather than a
+line somewhere below.
+
+| | |
+|---|---|
+| **Upstream** | [WLED](https://github.com/wled-dev/WLED) by Christian Schwinne and contributors |
+| **Licence** | EUPL v1.2 or later — see [`LICENSE`](LICENSE). ePixC's changes are under the same licence, as Article 5 requires |
+| **Modified by** | ePixC (ePixCTech), from 2026-04 onward; this notice added 2026-08-27 |
+
+## What ePixC changed
+
+Everything ePixC adds lives in `usermods/pixc_connect_blink/` and in the `PixC_V1` build
+environment, so the diff against upstream is small and readable rather than scattered:
+
+- **`pixc_connect_blink`** — the usermod that talks to the ePixC cloud: provisioning, MQTT state
+  publishing, and OTA with an ECDSA P-256 signature check that refuses any image it cannot verify.
+- **`pixc_https`** — an ESP-IDF `esp_http_client` wrapper with ISRG Root X1 pinned and no plaintext
+  fallback, because the framework WLED pins has no `WiFiClientSecure`.
+- **`platformio_override.ini`** — the `PixC_V1` target for the ESP32-S3 board ePixC ships.
+- **`.github/workflows/epixc-firmware.yaml`** — ePixC's own CI. Upstream's eight workflow files are
+  left in place and unregistered.
+
+Upstream's own README follows, unchanged.
+
+## Why this repository is public
+
+WLED is under the EUPL, which is a copyleft licence: Article 1 counts selling a device as
+Distribution, Article 5 requires a Derivative Work to go out under the same licence, and Article 3
+requires the source of a distributed binary to be available. So this repository is public because
+that is what shipping a controller with this firmware on it obliges — not as a courtesy, and not
+optionally.
+
+Nothing else in the ePixC stack is affected. The app, the backend, the website and the cloud
+services are separate works that link none of this code.
+
+---
+
 <p align="center">
   <img src="/images/wled_logo_akemi.png">
   <a href="https://github.com/wled-dev/WLED/releases"><img src="https://img.shields.io/github/release/wled-dev/WLED.svg?style=flat-square"></a>

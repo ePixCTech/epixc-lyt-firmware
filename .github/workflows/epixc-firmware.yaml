@@ -137,6 +137,21 @@ jobs:
       # This runs BEFORE the OTA-key step deliberately: that step reads a repository secret and so
       # cannot pass on a pull request from a fork, and a PR that edits pixc_roots.h should still be
       # checked.
+      # Ticket 44, founder decision 2026-08-27. The rows the vault's Claims Checklist got wrong
+      # in the dangerous direction are this repository's: it said Art-Net, sACN, E1.31, DDP, DMX
+      # and Bluetooth were "none implemented anywhere in the stack" while `e131.begin` and
+      # `ddp.begin` ran unconditionally on every shipped unit. Those rows are now pinned to the
+      # symbols, so removing a listener or adding one turns this red.
+      #
+      # Placed beside the CA-roots check and before the OTA-key step for the same reason that one
+      # is: it reads no repository secret, so it still runs on a pull request from a fork.
+      #
+      # Worth stating plainly: no workflow in this repository has ever run on a push (`183`), so
+      # until that is fixed this step's real home is the hand-run path — the vault's render.py
+      # executes the same script at the tester-build review.
+      - name: Claims still match the code they point at
+        run: python3 tools/claims_evidence.py
+
       - name: Check the pinned CA roots
         run: |
           python3 - <<'PY'
