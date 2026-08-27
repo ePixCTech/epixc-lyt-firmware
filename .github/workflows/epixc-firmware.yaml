@@ -1,5 +1,16 @@
 # ePixC firmware CI. THIS FILE IS OURS, NOT UPSTREAM'S.
 #
+# 2026-08-27: touched deliberately to register this workflow with GitHub Actions. The repository's
+# first push created master with 6,872 commits and Actions registered none of the nine workflow
+# files in this directory — `gh api .../actions/workflows` returned only the two Dependabot entries
+# GitHub generates itself. A following empty commit did not help, which fits: registration appears
+# to key off a push that actually touches the workflow file, and the push that added these files
+# was the one that got skipped. The four repositories pushed the same day with 23 to 109 commits
+# registered normally.
+#
+# If this directory ever gets re-added in another giant push, expect the same silence, and expect it
+# to be silent rather than red — which is the failure mode this file exists to prevent.
+#
 # It has to live in .github/workflows/ because that is the only directory GitHub Actions scans.
 # It sat in .github/workflows-epixc/ from c7fe580d until now, to keep upstream merges clean, which
 # meant it never ran once — and neither did the OTA size gate below, the one check in this repo
