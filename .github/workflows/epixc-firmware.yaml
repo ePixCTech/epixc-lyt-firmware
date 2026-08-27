@@ -8,6 +8,13 @@
 # was the one that got skipped. The four repositories pushed the same day with 23 to 109 commits
 # registered normally.
 #
+# Outcome, recorded 2026-08-27: touching this file registered it. `gh api .../actions/workflows`
+# went from 2 entries to 3, and it became dispatchable. The other eight files in this directory —
+# upstream WLED's build.yml, nightly.yml, pr-merge.yaml, release.yml, stale.yml, test.yaml,
+# usermods.yml and wled-ci.yml — are still unregistered, deliberately left that way: they are
+# upstream's CI, they would burn Actions minutes on a private fork, and none of them gates
+# anything ePixC relies on. If one is ever wanted, touching it is what registers it.
+#
 # If this directory ever gets re-added in another giant push, expect the same silence, and expect it
 # to be silent rather than red — which is the failure mode this file exists to prevent.
 #
