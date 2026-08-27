@@ -27,7 +27,7 @@ The engine below is byte-identical in epixc-web, epixc-backend and epixc-firmwar
 generator hashes the region in all three and refuses to render if they differ.
 """
 
-REPO = "epixc-firmware"
+REPO = "epixc-lyt-firmware"
 
 CLAIMS = [
     {
