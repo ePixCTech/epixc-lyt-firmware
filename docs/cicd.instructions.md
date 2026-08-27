@@ -160,3 +160,23 @@ This rule applies to any value that originates outside the repository (issue bod
 
 - Workflows triggered by `pull_request` from a fork run with **read-only** token permissions and no access to repository secrets — this is intentional and correct
 - Do not use `pull_request_target` unless you fully understand the security implications; it runs in the context of the base branch and *does* have secret access, making it a common attack surface
+
+## Why this repository's own CI has failed to run, three times
+
+Recorded 2026-08-27, because the pattern matters more than any one cause. The ePixC workflow
+carries the OTA image size gate, and its own header says the failure it guards is a fleet that can
+never be updated again. It has now failed to run for three unrelated reasons:
+
+1. It lived in `.github/workflows-epixc/`, which GitHub does not scan. Moved.
+2. The repository's first push created `master` with 6,872 commits and Actions registered none of
+   the nine workflow files in `.github/workflows/`. Touching the file registered it.
+3. It still does not run on a push. After registration it has exactly one run in its history, and
+   that run was a manual `workflow_dispatch`.
+
+The trigger is `on: push: branches: [master, main, dev]`, `master` is the default branch, there is
+no `paths:` filter, Actions is enabled with `allowed_actions: all`, and Dependabot's own runs fire
+on this repository — so Actions is not globally wedged. What has not been ruled out is org-level
+policy, which needs `admin:org` to query.
+
+The lesson worth keeping: a check that does not run is indistinguishable from a check that passes,
+and this one has been indistinguishable from passing for its entire existence.
