@@ -18,6 +18,18 @@
 # If this directory ever gets re-added in another giant push, expect the same silence, and expect it
 # to be silent rather than red — which is the failure mode this file exists to prevent.
 #
+# 2026-08-28: and then it was red instead, on every run, which is the same problem wearing the
+# opposite colour. The OTA signing-key step said "the release build fails here" while there is one
+# job that runs on every push, so the workflow failed in twenty-five seconds every time for a
+# reason unrelated to whether the firmware compiles — and the size gate below, the one check whose
+# failure mode is a fleet that can never be updated again, never got to run. **A CI that is red for
+# a known reason is a CI nobody reads.**
+#
+# The key is now required only when a run could produce something shippable: a manual dispatch with
+# `shippable: true`, or any run where the secret happens to exist. Otherwise this builds
+# PixC_V1_dev, which compiles without a key and whose binary, release name and artifact all say
+# UNSIGNED_DEV. The device it is flashed onto still refuses every OTA. See ticket 174.
+#
 # It has to live in .github/workflows/ because that is the only directory GitHub Actions scans.
 # It sat in .github/workflows-epixc/ from c7fe580d until now, to keep upstream merges clean, which
 # meant it never ran once — and neither did the OTA size gate below, the one check in this repo
@@ -40,6 +52,13 @@ on:
   pull_request:
     branches: [master, main, dev]
   workflow_dispatch:
+    inputs:
+      shippable:
+        description: >-
+          Build a SHIPPABLE image. Requires the EPIXC_OTA_PUBKEY_PEM secret and fails without it.
+          Leave off for an ordinary compile + size check.
+        type: boolean
+        default: false
 
 # Deliberately no `paths:` filter. The size gate is the point of this workflow, and the inputs that
 # move image size are not confined to a listable set of directories — platformio.ini and
@@ -67,6 +86,44 @@ jobs:
     name: PixC_V1 (ESP32-S3)
     runs-on: ubuntu-latest
     steps:
+      # Whether this run is allowed to produce something a device could install.
+      #
+      # It was every run until 2026-08-28, and that was the defect: the comment above says "the
+      # RELEASE build fails here", but there is one job and it runs on every push, so the whole
+      # workflow was red from the day it registered — for a reason that has nothing to do with
+      # whether the firmware compiles. **A CI that is red for a known reason is a CI nobody reads**,
+      # and the size gate it exists to run was the thing being drowned out.
+      #
+      # So the key is required only when the run could ship: a manual dispatch that asks for it.
+      # Everything else builds `PixC_V1_dev`, which sets -D EPIXC_OTA_UNSIGNED_DEV_BUILD and so
+      # compiles without a key — while the device still refuses every OTA and says so at boot. The
+      # size gate, which is the check whose failure mode is a fleet that can never be updated
+      # again, runs either way.
+      - name: Decide whether this run may ship
+        id: mode
+        env:
+          OTA_PUBKEY_PEM: ${{ secrets.EPIXC_OTA_PUBKEY_PEM }}
+        run: |
+          set -euo pipefail
+          shippable="${{ github.event.inputs.shippable }}"
+          if [ "${shippable}" = "true" ]; then
+            if [ -z "${OTA_PUBKEY_PEM}" ]; then
+              echo "::error::A shippable build was requested and the repository secret EPIXC_OTA_PUBKEY_PEM is not set. Without it the firmware is built with no signing key and would refuse every OTA update once installed. Create it from: openssl pkey -inform DER -in ota-sec1.der -pubout -outform PEM"
+              exit 1
+            fi
+            echo "env=PixC_V1" >> "$GITHUB_OUTPUT"
+            echo "sign=true"   >> "$GITHUB_OUTPUT"
+          elif [ -n "${OTA_PUBKEY_PEM}" ]; then
+            # The key exists, so build the real thing even on an ordinary push — there is no reason
+            # to exercise a different env from the one that ships.
+            echo "env=PixC_V1" >> "$GITHUB_OUTPUT"
+            echo "sign=true"   >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::No OTA signing key configured, so this is a DEV build (PixC_V1_dev, -D EPIXC_OTA_UNSIGNED_DEV_BUILD). It compiles and is size-checked; it is NOT shippable and the device it is flashed onto refuses every update. Ticket 174 issues the key."
+            echo "env=PixC_V1_dev" >> "$GITHUB_OUTPUT"
+            echo "sign=false"      >> "$GITHUB_OUTPUT"
+          fi
+
       - uses: actions/checkout@v4
 
       # pio-scripts/build_ui.py runs `npm ci` and `npm run build` as a pre-action and aborts the
@@ -88,8 +145,8 @@ jobs:
           path: |
             ~/.platformio/.cache
             ~/.buildcache
-          key: pio-${{ runner.os }}-PixC_V1-${{ hashFiles('platformio.ini', 'platformio_override.ini') }}
-          restore-keys: pio-${{ runner.os }}-PixC_V1-
+          key: pio-${{ runner.os }}-${{ steps.mode.outputs.env }}-${{ hashFiles('platformio.ini', 'platformio_override.ini') }}
+          restore-keys: pio-${{ runner.os }}-${{ steps.mode.outputs.env }}-
 
       # requirements.txt pins platformio==6.1.17, which is the version this fork's build is known
       # to work under. `pip install --upgrade platformio` floated to whatever was newest that day.
@@ -314,6 +371,7 @@ jobs:
       # fails there. That is the correct outcome for this repo — a fork cannot produce a shippable
       # ePixC image — and the message below says so rather than looking like a broken build.
       - name: Bake in the OTA signing public key
+        if: steps.mode.outputs.sign == 'true'
         env:
           OTA_PUBKEY_PEM: ${{ secrets.EPIXC_OTA_PUBKEY_PEM }}
         run: |
@@ -361,7 +419,7 @@ jobs:
           fi
 
       - name: Build
-        run: pio run -e PixC_V1
+        run: pio run -e ${{ steps.mode.outputs.env }}
 
       # A partition table is written by the flasher and CANNOT be changed over OTA, so a unit's
       # layout is fixed for its life. If a build ever produces an image larger than the OTA slot,
@@ -377,7 +435,7 @@ jobs:
           python3 - <<'PY'
           import glob, hashlib, os, struct, sys
 
-          ENV = "PixC_V1"
+          ENV = "${{ steps.mode.outputs.env }}"
           CSV = "tools/WLED_ESP32_8MB_epixc.csv"
           build_dir = os.path.join(".pio", "build", ENV)
           app_bin = os.path.join(build_dir, "firmware.bin")
@@ -458,7 +516,7 @@ jobs:
           python3 - <<'PY'
           import glob, os, re, sys
 
-          mapfile = "build_output/map/PixC_V1.map"
+          mapfile = "build_output/map/${{ steps.mode.outputs.env }}.map"
           if not os.path.isfile(mapfile):
               print(f"::error::{mapfile} is missing — cannot tell which framework was linked")
               sys.exit(1)
@@ -485,8 +543,8 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: epixc-firmware
+          name: epixc-firmware-${{ steps.mode.outputs.sign == 'true' && 'signed' || 'UNSIGNED-DEV' }}
           # The map goes with it: when the size gate does eventually fire, the map is what says why.
           path: |
             build_output/release/*.bin
-            build_output/map/PixC_V1.map
+            build_output/map/${{ steps.mode.outputs.env }}.map
