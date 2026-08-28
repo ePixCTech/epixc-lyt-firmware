@@ -787,6 +787,10 @@ class PixcConnectBlink : public Usermod {
       JsonObject top = root.createNestedObject("PixcConnect");
       top["apiHost"] = _apiHost;
       top["apiPort"] = _apiPort;
+      // `settingsPin` is deliberately NOT written back. This same function answers
+      // `GET /json/cfg`, which is unauthenticated, so echoing the PIN here would publish the
+      // credential to exactly the caller it exists to stop. WLED keeps settingsPIN in wsec.json
+      // for the same reason, and that is where this one is persisted.
     }
 
     bool readFromConfig(JsonObject& root) override {
@@ -812,6 +816,34 @@ class PixcConnectBlink : public Usermod {
       // The keys are still ACCEPTED and still serialized, so an app that writes them gets its
       // 200 and the config round-trips; they simply do not move the host.
 #endif
+
+      // The settings PIN, set by the app during pairing. Founder's call, 2026-08-28, ticket 33.
+      //
+      // WLED's own `settingsPIN` lives in wsec.json and is only ever written by the settings FORM
+      // (`set.cpp`), which the app does not speak. Accepting it here lets the app set it in the
+      // same `/json/cfg` POST it already sends while it is connected directly to the device's own
+      // access point — the one moment in a device's life when an unauthenticated write on that
+      // link is not a weakness, because there is nothing else on the network.
+      //
+      // Why a PIN at all, when the provisioning host is now compiled in: `POST /json/cfg` can
+      // still rewrite the LED bus, the MQTT settings and the access point. Closing the host was
+      // the specific fix; this closes the door.
+      //
+      // Four digits, because that is WLED's format (`set.cpp` accepts length 4 or 0) and the
+      // whole point is to reuse the gate the core already enforces rather than invent a second
+      // one. "0000" is WLED's placeholder for "unchanged" and is rejected there, so it is
+      // rejected here too — otherwise the app could believe it had set a PIN that was ignored.
+      const char* pin = top["settingsPin"] | (const char*)nullptr;
+      if (pin != nullptr && strlen(pin) == 4 && strcmp(pin, "0000") != 0 &&
+          strcmp(pin, settingsPIN) != 0) {
+        strlcpy(settingsPIN, pin, 5);
+        // Persist immediately. wsec.json is written by serializeConfigSec() and NOT by the
+        // ordinary config save that follows this call, so without this the PIN would hold until
+        // the next reboot and then silently vanish — a lock that quietly stops locking.
+        serializeConfigSec();
+        DEBUG_PRINTLN(F("[ePixC] settings PIN set"));
+      }
+
       return true;
     }
 
