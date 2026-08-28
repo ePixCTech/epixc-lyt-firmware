@@ -628,7 +628,14 @@ void handleSettingsSet(AsyncWebServerRequest *request, byte subPage)
     if (request->hasArg(F("RS"))) //complete factory reset
     {
       WLED_FS.format();
-      serveMessage(request, 200, F("All Settings erased."), F("Connect to PixC-AP to setup again"),255);
+      // The SSID comes from the constant that actually names the hotspot, not from a hand-typed
+      // copy of it. This named the pre-rename hotspot, which no unit has broadcast since;
+      // DEFAULT_AP_BASE is "ePixC" (const.h), so the real name is ePixC-AP, and the app pins that
+      // spelling in pairing_platform_test.dart. Of every string in this firmware it is
+      // the worst one to get wrong: it is shown at the exact moment the customer has just erased
+      // their config and has nothing to go on but this sentence.
+      serveMessage(request, 200, F("All Settings erased."),
+                   String(F("Connect to ")) + DEFAULT_AP_SSID + F(" to setup again"), 255);
       doReboot = true; // may reboot immediately on dual-core system (race condition) which is desireable in this case
     }
 

@@ -29,7 +29,7 @@
 // only the fallback for a unit that never completed setup. The broker itself is
 // never hardcoded — it is always fetched from this API.
 //
-// The default used to be "api.pixc.app", a domain ePixC does not own. Anyone who
+// The default used to be a host on the pre-rename domain, which ePixC does not own. Anyone who
 // registered it would have been asked, by every un-paired unit, which MQTT broker
 // to connect to. The real host is api.epixc.in (see deploy/caddy/Caddyfile).
 //
@@ -49,14 +49,14 @@
   #define PIXC_MQTT_PORT 1883
 #endif
 
-// PixC device-edge usermod. Two jobs:
+// ePixC device-edge usermod. Two jobs:
 //
-//  1. MQTT bridge to the PixC cloud (pixc-mqtt broker). WLED's native MQTT
-//     topics/payloads don't match the PixC contract, so this usermod:
+//  1. MQTT bridge to the ePixC cloud (epixc-mqtt broker). WLED's native MQTT
+//     topics/payloads don't match the ePixC contract, so this usermod:
 //       - forces the device topic to `pixc/d/{mac}` (full MAC, lowercase) so
 //         WLED subscribes `pixc/d/{mac}/api` for commands;
 //       - publishes `announce` (once on connect), `state` and `health` to
-//         `pixc/d/{mac}/{kind}` in the shapes pixc-mqtt expects.
+//         `pixc/d/{mac}/{kind}` in the shapes epixc-mqtt expects.
 //
 //  2. On the first successful MQTT (cloud) connect after Wi-Fi is up — i.e.
 //     right after initial setup / pairing — flash the strip solid green for
@@ -119,7 +119,7 @@ class PixcConnectBlink : public Usermod {
     byte _savedBri = 0;
     uint8_t _savedFx = 0;
 
-    // PixC API host (provisioned by the app, persisted in usermod config). The
+    // ePixC API host (provisioned by the app, persisted in usermod config). The
     // device calls GET {apiHost}:{apiPort}/api/v1/provision?mac=... to learn the
     // MQTT broker, then hands off to MQTT.
     String _apiHost = PIXC_API_HOST;
@@ -183,7 +183,25 @@ class PixcConnectBlink : public Usermod {
     void fetchProvisionConfig() {
       if (WiFi.status() != WL_CONNECTED || _apiHost.length() == 0) return;
 
-      const bool useTls = (_apiPort == 443);
+      // The transport is a COMPILE-TIME decision, not a runtime one. Founder's call, 2026-08-28,
+      // grilling ticket 33.
+      //
+      // This read `_apiPort == 443`, and `_apiPort` comes from `readFromConfig` — that is,
+      // from `POST /json/cfg`, which `wled_server.cpp` gates on `settingsPIN` and which shipped
+      // with no PIN set. So anyone on the customer's Wi-Fi could write `apiPort: 8080`, and the
+      // device would drop to plaintext on the next reconnect and ask them which broker to trust,
+      // handing over the per-device credential from ticket 09 in the process. That is exactly
+      // the attack this ticket was opened for, restored through a door the ticket never looked
+      // at, in a build whose stated guarantee was "never falls back to plaintext".
+      //
+      // A guarantee that a configuration value can revoke is not a guarantee. `PixC_V1` has no
+      // plaintext path compiled into it at all now, so there is no value any attacker can write
+      // that produces one.
+#ifdef EPIXC_ALLOW_PLAINTEXT_PROVISION
+      const bool useTls = (_apiPort == 443);   // PixC_V1_dev only
+#else
+      const bool useTls = true;
+#endif
 
       // A TLS handshake needs roughly 40 KB of heap for the record buffers and the certificate
       // chain. Attempting one below that does not fail cleanly — it fails somewhere inside
@@ -200,8 +218,17 @@ class PixcConnectBlink : public Usermod {
                useTls ? "https" : "http", _apiHost.c_str(), _apiPort, escapedMac.c_str());
 
       char body[768];
+      // Both arms of a ternary have to compile even when one is unreachable, so the CALL has to
+      // be behind the same guard as the function. Caught by the compiler on the first release
+      // build after the change, which is the argument for compiling the path out rather than
+      // reasoning that nothing can reach it: an absent function fails loudly at build time, an
+      // unreachable one fails quietly in the field.
+#ifdef EPIXC_ALLOW_PLAINTEXT_PROVISION
       const int len = useTls ? pixcHttpsGet(url, body, sizeof(body))
                              : httpGet(url, body, sizeof(body));
+#else
+      const int len = pixcHttpsGet(url, body, sizeof(body));
+#endif
       if (len <= 0) return;
 
       DynamicJsonDocument doc(640);
@@ -223,8 +250,11 @@ class PixcConnectBlink : public Usermod {
       }
     }
 
-    // Plaintext GET, bench only. Reached only when the port is not 443, which a release build
-    // cannot arrange: `default_envs` names `PixC_V1`, whose compiled host is api.epixc.in:443.
+    // Plaintext GET, bench only — and now genuinely absent from a release image rather than
+    // merely unreachable in it. The previous comment said a release build "cannot arrange" a
+    // non-443 port; it could, through `readFromConfig`. Unreachable-by-argument is how this
+    // defect survived, so the function is compiled out instead of reasoned about.
+#ifdef EPIXC_ALLOW_PLAINTEXT_PROVISION
     int httpGet(const char* url, char* out, size_t cap) {
       WiFiClient client;
       HTTPClient http;
@@ -240,6 +270,7 @@ class PixcConnectBlink : public Usermod {
       http.end();
       return len;
     }
+#endif  // EPIXC_ALLOW_PLAINTEXT_PROVISION
 
 
 
@@ -477,7 +508,7 @@ class PixcConnectBlink : public Usermod {
     }
 
     // Report OTA progress to the cloud on `pixc/d/{mac}/ota/progress`. `status`
-    // is one of downloading/installing/done/failed (pixc-mqtt treats done|failed
+    // is one of downloading/installing/done/failed (epixc-mqtt treats done|failed
     // as terminal). Failures carry the reason in `err`.
     void publishOtaProgress(const char* status, int percent, const char* err = nullptr) {
       if (!WLED_MQTT_CONNECTED) return;
@@ -596,7 +627,7 @@ class PixcConnectBlink : public Usermod {
         return;
       }
 
-      DEBUG_PRINTF("[PixC] OTA start v%s <- %s\n", _otaVer.c_str(), _otaUrl.c_str());
+      DEBUG_PRINTF("[ePixC] OTA start v%s <- %s\n", _otaVer.c_str(), _otaUrl.c_str());
       publishOtaProgress("downloading", 0);
 
       int status = 0;
@@ -672,7 +703,7 @@ class PixcConnectBlink : public Usermod {
 
       if (!ok) {
         Update.abort();
-        DEBUG_PRINTF("[PixC] OTA failed: %s\n", failMsg ? failMsg : "?");
+        DEBUG_PRINTF("[ePixC] OTA failed: %s\n", failMsg ? failMsg : "?");
         publishOtaProgress("failed", 0, failMsg);
         return;
       }
@@ -684,7 +715,7 @@ class PixcConnectBlink : public Usermod {
         return;
       }
 
-      DEBUG_PRINTLN("[PixC] OTA done; rebooting");
+      DEBUG_PRINTLN("[ePixC] OTA done; rebooting");
       publishOtaProgress("done", 100);
       delay(1200);                       // let the QoS0 progress publish flush
       doReboot = true;                   // WLED reboots from its own loop
@@ -721,7 +752,7 @@ class PixcConnectBlink : public Usermod {
       if (running != nullptr && esp_ota_get_state_partition(running, &otaState) == ESP_OK) {
         _awaitingConfirm = (otaState == ESP_OTA_IMG_PENDING_VERIFY);
       }
-      // Broker is NOT hardcoded — it is fetched from the PixC API (see
+      // Broker is NOT hardcoded — it is fetched from the ePixC API (see
       // fetchProvisionConfig) on every Wi-Fi connect. Only seed the last-resort
       // fallback if a build-time broker was explicitly provided.
       if (strlen(PIXC_MQTT_HOST) > 0 && strlen(mqttServer) == 0) {
@@ -750,7 +781,7 @@ class PixcConnectBlink : public Usermod {
       _lastProvisionTry = 0;   // provision asap in loop()
     }
 
-    // Persist the PixC API host/port so the app provisions it once and it
+    // Persist the ePixC API host/port so the app provisions it once and it
     // survives reboots (cfg.json -> um.PixcConnect.{apiHost,apiPort}).
     void addToConfig(JsonObject& root) override {
       JsonObject top = root.createNestedObject("PixcConnect");
@@ -761,8 +792,26 @@ class PixcConnectBlink : public Usermod {
     bool readFromConfig(JsonObject& root) override {
       JsonObject top = root["PixcConnect"];
       if (top.isNull()) return false;
+#ifdef EPIXC_ALLOW_PLAINTEXT_PROVISION
+      // Bench builds keep the host configurable, which is the entire reason the dev env exists:
+      // the bench Mac's address rotates.
       _apiHost = top["apiHost"] | _apiHost;
       _apiPort = top["apiPort"] | _apiPort;
+#else
+      // A release unit provisions from the compiled host and nothing else. Founder's call,
+      // 2026-08-28, ticket 33.
+      //
+      // Pinning ISRG Root X1 proves the peer holds a Let's Encrypt certificate. It does NOT
+      // prove the peer is ePixC — an attacker with a domain and a free certificate satisfies a
+      // root pin completely. Binding to the CA was never the goal; binding to api.epixc.in is,
+      // and the only way to do that is to stop letting a config write choose the host.
+      //
+      // Nothing legitimate is lost: the app writes exactly this value already
+      // (`app_config.dart` -> provisionApiHost/provisionApiPort, 443 in a release build), so
+      // ignoring the write is a no-op on the real pairing path and a refusal on every other.
+      // The keys are still ACCEPTED and still serialized, so an app that writes them gets its
+      // 200 and the config round-trips; they simply do not move the host.
+#endif
       return true;
     }
 
@@ -820,9 +869,9 @@ class PixcConnectBlink : public Usermod {
       if (!_awaitingConfirm || _confirmed) return;
       _confirmed = true;
       if (esp_ota_mark_app_valid_cancel_rollback() == ESP_OK) {
-        DEBUG_PRINTLN("[PixC] OTA image confirmed; rollback cancelled");
+        DEBUG_PRINTLN("[ePixC] OTA image confirmed; rollback cancelled");
       } else {
-        DEBUG_PRINTLN("[PixC] OTA image confirm FAILED; this image may be rolled back");
+        DEBUG_PRINTLN("[ePixC] OTA image confirm FAILED; this image may be rolled back");
       }
     }
 
@@ -870,7 +919,7 @@ class PixcConnectBlink : public Usermod {
       // anything here, including the placement of this call.
       confirmImageIfPending();
 
-      // Subscribe the PixC control subtopics the core doesn't handle. `/api`
+      // Subscribe the ePixC control subtopics the core doesn't handle. `/api`
       // (state commands) is subscribed by WLED core; `/cfg` carries config
       // fragments (power plan, restore-on-power, default brightness, slow-fade)
       // and `/reset` triggers a factory wipe.
@@ -935,7 +984,7 @@ class PixcConnectBlink : public Usermod {
         _flashing = false;
       }
 
-      // Once on Wi-Fi, fetch the broker from the PixC API (retry until it
+      // Once on Wi-Fi, fetch the broker from the ePixC API (retry until it
       // sticks). Broker is never hardcoded — this is the device→Java handoff.
       if (!_provisioned && WiFi.status() == WL_CONNECTED &&
           (_lastProvisionTry == 0 || now - _lastProvisionTry >= kProvisionRetryMs)) {

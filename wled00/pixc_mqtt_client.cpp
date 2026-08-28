@@ -109,7 +109,7 @@ void PixcMqttClient::handle(esp_mqtt_event_handle_t event) {
       // that matter — a certificate the pinned roots do not cover, and credentials the broker
       // rejects — look identical from the outside without it.
       if (event->error_handle != nullptr) {
-        DEBUG_PRINTF("[PixC] MQTT error type=%d tls=%d sock_errno=%d\n",
+        DEBUG_PRINTF("[ePixC] MQTT error type=%d tls=%d sock_errno=%d\n",
                      (int)event->error_handle->error_type,
                      (int)event->error_handle->esp_tls_last_esp_err,
                      (int)event->error_handle->esp_transport_sock_errno);

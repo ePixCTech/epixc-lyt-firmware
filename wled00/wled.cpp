@@ -849,8 +849,8 @@ void WLED::initInterfaces()
   if (aOtaEnabled) ArduinoOTA.begin();
 #endif
 
-  // mDNS responder DISABLED for PixC — the app discovers devices by scanning
-  // for the PixC-AP Wi-Fi SSID (initial pairing) and via the cloud once
+  // mDNS responder DISABLED for ePixC — the app discovers devices by scanning
+  // for the ePixC-AP Wi-Fi SSID (initial pairing) and via the cloud once
   // provisioned, so no mDNS advertisement is needed.
   // if (strlen(cmDNS) > 0) {
   //   MDNS.end();
