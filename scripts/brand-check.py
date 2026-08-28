@@ -19,16 +19,21 @@ Whitespace is flattened before matching, so a name split across a line break can
 blind spot that let a split wordmark defeat the website's line-based check.
 
 Identifiers are exempt because renaming them breaks a build or a path and no customer ever reads
-them: `PixC_V1` (and `_dev`) are PlatformIO environments named in `default_envs`, `pixc/d/` is the
-MQTT topic prefix every shipped unit publishes on, and the `pixc_connect_blink` usermod directory
-is a path in `platformio_override.ini` and every include. The exemption is by exact shape, never
-by file, so a new *sentence* in those files still fails.
+them: `PixC_V1` (and `_dev`) are PlatformIO environments named in `default_envs`, and the
+`pixc_connect_blink` usermod directory is a path in `platformio_override.ini` and every include.
+The exemption is by exact shape, never by file, so a new *sentence* in those files still fails.
 
 **Keep the exemption list narrow, and check each entry against a plant.** The first version of it
 carried a blanket `pixc-` prefix, which swallowed the retired AP name — the guard read green
 against the exact string it was written to catch, and only planting that string revealed it. The
 one thing `pixc-` was protecting turned out to be `pixc-mqtt`, which is a RETIRED service name
 too (the Rust crate is `epixc-mqtt`), so the exemption existed solely to hide two defects.
+
+A second entry went the same way an hour later. `pixc/d/` was exempted as "the MQTT topic prefix
+every shipped unit publishes on" — and it is not. The usermod builds `epixc/v1/d/%s`, which is
+what the broker subscribes to; the exemption was protecting six stale comments describing a topic
+that has never existed. **An exemption is a claim about the code, and it decays like any other.**
+Both were written by the same hand that wrote the guard, in the same sitting.
 """
 import pathlib
 import re
@@ -45,7 +50,7 @@ FORBIDDEN = re.compile(r"hyperatlas|(?<![eE])\bPixC\b", re.I)
 # that carry it. Ordered longest-first so `PixC_V1_dev` is consumed before `PixC_V1`.
 IDENTIFIERS = re.compile(
     r"PixC_V1_dev|PixC_V1|pixc_connect_blink|pixc_https|pixc_roots|pixc_led_bus|"
-    r"pixc_ota_pubkey|PIXC_[A-Z0-9_]+|pixc/d/",
+    r"pixc_ota_pubkey|PIXC_[A-Z0-9_]+",
     re.I,
 )
 

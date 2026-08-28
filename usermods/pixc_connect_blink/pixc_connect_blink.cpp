@@ -53,10 +53,10 @@
 //
 //  1. MQTT bridge to the ePixC cloud (epixc-mqtt broker). WLED's native MQTT
 //     topics/payloads don't match the ePixC contract, so this usermod:
-//       - forces the device topic to `pixc/d/{mac}` (full MAC, lowercase) so
-//         WLED subscribes `pixc/d/{mac}/api` for commands;
+//       - forces the device topic to `epixc/v1/d/{mac}` (full MAC, lowercase) so
+//         WLED subscribes `epixc/v1/d/{mac}/api` for commands;
 //       - publishes `announce` (once on connect), `state` and `health` to
-//         `pixc/d/{mac}/{kind}` in the shapes epixc-mqtt expects.
+//         `epixc/v1/d/{mac}/{kind}` in the shapes epixc-mqtt expects.
 //
 //  2. On the first successful MQTT (cloud) connect after Wi-Fi is up — i.e.
 //     right after initial setup / pairing — flash the strip solid green for
@@ -127,7 +127,7 @@ class PixcConnectBlink : public Usermod {
     bool _provisioned = false;          // got the broker from the API yet?
     unsigned long _lastProvisionTry = 0;
 
-    // OTA (cloud-triggered, MQTT-pull). The trigger arrives on `pixc/d/{mac}/ota`;
+    // OTA (cloud-triggered, MQTT-pull). The trigger arrives on `epixc/v1/d/{mac}/ota`;
     // the actual HTTP download + flash is deferred to loop() so it never blocks
     // the MQTT receive callback. Progress is reported on `.../ota/progress`.
     bool _otaPending = false;
@@ -474,7 +474,7 @@ class PixcConnectBlink : public Usermod {
       return true;
     }
 
-    // Apply a WLED config fragment pushed by the cloud over `pixc/d/{mac}/cfg`
+    // Apply a WLED config fragment pushed by the cloud over `epixc/v1/d/{mac}/cfg`
     // (power plan -> def.bri, restore-on-power -> def.on, slow-fade -> light.tr.dur).
     // Only native WLED cfg keys take effect; unknown keys are ignored safely.
     //
@@ -507,7 +507,7 @@ class PixcConnectBlink : public Usermod {
       doReboot = true;
     }
 
-    // Report OTA progress to the cloud on `pixc/d/{mac}/ota/progress`. `status`
+    // Report OTA progress to the cloud on `epixc/v1/d/{mac}/ota/progress`. `status`
     // is one of downloading/installing/done/failed (epixc-mqtt treats done|failed
     // as terminal). Failures carry the reason in `err`.
     void publishOtaProgress(const char* status, int percent, const char* err = nullptr) {
