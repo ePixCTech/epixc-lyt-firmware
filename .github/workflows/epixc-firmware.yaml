@@ -30,6 +30,30 @@
 # PixC_V1_dev, which compiles without a key and whose binary, release name and artifact all say
 # UNSIGNED_DEV. The device it is flashed onto still refuses every OTA. See ticket 174.
 #
+# === STILL BROKEN, and narrowed on 2026-08-28: `push` DOES NOT TRIGGER THIS ===
+#
+# Two pushes to master that each TOUCHED this file produced no run at all — not a failed run, no
+# run. `workflow_dispatch` works; the API has never recorded a single `push` event for this
+# repository. Everything checkable from a `repo`-scoped token was checked and is correct:
+#
+#   repos/.../actions/permissions   {"enabled":true,"allowed_actions":"all"}
+#   repos/.../actions/workflows     this file is listed, state "active"
+#   repos/.../rulesets              []
+#   repos/.../actions/permissions/workflow  default_workflow_permissions "write"
+#   repo metadata                   fork:false, archived:false, disabled:false, default_branch:master
+#   the `on:` block ON THE PUSHED COMMIT   push.branches includes master
+#
+# So it is not the trigger, not the branch, not a ruleset, not a fork, not the file's registration.
+# The one thing left is the ORGANISATION's Actions policy, and reading it needs `admin:org`:
+#
+#   $ gh api orgs/ePixCTech/actions/permissions
+#   403 "You must be an org admin or have the actions policies fine-grained permission."
+#
+# >>> FOUNDER: open https://github.com/organizations/ePixCTech/settings/actions and check that
+# >>> "Allow all actions and reusable workflows" is set for this repository, and that
+# >>> "Allow GitHub Actions to run on pushes" is not restricted at the org level. Everything on the
+# >>> repository side is already correct, so whatever is found there is the whole of it.
+#
 # It has to live in .github/workflows/ because that is the only directory GitHub Actions scans.
 # It sat in .github/workflows-epixc/ from c7fe580d until now, to keep upstream merges clean, which
 # meant it never ran once — and neither did the OTA size gate below, the one check in this repo
