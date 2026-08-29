@@ -49,10 +49,39 @@
 #   $ gh api orgs/ePixCTech/actions/permissions
 #   403 "You must be an org admin or have the actions policies fine-grained permission."
 #
-# >>> FOUNDER: open https://github.com/organizations/ePixCTech/settings/actions and check that
-# >>> "Allow all actions and reusable workflows" is set for this repository, and that
-# >>> "Allow GitHub Actions to run on pushes" is not restricted at the org level. Everything on the
-# >>> repository side is already correct, so whatever is found there is the whole of it.
+# === 2026-08-29: THE ORG POLICY IS NOT THE CAUSE. That guess is now disproved. ===
+#
+# The line that used to be here sent the founder to the organisation's Actions settings. It was
+# reasoning by elimination - everything checkable was correct, so it must be the one thing that was
+# not checkable - and reasoning by elimination is only as good as the list of things eliminated.
+#
+# The cheap test nobody had run: ask whether ANY OTHER repository in this organisation gets
+# push-triggered runs.
+#
+#   $ for r in epixc-web epixc-app epixc-backend epixc-docs epixc-sync epixc-wireframes; do
+#       gh api "repos/ePixCTech/$r/actions/runs?event=push&per_page=1" --jq .total_count; done
+#     20  21  24  1  2  2
+#
+# Six do. So Actions runs on push across this organisation, and whatever is wrong is specific to
+# THIS repository. Also ruled out on the same pass: the repo is PUBLIC (so it is not a private-repo
+# minutes limit), fork:false, archived:false, disabled:false, the workflow is registered and
+# `state: active`, and none of the three pushed commits carries a `[skip ci]`-family token in its
+# message - which is the one documented way a correct workflow silently does not run.
+#
+# What is left, and it is one click each:
+#
+# >>> FOUNDER, both in https://github.com/organizations/ePixCTech/settings/actions:
+# >>>   1. If "Enable Actions for" is set to SELECTED REPOSITORIES rather than all, check whether
+# >>>      epixc-lyt-firmware is in the list. Six siblings running proves the policy allows pushes;
+# >>>      it does not prove this repository is included in it.
+# >>>   2. Check the repository's own Settings > Actions > General for a disabled state that the
+# >>>      REST API reports as enabled - the two have disagreed before on repos imported with very
+# >>>      large histories.
+# >>>
+# >>> If both look right, the next step is empirical rather than more reading: push a commit that
+# >>> touches this file and watch `gh api repos/.../actions/runs?event=push`. Registration keyed off
+# >>> a touching push once already (see 2026-08-27 above), and the same mechanism may gate the
+# >>> trigger as well as the listing.
 #
 # It has to live in .github/workflows/ because that is the only directory GitHub Actions scans.
 # It sat in .github/workflows-epixc/ from c7fe580d until now, to keep upstream merges clean, which
