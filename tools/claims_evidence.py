@@ -220,7 +220,49 @@ def engine_digest():
     return hashlib.sha256(body.encode()).hexdigest()[:16]
 
 
+# The digest the region above is REQUIRED to have, checked by this script in its own repository's
+# CI. Written 2026-08-29 after the drift it exists to catch had already happened.
+#
+# The cross-repository check lives in the vault (99-Wayfinder/claims/render.py), which is the only
+# place that can see all three copies at once - and it is hand-run. So when epixc-web's copy drifted
+# by three characters, nothing failed: each repository's CI went on passing, the vault generator
+# refused to render, and the public Claims Checklist silently froze on stale pricing rows for three
+# days. A check that only one person running one script by hand can perform is a check that reports
+# nothing on the day it matters.
+#
+# Pinning the digest moves the FIRST detection into every repository's own CI, where a diff that
+# touches this region fails the build that carries it, without any repository needing to see
+# another. It cannot replace the vault's check - a pin says "this copy is what it was", not "the
+# three copies agree" - so both exist, and the pin is the fast one.
+#
+# It lives BELOW engine_digest() on purpose. The hashed region ends at the FIRST occurrence of the
+# end marker, which is the string literal inside engine_digest itself, so this constant is inside
+# the shared region but outside the hash. Putting it above would make the pin cover itself, and no
+# value would ever be correct.
+#
+# EDITING THE ENGINE: change it in all three copies in one commit, run any copy to read the new
+# digest out of the failure message, and update this line in all three. If that feels like friction,
+# it is the friction the header at the top of the region already asks for.
+ENGINE_PIN = "a784e1bf69b43713"
+
+
+def engine_pin_ok():
+    """None if this copy matches the pin, or the sentence explaining what to do about it."""
+    actual = engine_digest()
+    if actual == ENGINE_PIN:
+        return None
+    return (f"the engine region has drifted: this copy hashes {actual}, the pin says {ENGINE_PIN}.\n"
+            "Either an edit to the shared region was not made in all three repositories, or it was\n"
+            "and the pin was not updated. Do not change the pin to make this pass without checking\n"
+            "the other copies first - a pin updated alone hides exactly the drift it is here for.")
+
+
 def main():
+    drift = engine_pin_ok()
+    if drift is not None:
+        print(f"{REPO}: {drift}", file=sys.stderr)
+        return 1
+
     results = evaluate()
     if "--json" in sys.argv:
         print(json.dumps({"repo": REPO, "engine": engine_digest(),
