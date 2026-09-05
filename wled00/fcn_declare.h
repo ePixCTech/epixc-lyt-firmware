@@ -450,6 +450,9 @@ uint8_t extractModeName(uint8_t mode, const char *src, char *dest, uint8_t maxLe
 uint8_t extractModeSlider(uint8_t mode, uint8_t slider, char *dest, uint8_t maxLen, uint8_t *var = nullptr);
 int16_t extractModeDefaults(uint8_t mode, const char *segVar);
 void checkSettingsPIN(const char *pin);
+#ifdef PIXC_LAN_AUTH
+bool pixcLanAuthorised();
+#endif
 uint16_t crc16(const unsigned char* data_p, size_t length);
 String computeSHA1(const String& input);
 String getDeviceId();

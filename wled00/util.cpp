@@ -155,12 +155,12 @@ static void sanitizeHostname(char* hostname, size_t maxLen) {
  *   preferMDNSname -> use mDNS name if set, otherwise fall back to WLED "server description" name (legacy behaviour)
  */
 void getWLEDhostname(char* hostname, size_t maxLen, bool preferMDNS) {
-  if (maxLen <= 6) { strlcpy(hostname, "wled", maxLen); return; } // buffer too small (should not happen)
+  if (maxLen <= 6) { strlcpy(hostname, "epixc", maxLen); return; } // buffer too small (should not happen)
   if (preferMDNS && (strlen(cmDNS) > 0) && (strcmp_P(cmDNS, PSTR(DEFAULT_MDNS_NAME)) != 0)) {     // avoid "x" = not set (use wled-MAC)
     strlcpy(hostname, cmDNS, maxLen);
     sanitizeHostname(hostname, maxLen);  // sanitize cmDNS name
     if (strlen(hostname) < 1) {          // if result is empty -> fall back to wled-MAC
-      snprintf_P(hostname, maxLen, PSTR("wled-%*s"), 6, escapedMac.c_str() + 6);
+      snprintf_P(hostname, maxLen, PSTR("epixc-%*s"), 6, escapedMac.c_str() + 6);
       hostname[maxLen -1] = '\0';        // ensure string termination
     }
   } else {
@@ -176,7 +176,7 @@ void getWLEDhostname(char* hostname, size_t maxLen, bool preferMDNS) {
  */
 void prepareHostname(char* hostname, size_t maxLen)
 {
-  if (maxLen <= 6) { strlcpy(hostname, "wled", maxLen); return; } // buffer too small (should not happen)
+  if (maxLen <= 6) { strlcpy(hostname, "epixc", maxLen); return; } // buffer too small (should not happen)
   if (strncasecmp_P(serverDescription, PSTR("wled"), 4) == 0)     // avoid wled-WLED-... as a hostname
     strlcpy(hostname, serverDescription, maxLen);
   else
@@ -186,7 +186,7 @@ void prepareHostname(char* hostname, size_t maxLen)
   size_t sanOffset = hostname[4] != '-' ? 4 : 5;            // ensure that "WLED foo" and "WLED!foo" get sanitized
   sanitizeHostname(hostname+sanOffset, maxLen-sanOffset);   // sanitize name, keep "wled-" intact
   if (strlen(hostname) <= sanOffset)
-    snprintf_P(hostname, maxLen, PSTR("wled-%*s"), 6, escapedMac.c_str() + 6); // fallback to wled-MAC if sanitization cleaned everything
+    snprintf_P(hostname, maxLen, PSTR("epixc-%*s"), 6, escapedMac.c_str() + 6); // fallback to wled-MAC if sanitization cleaned everything
 }
 
 
@@ -481,9 +481,71 @@ void checkSettingsPIN(const char* pin) {
   if (!pin) return;
   if (!correctPIN && millis() - lastEditTime < PIN_RETRY_COOLDOWN) return; // guard against PIN brute force
   //bool correctBefore = correctPIN; // unused
+#ifdef PIXC_LAN_AUTH
+  // An EMPTY PIN MUST NOT UNLOCK. Upstream treats "no PIN set" as "no protection wanted", which is
+  // the right default for a hobby controller somebody flashed themselves and the wrong one for a
+  // unit sold to a customer: a factory-fresh ePixC has no PIN yet, and under the upstream rule that
+  // is precisely the state in which anybody on the Wi-Fi can drive it.
+  //
+  // So the empty-PIN arm is dropped here rather than the whole function replaced - the brute-force
+  // cooldown above and the 15-minute relock in wled.cpp are both wanted unchanged.
+  correctPIN = (strlen(settingsPIN) == 4 && strncmp(settingsPIN, pin, 4) == 0);
+#else
   correctPIN = (strlen(settingsPIN) == 0 || strncmp(settingsPIN, pin, 4) == 0);
+#endif
   lastEditTime = millis();
 }
+
+
+#ifdef PIXC_LAN_AUTH
+/**
+ * Whether the caller on the LAN may use the JSON API at all.
+ *
+ * =============================================================================================
+ * WHY THIS EXISTS: THREE UNAUTHENTICATED WRITE PATHS, NOT ONE
+ * =============================================================================================
+ * Upstream gates `POST /json/cfg`, `/settings`, `/edit` and OTA on `correctPIN`. It does NOT gate
+ * a plain state write. `POST /json {"on":true,"seg":[...]}` runs `deserializeState()` with no
+ * check whatsoever, `GET /json` returns state plus network information to anybody who asks, and
+ * the legacy `/win&A=128&FX=9` query API reaches `handleSet()` through the not-found handler with
+ * nothing in front of it. Any of the three lets a stranger on the customer's Wi-Fi take the lights.
+ *
+ * That is defensible for the project this is forked from - a controller on your own bench, where
+ * a PIN prompt between you and your lights is friction with no threat behind it. It is not
+ * defensible for a unit somebody bought.
+ *
+ * =============================================================================================
+ * THE PAIRING WINDOW, AND WHY IT IS NOT A HOLE
+ * =============================================================================================
+ * Founder's call, 2026-09-05: the device ships LOCKED, and the app writes the PIN during pairing.
+ * Which raises the obvious problem - if a factory-fresh unit refuses every request, the app cannot
+ * reach it to set the PIN, and the device is a brick in a box.
+ *
+ * The window is `apActive && !WLED_CONNECTED`: the device is running its own access point and has
+ * no station connection. To be inside it an attacker must already have joined the setup AP, which
+ * means being in radio range of a unit that is out of its box and not yet paired. That is a
+ * different and much smaller threat than "anybody on the home Wi-Fi, forever".
+ *
+ * It closes the moment the device joins a network, which is the same moment the app has written
+ * the PIN - so the window is open for the length of one pairing and never again unless the owner
+ * factory-resets. It is deliberately NOT "unprovisioned", which would stay open on the customer's
+ * own Wi-Fi if pairing half-failed.
+ *
+ * =============================================================================================
+ * WHAT THIS DOES NOT COVER, STATED RATHER THAN IMPLIED
+ * =============================================================================================
+ * DDP and E1.31 on UDP carry no credential field - there is nowhere in either protocol to put a
+ * PIN - so realtime pixel data stays open by decision, not by omission. A DDP sender can push
+ * frames while it keeps sending and can do nothing else: it cannot change config, write a preset,
+ * or survive a reboot. ePixC Sync depends on that path. See the Debt Register and
+ * [[Offline and LAN-First]].
+ */
+bool pixcLanAuthorised() {
+  if (correctPIN) return true;                 // unlocked this session by a correct PIN
+  if (apActive && !WLED_CONNECTED) return true; // the pairing window - see above
+  return false;
+}
+#endif
 
 
 uint16_t crc16(const unsigned char* data_p, size_t length) {

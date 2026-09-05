@@ -596,7 +596,14 @@ WLED_GLOBAL bool aOtaEnabled    _INIT(false);     // ArduinoOTA allows easy upda
 #endif
 WLED_GLOBAL bool otaSameSubnet  _INIT(true);      // prevent OTA updates from other subnets (e.g. internet) if no PIN is set
 WLED_GLOBAL char settingsPIN[5] _INIT(WLED_PIN);  // PIN for settings pages
+#ifdef PIXC_LAN_AUTH
+// LOCKED FROM BOOT. Upstream starts unlocked when no PIN is set, which makes a factory-fresh unit
+// - the one state every sold device passes through - the least protected it will ever be. The app
+// writes the PIN over the pairing AP; until it has, `pixcLanAuthorised()` allows only that window.
+WLED_GLOBAL bool correctPIN     _INIT(false);
+#else
 WLED_GLOBAL bool correctPIN     _INIT(!strlen(settingsPIN));
+#endif
 WLED_GLOBAL unsigned long lastEditTime _INIT(0);
 
 WLED_GLOBAL uint16_t userVar0 _INIT(0), userVar1 _INIT(0); //available for use in usermod

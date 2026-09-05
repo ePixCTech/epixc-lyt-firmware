@@ -1309,7 +1309,14 @@ bool deserializeConfigSec() {
 #endif
 
   getStringFromJson(settingsPIN, root["pin"], 5);
+#ifdef PIXC_LAN_AUTH
+  // Loading config must never UNLOCK. Upstream recomputes the flag from "is a PIN set", so a config
+  // read on a device with no PIN yet would hand back an unlocked API - including a config read
+  // triggered by a stranger's own write.
+  correctPIN = false;
+#else
   correctPIN = !strlen(settingsPIN);
+#endif
 
   JsonObject ota = root["ota"];
   getStringFromJson(otaPass, ota[F("pwd")], 33);

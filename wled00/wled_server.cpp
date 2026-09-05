@@ -334,7 +334,7 @@ static bool captivePortal(AsyncWebServerRequest *request)
   if (!request->hasHeader(F("Host"))) return false;
 
   String hostH = request->getHeader(F("Host"))->value();
-  if (!isIp(hostH) && hostH.indexOf(F("wled.me")) < 0 && hostH.indexOf(cmDNS) < 0 && hostH.indexOf(':') < 0) {
+  if (!isIp(hostH) && hostH.indexOf(F("epixc.in")) < 0 && hostH.indexOf(cmDNS) < 0 && hostH.indexOf(':') < 0) {
     DEBUG_PRINTLN(F("Captive portal"));
     AsyncWebServerResponse *response = request->beginResponse(302);
     response->addHeader(F("Location"), F("http://4.3.2.1"));
@@ -414,6 +414,24 @@ void initServer()
 
   const static char _json[] PROGMEM = "/json";
   server.on(FPSTR(_json), HTTP_GET, [](AsyncWebServerRequest *request){
+#ifdef PIXC_LAN_AUTH
+    // A read is gated too, founder's call 2026-09-05. `serveJson` answers /json/info with the SSID,
+    // the IP, the MAC-derived name and the build - a map of the house drawn for anybody who asks -
+    // and /json/state with everything needed to write a convincing forgery back. The cost is that
+    // the app must hold a PIN before it can render a device tile from the LAN, which it does: the
+    // same PIN it wrote during pairing.
+    //
+    // `?pin=` is read here because a GET HAS NO BODY. Every other unlock in this firmware arrives
+    // as a `pin` key inside a JSON object; a read has nowhere to put one, so without this the
+    // gated read would be unreachable by any correct client - a rule with no way to satisfy it.
+    // It goes through `checkSettingsPIN` like every other attempt, so the brute-force cooldown and
+    // the 15-minute relock apply unchanged.
+    //
+    // A PIN in a query string is logged by proxies in a way a body is not. On a LAN request to a
+    // device on the same subnet there is no proxy, and the alternative was leaving reads open.
+    if (request->hasArg(F("pin"))) checkSettingsPIN(request->arg(F("pin")).c_str());
+    if (!pixcLanAuthorised()) { serveJsonError(request, 401, ERR_DENIED); return; }
+#endif
     serveJson(request);
   });
 
@@ -437,6 +455,21 @@ void initServer()
 
     const String& url = request->url();
     isConfig = url.indexOf(F("cfg")) > -1;
+#ifdef PIXC_LAN_AUTH
+    // THE GAP THIS WHOLE CHANGE EXISTS FOR. Upstream checks the PIN on the `isConfig` arm below and
+    // nothing on the other one, so `POST /json {"on":false}` from any device on the network reached
+    // `deserializeState()` untouched. Gated here rather than inside `deserializeState` because that
+    // function is also reached from MQTT, presets and the API - paths that have already been
+    // authorised by other means and must not start demanding a LAN PIN.
+    //
+    // AFTER `checkSettingsPIN` above, deliberately: it lets one request carry both the credential
+    // and the command, `{"pin":"4821","on":true}`, which is what the app sends on a cold LAN start.
+    if (!pixcLanAuthorised()) {
+      releaseJSONBufferLock();
+      serveJsonError(request, 401, ERR_DENIED);
+      return;
+    }
+#endif
     if (!isConfig) {
       /*
       #ifdef WLED_DEBUG
@@ -690,6 +723,18 @@ void initServer()
       return;
     }
 
+#ifdef PIXC_LAN_AUTH
+    // The third open write path, and the least obvious: the legacy query API arrives through the
+    // NOT-FOUND handler, so `/win&A=128&FX=9` is a full state write that never passes any of the
+    // checks a reader would think to look at. It is gated here, before `handleSet` sees it, and the
+    // reply is deliberately the same 401 the JSON API gives rather than the 404 this handler exists
+    // to serve - a stranger learns that the endpoint is protected, which is not worth hiding, and
+    // the app's own diagnostics can tell "locked" from "gone".
+    if (!pixcLanAuthorised() && request->url().indexOf(F("win")) > -1) {
+      request->send(401, FPSTR(CONTENT_TYPE_PLAIN), F("Locked. Unlock with the app."));
+      return;
+    }
+#endif
     if(handleSet(request, request->url())) return;
     #ifndef WLED_DISABLE_ALEXA
     if(espalexa.handleAlexaApiCall(request)) return;
