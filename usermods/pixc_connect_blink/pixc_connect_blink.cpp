@@ -788,9 +788,15 @@ class PixcConnectBlink : public Usermod {
       top["apiHost"] = _apiHost;
       top["apiPort"] = _apiPort;
       // `settingsPin` is deliberately NOT written back. This same function answers
-      // `GET /json/cfg`, which is unauthenticated, so echoing the PIN here would publish the
-      // credential to exactly the caller it exists to stop. WLED keeps settingsPIN in wsec.json
-      // for the same reason, and that is where this one is persisted.
+      // `GET /json/cfg`, and echoing the PIN here would publish the credential to exactly the
+      // caller it exists to stop. WLED keeps settingsPIN in wsec.json for the same reason, and
+      // that is where this one is persisted.
+      //
+      // That read is NO LONGER UNAUTHENTICATED, as this comment said until 2026-09-05 - the GET
+      // gate added with `PIXC_LAN_AUTH` covers `/json` and every sub-path, `cfg` among them
+      // (`serveJson` picks the target from the URL, so one handler answers them all). The rule
+      // above stands anyway, and deliberately: a credential that is only safe because of a check
+      // somewhere else is one flag away from not being safe, and this is the flag.
     }
 
     bool readFromConfig(JsonObject& root) override {
