@@ -560,46 +560,96 @@ void checkSettingsPIN(const char* pin) {
  *
  * An IP is not an identity, and this is not claimed to be one: a host that can spoof the owner's
  * address on the LAN can already read the owner's PIN off the wire (plain HTTP). The fix is for
- * the two holes above, which needed no such capability. The settings pages, /edit and OTA keep the
- * upstream global flag - a browser flow nothing of ours drives.
+ * the two holes above, which needed no such capability. Since the audit, the settings pages, /edit
+ * and OTA ask the same per-caller question (pixcCallerUnlocked) instead of the global flag.
+ */
+/*
+ * Hardening after the 2026-09-23 security audit (D303 follow-up):
+ *  - A DEVICE-WIDE failure budget as well as the per-caller cooldown. Per caller alone let a host
+ *    with seven addresses rotate past a six-slot table and guess at wire speed (a 4-digit PIN in
+ *    minutes) - worse than the global cooldown it replaced. Now: more than kFailBudget wrong PINs
+ *    in kFailWindow locks out every caller NOT already unlocked, for a lockout that doubles each
+ *    time it trips (to 15 min). An unlocked caller never needs to unlock again, so the owner is
+ *    not locked out by it.
+ *  - A refused caller still cooling down is never evicted; a full table refuses newcomers.
+ *  - 64-bit milliseconds: millis() wraps at 49.7 days and would revive a stale unlock.
+ *  - Constant-time compare of exactly four characters.
+ *  - An unlock lasts 15 idle minutes (sliding) and never more than 12 hours in all.
  */
 namespace {
-struct LanCaller { uint32_t ip; unsigned long at; };
-constexpr uint8_t kLanCallers = 6;  // phones, a desktop or two, the web UI: a household, not a fleet
-LanCaller lanAllowed[kLanCallers];  // ip 0 = free slot
+struct LanCaller { uint32_t ip; uint64_t at; uint64_t since; };
+constexpr uint8_t kLanCallers = 6;               // a household's phones, desktops and web UI
+constexpr uint8_t kFailBudget = 10;              // wrong PINs, all callers together...
+constexpr uint64_t kFailWindow = 60000;          // ...per minute, before the lockout
+constexpr uint64_t kLockoutMax = 15ULL * 60000;  // the lockout doubles up to this
+constexpr uint64_t kUnlockMax = 12ULL * 3600000; // absolute ceiling on one unlock
+LanCaller lanAllowed[kLanCallers];               // ip 0 = free slot
 LanCaller lanRefused[kLanCallers];
+uint64_t failWindowStart = 0, lockedUntil = 0, lockout = 30000;
+uint8_t failsInWindow = 0;
+
+uint64_t nowMs() {
+#ifdef ARDUINO_ARCH_ESP32
+  return static_cast<uint64_t>(esp_timer_get_time() / 1000);
+#else
+  static uint32_t last = 0; static uint64_t high = 0;  // widen millis() across its wrap
+  uint32_t m = millis(); if (m < last) high += 1ULL << 32; last = m; return high + m;
+#endif
+}
 
 int8_t lanFind(const LanCaller* t, uint32_t ip) {
   for (uint8_t i = 0; i < kLanCallers; i++) if (t[i].ip == ip) return i;
   return -1;
 }
 
-// Remember `ip` now: its own slot, else a free one, else the one heard from longest ago.
-void lanPut(LanCaller* t, uint32_t ip) {
+// Remember `ip` now: its own slot, else a free one, else - allowed table only - the one heard from
+// longest ago. Returns false when the table is full and nothing may be evicted.
+bool lanPut(LanCaller* t, uint32_t ip, bool mayEvict) {
+  const uint64_t now = nowMs();
   int8_t slot = lanFind(t, ip);
   if (slot < 0) slot = lanFind(t, 0);
   if (slot < 0) {
+    if (!mayEvict) return false;
     slot = 0;
-    for (uint8_t i = 1; i < kLanCallers; i++) if (millis() - t[i].at > millis() - t[slot].at) slot = i;
+    for (uint8_t i = 1; i < kLanCallers; i++) if (t[i].at < t[slot].at) slot = i;
   }
+  if (t[slot].ip != ip) t[slot].since = now;
   t[slot].ip = ip;
-  t[slot].at = millis();
+  t[slot].at = now;
+  return true;
+}
+
+bool pinMatches(const char* pin) {
+  if (strlen(settingsPIN) != 4 || strnlen(pin, 5) != 4) return false;  // exactly four, both sides
+  uint8_t diff = 0;
+  for (uint8_t i = 0; i < 4; i++) diff |= static_cast<uint8_t>(settingsPIN[i] ^ pin[i]);  // no early exit
+  return diff == 0;
 }
 }  // namespace
 
 void pixcLanUnlock(uint32_t callerIp, const char* pin) {
   if (!pin || !callerIp) return;
+  const uint64_t now = nowMs();
+  // Expired refusals free their slots, so a full table means callers genuinely cooling down.
+  for (uint8_t i = 0; i < kLanCallers; i++)
+    if (lanRefused[i].ip && now - lanRefused[i].at >= PIN_RETRY_COOLDOWN) lanRefused[i].ip = 0;
+  const bool alreadyIn = lanFind(lanAllowed, callerIp) >= 0;
   int8_t refused = lanFind(lanRefused, callerIp);
-  // This caller's own brute-force cooldown; nobody else's attempts can start it.
-  if (refused >= 0 && millis() - lanRefused[refused].at < PIN_RETRY_COOLDOWN) return;
-  // As in checkSettingsPIN: a device with no PIN yet can never be unlocked by one.
-  if (strlen(settingsPIN) == 4 && strncmp(settingsPIN, pin, 4) == 0) {
-    lanPut(lanAllowed, callerIp);
-    if (refused >= 0) lanRefused[refused].ip = 0;
-  } else {
-    int8_t allowed = lanFind(lanAllowed, callerIp);
-    if (allowed >= 0) lanAllowed[allowed].ip = 0;  // a wrong PIN ends that caller's own unlock
-    lanPut(lanRefused, callerIp);
+  if (refused >= 0) return;                               // this caller's own cooldown
+  if (!alreadyIn && now < lockedUntil) return;            // device-wide lockout; unlocked callers exempt
+  if (pinMatches(pin)) {
+    lanPut(lanAllowed, callerIp, true);
+    return;
+  }
+  int8_t allowed = lanFind(lanAllowed, callerIp);
+  if (allowed >= 0) lanAllowed[allowed].ip = 0;           // a wrong PIN ends that caller's own unlock
+  lanPut(lanRefused, callerIp, false);                    // full of active cooldowns: nothing evicted
+  if (now - failWindowStart > kFailWindow) { failWindowStart = now; failsInWindow = 0; }
+  if (++failsInWindow > kFailBudget) {
+    lockedUntil = now + lockout;
+    lockout = lockout * 2 > kLockoutMax ? kLockoutMax : lockout * 2;
+    failsInWindow = 0;
+    failWindowStart = now;
   }
 }
 
@@ -608,12 +658,21 @@ void pixcLanForgetAll() {
 }
 
 bool pixcLanAuthorised(uint32_t callerIp) {
-  if (apActive && !WLED_CONNECTED) return true; // the pairing window - see above
+  // The pairing window, only for a unit that has never been given a PIN. It used to be open
+  // whenever the setup access point was up with no Wi-Fi - which also happens when a paired unit
+  // loses its router (jammed, or simply rebooting), and the AP's password is the public default.
+  if (apActive && !WLED_CONNECTED && strlen(settingsPIN) == 0) return true;
   int8_t i = callerIp ? lanFind(lanAllowed, callerIp) : -1;
   if (i < 0) return false;
-  if (millis() - lanAllowed[i].at > PIN_TIMEOUT) { lanAllowed[i].ip = 0; return false; }
-  lanAllowed[i].at = millis();
+  const uint64_t now = nowMs();
+  if (now - lanAllowed[i].at > PIN_TIMEOUT || now - lanAllowed[i].since > kUnlockMax) { lanAllowed[i].ip = 0; return false; }
+  if (lockout > 30000 && now > lockedUntil + kLockoutMax) lockout = 30000;  // quiet again: reset the backoff
+  lanAllowed[i].at = now;
   return true;
+}
+
+bool pixcCallerUnlocked(AsyncWebServerRequest* request) {
+  return pixcLanAuthorised(pixcCallerIp(request));
 }
 #endif
 

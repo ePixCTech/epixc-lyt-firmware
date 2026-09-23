@@ -200,7 +200,7 @@ static String msgProcessor(const String& var)
 
 
 static void handleUpload(AsyncWebServerRequest *request, const String& filename, size_t index, uint8_t *data, size_t len, bool isFinal) {
-  if (!correctPIN) {
+  if (!PIXC_UNLOCKED(request)) {
     if (isFinal) request->send(401, FPSTR(CONTENT_TYPE_PLAIN), FPSTR(s_unlock_cfg));
     return;
   }
@@ -239,7 +239,7 @@ static void createEditHandler() {
 
   editHandler = &server.on(F("/edit"), static_cast<WebRequestMethod>(HTTP_GET), [](AsyncWebServerRequest *request) {
     // PIN check for GET/DELETE, for POST it is done in handleUpload()
-    if (!correctPIN) {
+    if (!PIXC_UNLOCKED(request)) {
       serveMessage(request, 401, FPSTR(s_accessdenied), FPSTR(s_unlock_cfg), 254);
       return;
     }
@@ -589,7 +589,7 @@ void initServer()
         setOTAReplied(request);
         return;
       }
-      if (!correctPIN) {
+      if (!PIXC_UNLOCKED(request)) {
         serveMessage(request, 401, FPSTR(s_accessdenied), FPSTR(s_unlock_cfg), 254);
         setOTAReplied(request);
         return;
@@ -638,7 +638,7 @@ void initServer()
         setBootloaderOTAReplied(request);
         return;
       }
-      if (!correctPIN) {
+      if (!PIXC_UNLOCKED(request)) {
         serveMessage(request, 401, FPSTR(s_accessdenied), FPSTR(s_unlock_cfg), 254);
         setBootloaderOTAReplied(request);
         return;
@@ -794,7 +794,7 @@ void serveSettingsJS(AsyncWebServerRequest* request)
     request->send_P(501, FPSTR(CONTENT_TYPE_JAVASCRIPT), PSTR("alert('Settings for this request are not implemented.');"));
     return;
   }
-  if (subPage > 0 && !correctPIN && strlen(settingsPIN)>0) {
+  if (subPage > 0 && !PIXC_UNLOCKED(request) && strlen(settingsPIN)>0) {
     request->send_P(401, FPSTR(CONTENT_TYPE_JAVASCRIPT), PSTR("alert('PIN incorrect.');"));
     return;
   }
@@ -837,7 +837,7 @@ void serveSettings(AsyncWebServerRequest* request, bool post) {
   //else if (url.indexOf("/edit")   >= 0) subPage = 10;
   else subPage = SUBPAGE_WELCOME;
 
-  bool pinRequired = !correctPIN && strlen(settingsPIN) > 0 && (subPage > (WLED_WIFI_CONFIGURED ? SUBPAGE_MENU : SUBPAGE_WIFI) && subPage < SUBPAGE_LOCK);
+  bool pinRequired = !PIXC_UNLOCKED(request) && strlen(settingsPIN) > 0 && (subPage > (WLED_WIFI_CONFIGURED ? SUBPAGE_MENU : SUBPAGE_WIFI) && subPage < SUBPAGE_LOCK);
   if (pinRequired) {
     originalSubPage = subPage;
     subPage = SUBPAGE_PINREQ; // require PIN
@@ -874,12 +874,12 @@ void serveSettings(AsyncWebServerRequest* request, bool post) {
 #ifndef WLED_DISABLE_2D
       case SUBPAGE_2D     : strcpy_P(s, PSTR("2D")); break;
 #endif
-      case SUBPAGE_PINREQ : strcpy_P(s, correctPIN ? PSTR("PIN accepted") : PSTR("PIN rejected")); break;
+      case SUBPAGE_PINREQ : strcpy_P(s, PIXC_UNLOCKED(request) ? PSTR("PIN accepted") : PSTR("PIN rejected")); break;
     }
 
     if (subPage != SUBPAGE_PINREQ) strcat_P(s, PSTR(" settings saved."));
 
-    if (subPage == SUBPAGE_PINREQ && correctPIN) {
+    if (subPage == SUBPAGE_PINREQ && PIXC_UNLOCKED(request)) {
       subPage = originalSubPage; // on correct PIN load settings page the user intended
     } else {
       if (!s2[0]) strcpy_P(s2, s_redirecting);

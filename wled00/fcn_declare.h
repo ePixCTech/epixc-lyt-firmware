@@ -455,6 +455,13 @@ bool pixcLanAuthorised(uint32_t callerIp);
 void pixcLanUnlock(uint32_t callerIp, const char* pin);
 void pixcLanForgetAll();
 uint32_t pixcCallerIp(AsyncWebServerRequest* request);
+bool pixcCallerUnlocked(AsyncWebServerRequest* request);
+// The settings pages, /edit and OTA: per caller with the LAN gate, upstream's global flag without.
+#ifdef PIXC_LAN_AUTH
+#define PIXC_UNLOCKED(req) pixcCallerUnlocked(req)
+#else
+#define PIXC_UNLOCKED(req) correctPIN
+#endif
 #endif
 uint16_t crc16(const unsigned char* data_p, size_t length);
 String computeSHA1(const String& input);

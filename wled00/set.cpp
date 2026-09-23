@@ -18,7 +18,7 @@ void handleSettingsSet(AsyncWebServerRequest *request, byte subPage)
   }
 
   //0: menu 1: wifi 2: leds 3: ui 4: sync 5: time 6: sec 7: DMX 8: usermods 9: N/A 10: 2D
-  if (subPage < 1 || subPage > 10 || !correctPIN) return;
+  if (subPage < 1 || subPage > 10 || !PIXC_UNLOCKED(request)) return;
 
   //WIFI SETTINGS
   if (subPage == SUBPAGE_WIFI)
