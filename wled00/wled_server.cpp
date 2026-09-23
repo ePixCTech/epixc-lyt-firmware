@@ -429,8 +429,8 @@ void initServer()
     //
     // A PIN in a query string is logged by proxies in a way a body is not. On a LAN request to a
     // device on the same subnet there is no proxy, and the alternative was leaving reads open.
-    if (request->hasArg(F("pin"))) checkSettingsPIN(request->arg(F("pin")).c_str());
-    if (!pixcLanAuthorised()) { serveJsonError(request, 401, ERR_DENIED); return; }
+    if (request->hasArg(F("pin"))) pixcLanUnlock(pixcCallerIp(request), request->arg(F("pin")).c_str());
+    if (!pixcLanAuthorised(pixcCallerIp(request))) { serveJsonError(request, 401, ERR_DENIED); return; }
 #endif
     serveJson(request);
   });
@@ -451,7 +451,12 @@ void initServer()
       serveJsonError(request, 400, ERR_JSON);
       return;
     }
+#ifdef PIXC_LAN_AUTH
+    // Per caller (D303): the PIN unlocks the host that sent it, not the device for everybody.
+    if (root.containsKey("pin")) pixcLanUnlock(pixcCallerIp(request), root["pin"].as<const char*>());
+#else
     if (root.containsKey("pin")) checkSettingsPIN(root["pin"].as<const char*>());
+#endif
 
     const String& url = request->url();
     isConfig = url.indexOf(F("cfg")) > -1;
@@ -464,7 +469,7 @@ void initServer()
     //
     // AFTER `checkSettingsPIN` above, deliberately: it lets one request carry both the credential
     // and the command, `{"pin":"4821","on":true}`, which is what the app sends on a cold LAN start.
-    if (!pixcLanAuthorised()) {
+    if (!pixcLanAuthorised(pixcCallerIp(request))) {
       releaseJSONBufferLock();
       serveJsonError(request, 401, ERR_DENIED);
       return;
@@ -480,11 +485,15 @@ void initServer()
       */
       verboseResponse = deserializeState(root);
     } else {
+#ifndef PIXC_LAN_AUTH
+      // With PIXC_LAN_AUTH this caller already passed the per-caller gate above, which is stricter
+      // than the global flag: the global one would admit a caller on the strength of another's PIN.
       if (!correctPIN && strlen(settingsPIN)>0) {
         releaseJSONBufferLock();
         serveJsonError(request, 401, ERR_DENIED);
         return;
       }
+#endif
       verboseResponse = deserializeConfig(root); //use verboseResponse to determine whether cfg change should be saved immediately
     }
     releaseJSONBufferLock();
@@ -730,7 +739,7 @@ void initServer()
     // reply is deliberately the same 401 the JSON API gives rather than the 404 this handler exists
     // to serve - a stranger learns that the endpoint is protected, which is not worth hiding, and
     // the app's own diagnostics can tell "locked" from "gone".
-    if (!pixcLanAuthorised() && request->url().indexOf(F("win")) > -1) {
+    if (!pixcLanAuthorised(pixcCallerIp(request)) && request->url().indexOf(F("win")) > -1) {
       request->send(401, FPSTR(CONTENT_TYPE_PLAIN), F("Locked. Unlock with the app."));
       return;
     }
@@ -928,5 +937,12 @@ void serveSettings(AsyncWebServerRequest* request, bool post) {
     default:                content = PAGE_settings;      len = PAGE_settings_length;      break;
   }
   handleStaticContent(request, "", code, contentType, content, len);
+}
+#endif
+#ifdef PIXC_LAN_AUTH
+// The address the request came from, as the per-caller LAN gate keys on it (util.cpp, D303).
+uint32_t pixcCallerIp(AsyncWebServerRequest* request) {
+  AsyncClient* c = request ? request->client() : nullptr;
+  return c ? (uint32_t)c->remoteIP() : 0;
 }
 #endif

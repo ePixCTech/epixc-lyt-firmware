@@ -73,7 +73,7 @@ CLAIMS = [
                "open because none of those protocols can carry a credential.",
         "evidence": [
             {"file": "wled00/util.cpp", "must": "present",
-             "pattern": r"bool pixcLanAuthorised\(\)"},
+             "pattern": r"bool pixcLanAuthorised\(uint32_t callerIp\)"},
             # THE ENGINE FLATTENS WHITESPACE before matching (`flattened()`, a few lines up:
             # `re.sub(r"\s+", " ", text)`), so this file arrives as one long line. Two patterns
             # were written and both went red on a correct build before that was read: `^...$`

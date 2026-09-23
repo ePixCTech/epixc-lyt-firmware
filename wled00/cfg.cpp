@@ -1308,8 +1308,13 @@ bool deserializeConfigSec() {
   getStringFromJson(hueApiKey, interfaces["hue"][F("key")], 47);
 #endif
 
+#ifdef PIXC_LAN_AUTH
+  char pinBefore[5];
+  strlcpy(pinBefore, settingsPIN, 5);
+#endif
   getStringFromJson(settingsPIN, root["pin"], 5);
 #ifdef PIXC_LAN_AUTH
+  if (strncmp(pinBefore, settingsPIN, 5) != 0) pixcLanForgetAll(); // a new PIN: every caller asks again
   // Loading config must never UNLOCK. Upstream recomputes the flag from "is a PIN set", so a config
   // read on a device with no PIN yet would hand back an unlocked API - including a config read
   // triggered by a stranger's own write.

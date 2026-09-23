@@ -540,10 +540,80 @@ void checkSettingsPIN(const char* pin) {
  * or survive a reboot. ePixC Sync depends on that path. See the Debt Register and
  * [[Offline and LAN-First]].
  */
-bool pixcLanAuthorised() {
-  if (correctPIN) return true;                 // unlocked this session by a correct PIN
+/*
+ * =============================================================================================
+ * PER CALLER, NOT PER DEVICE (Debt Register D303, 2026-09-23)
+ * =============================================================================================
+ * This gate first read the upstream `correctPIN` flag, which is ONE boolean for the whole device.
+ * Two consequences, both found while checking how ePixC Sync talks to a light:
+ *
+ *  1. Anybody on the LAN rode on somebody else's unlock. The moment the app (or ePixC Sync) sent
+ *     the right PIN, every host on the network was authorised for up to 15 minutes, PIN or not.
+ *  2. Anybody could lock the owner out. A wrong PIN from any host set the flag false and started a
+ *     3-second cooldown in which the RIGHT PIN is refused too - repeat every 3 s and the owner's
+ *     app can never unlock: a denial of service needing no credential at all.
+ *
+ * So the unlock is remembered per caller IP: a small table of callers that presented the PIN, each
+ * relocking after PIN_TIMEOUT without a request (sliding, so an app that keeps talking stays in),
+ * and a table of callers that got it wrong, each in its OWN cooldown. A stranger's wrong guesses
+ * now cost the stranger, not the owner. A PIN change forgets every caller.
+ *
+ * An IP is not an identity, and this is not claimed to be one: a host that can spoof the owner's
+ * address on the LAN can already read the owner's PIN off the wire (plain HTTP). The fix is for
+ * the two holes above, which needed no such capability. The settings pages, /edit and OTA keep the
+ * upstream global flag - a browser flow nothing of ours drives.
+ */
+namespace {
+struct LanCaller { uint32_t ip; unsigned long at; };
+constexpr uint8_t kLanCallers = 6;  // phones, a desktop or two, the web UI: a household, not a fleet
+LanCaller lanAllowed[kLanCallers];  // ip 0 = free slot
+LanCaller lanRefused[kLanCallers];
+
+int8_t lanFind(const LanCaller* t, uint32_t ip) {
+  for (uint8_t i = 0; i < kLanCallers; i++) if (t[i].ip == ip) return i;
+  return -1;
+}
+
+// Remember `ip` now: its own slot, else a free one, else the one heard from longest ago.
+void lanPut(LanCaller* t, uint32_t ip) {
+  int8_t slot = lanFind(t, ip);
+  if (slot < 0) slot = lanFind(t, 0);
+  if (slot < 0) {
+    slot = 0;
+    for (uint8_t i = 1; i < kLanCallers; i++) if (millis() - t[i].at > millis() - t[slot].at) slot = i;
+  }
+  t[slot].ip = ip;
+  t[slot].at = millis();
+}
+}  // namespace
+
+void pixcLanUnlock(uint32_t callerIp, const char* pin) {
+  if (!pin || !callerIp) return;
+  int8_t refused = lanFind(lanRefused, callerIp);
+  // This caller's own brute-force cooldown; nobody else's attempts can start it.
+  if (refused >= 0 && millis() - lanRefused[refused].at < PIN_RETRY_COOLDOWN) return;
+  // As in checkSettingsPIN: a device with no PIN yet can never be unlocked by one.
+  if (strlen(settingsPIN) == 4 && strncmp(settingsPIN, pin, 4) == 0) {
+    lanPut(lanAllowed, callerIp);
+    if (refused >= 0) lanRefused[refused].ip = 0;
+  } else {
+    int8_t allowed = lanFind(lanAllowed, callerIp);
+    if (allowed >= 0) lanAllowed[allowed].ip = 0;  // a wrong PIN ends that caller's own unlock
+    lanPut(lanRefused, callerIp);
+  }
+}
+
+void pixcLanForgetAll() {
+  for (uint8_t i = 0; i < kLanCallers; i++) lanAllowed[i].ip = lanRefused[i].ip = 0;
+}
+
+bool pixcLanAuthorised(uint32_t callerIp) {
   if (apActive && !WLED_CONNECTED) return true; // the pairing window - see above
-  return false;
+  int8_t i = callerIp ? lanFind(lanAllowed, callerIp) : -1;
+  if (i < 0) return false;
+  if (millis() - lanAllowed[i].at > PIN_TIMEOUT) { lanAllowed[i].ip = 0; return false; }
+  lanAllowed[i].at = millis();
+  return true;
 }
 #endif
 
