@@ -847,6 +847,12 @@ class PixcConnectBlink : public Usermod {
         // ordinary config save that follows this call, so without this the PIN would hold until
         // the next reboot and then silently vanish — a lock that quietly stops locking.
         serializeConfigSec();
+#ifdef PIXC_LAN_AUTH
+        // Every remembered LAN unlock was granted on the old PIN. The server rotates the PIN when
+        // someone who knew it leaves the home (D305); an unlock that outlived the rotation would
+        // keep them in. The settings page and /json/cfg paths already forget; this one did not.
+        pixcLanForgetAll();
+#endif
         DEBUG_PRINTLN(F("[ePixC] settings PIN set"));
       }
 
@@ -963,7 +969,9 @@ class PixcConnectBlink : public Usermod {
       // and `/reset` triggers a factory wipe.
       if (mqtt != nullptr) {
         String base = mqttDeviceTopic;
-        mqtt->subscribe((base + "/cfg").c_str(), 0);
+        // QoS 1: /cfg carries the rotated settings PIN, which is not retained. At QoS 0 a lost
+        // message left the server waiting for a PIN the controller never got (D305).
+        mqtt->subscribe((base + "/cfg").c_str(), 1);
         mqtt->subscribe((base + "/reset").c_str(), 0);
         mqtt->subscribe((base + "/ota").c_str(), 0);
       }
