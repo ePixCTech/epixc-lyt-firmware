@@ -429,8 +429,10 @@ void initServer()
     //
     // A PIN in a query string is logged by proxies in a way a body is not. On a LAN request to a
     // device on the same subnet there is no proxy, and the alternative was leaving reads open.
-    if (request->hasArg(F("pin"))) pixcLanUnlock(pixcCallerIp(request), request->arg(F("pin")).c_str());
-    if (!pixcLanAuthorised(pixcCallerIp(request))) { serveJsonError(request, 401, ERR_DENIED); return; }
+    // A read carries its PIN every time and is authorised by it alone, never remembered (D304).
+    const bool readPin = request->hasArg(F("pin")) &&
+        pixcLanUnlock(pixcCallerIp(request), request->arg(F("pin")).c_str(), false);
+    if (!readPin && !pixcLanAuthorised(pixcCallerIp(request))) { serveJsonError(request, 401, ERR_DENIED); return; }
 #endif
     serveJson(request);
   });
@@ -453,7 +455,10 @@ void initServer()
     }
 #ifdef PIXC_LAN_AUTH
     // Per caller (D303): the PIN unlocks the host that sent it, not the device for everybody.
-    if (root.containsKey("pin")) pixcLanUnlock(pixcCallerIp(request), root["pin"].as<const char*>());
+    // A PIN with a command authorises that request only; a PIN on its own (the web page's prompt)
+    // unlocks the browser for a while (D304).
+    const bool thisPin = root.containsKey("pin") &&
+        pixcLanUnlock(pixcCallerIp(request), root["pin"].as<const char*>(), root.size() == 1);
 #else
     if (root.containsKey("pin")) checkSettingsPIN(root["pin"].as<const char*>());
 #endif
@@ -469,7 +474,7 @@ void initServer()
     //
     // AFTER `checkSettingsPIN` above, deliberately: it lets one request carry both the credential
     // and the command, `{"pin":"4821","on":true}`, which is what the app sends on a cold LAN start.
-    if (!pixcLanAuthorised(pixcCallerIp(request))) {
+    if (!thisPin && !pixcLanAuthorised(pixcCallerIp(request))) {
       releaseJSONBufferLock();
       serveJsonError(request, 401, ERR_DENIED);
       return;

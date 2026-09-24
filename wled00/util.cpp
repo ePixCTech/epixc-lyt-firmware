@@ -627,19 +627,27 @@ bool pinMatches(const char* pin) {
 }
 }  // namespace
 
-void pixcLanUnlock(uint32_t callerIp, const char* pin) {
-  if (!pin || !callerIp) return;
+/*
+ * D304 (2026-09-24): an unlock was remembered for the caller's IP for 15 idle minutes, so whoever
+ * got that address next (a DHCP lease handed on, several phones behind one NAT, a guest network)
+ * inherited it. ePixC's own clients (the app and Sync) send the PIN with EVERY request, so for them
+ * nothing needs remembering: `remember` is false and a right PIN authorises that request alone.
+ * Only a PIN sent on its own, which is how the stock web page's prompt unlocks a browser, is
+ * remembered. Returns whether this PIN was right.
+ */
+bool pixcLanUnlock(uint32_t callerIp, const char* pin, bool remember) {
+  if (!pin || !callerIp) return false;
   const uint64_t now = nowMs();
   // Expired refusals free their slots, so a full table means callers genuinely cooling down.
   for (uint8_t i = 0; i < kLanCallers; i++)
     if (lanRefused[i].ip && now - lanRefused[i].at >= PIN_RETRY_COOLDOWN) lanRefused[i].ip = 0;
   const bool alreadyIn = lanFind(lanAllowed, callerIp) >= 0;
   int8_t refused = lanFind(lanRefused, callerIp);
-  if (refused >= 0) return;                               // this caller's own cooldown
-  if (!alreadyIn && now < lockedUntil) return;            // device-wide lockout; unlocked callers exempt
+  if (refused >= 0) return false;                         // this caller's own cooldown
+  if (!alreadyIn && now < lockedUntil) return false;      // device-wide lockout; unlocked callers exempt
   if (pinMatches(pin)) {
-    lanPut(lanAllowed, callerIp, true);
-    return;
+    if (remember) lanPut(lanAllowed, callerIp, true);
+    return true;
   }
   int8_t allowed = lanFind(lanAllowed, callerIp);
   if (allowed >= 0) lanAllowed[allowed].ip = 0;           // a wrong PIN ends that caller's own unlock
@@ -651,6 +659,7 @@ void pixcLanUnlock(uint32_t callerIp, const char* pin) {
     failsInWindow = 0;
     failWindowStart = now;
   }
+  return false;
 }
 
 void pixcLanForgetAll() {

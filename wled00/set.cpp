@@ -12,7 +12,7 @@ void handleSettingsSet(AsyncWebServerRequest *request, byte subPage)
     checkSettingsPIN(request->arg(F("PIN")).c_str());
 #ifdef PIXC_LAN_AUTH
     // The web UI's own PIN prompt: unlock the browser that answered it for the JSON API too.
-    pixcLanUnlock(pixcCallerIp(request), request->arg(F("PIN")).c_str());
+    pixcLanUnlock(pixcCallerIp(request), request->arg(F("PIN")).c_str(), true);  // the settings page: a browser
 #endif
     return;
   }

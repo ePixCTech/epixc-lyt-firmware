@@ -452,7 +452,7 @@ int16_t extractModeDefaults(uint8_t mode, const char *segVar);
 void checkSettingsPIN(const char *pin);
 #ifdef PIXC_LAN_AUTH
 bool pixcLanAuthorised(uint32_t callerIp);
-void pixcLanUnlock(uint32_t callerIp, const char* pin);
+bool pixcLanUnlock(uint32_t callerIp, const char* pin, bool remember);
 void pixcLanForgetAll();
 uint32_t pixcCallerIp(AsyncWebServerRequest* request);
 bool pixcCallerUnlocked(AsyncWebServerRequest* request);
