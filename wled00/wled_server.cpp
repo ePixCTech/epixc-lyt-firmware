@@ -412,6 +412,17 @@ void initServer()
   });
 #endif
 
+#ifdef PIXC_LAN_AUTH
+  // Who am I, with no PIN: the MAC only, which anyone on the LAN already sees in ARP. ePixC's app
+  // and Sync compare it with the MAC the cloud holds BEFORE they send the PIN, so a host that took
+  // over the light's address is never handed it (D308 interim; the full fix is a long per-device
+  // LAN secret). /json/info stays gated: it is a map of the house. Registered before /json, whose
+  // handler would otherwise catch this path as a prefix.
+  server.on(F("/json/id"), HTTP_GET, [](AsyncWebServerRequest *request){
+    request->send(200, FPSTR(CONTENT_TYPE_JSON), String(F("{\"mac\":\"")) + escapedMac + F("\"}"));
+  });
+#endif
+
   const static char _json[] PROGMEM = "/json";
   server.on(FPSTR(_json), HTTP_GET, [](AsyncWebServerRequest *request){
 #ifdef PIXC_LAN_AUTH
