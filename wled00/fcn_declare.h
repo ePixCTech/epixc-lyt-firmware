@@ -177,7 +177,15 @@ void serializeState(JsonObject root, bool forPreset = false, bool includeBri = t
 void serializeInfo(JsonObject root);
 void serializeModeNames(JsonArray arr);
 void serializePins(JsonObject root);
+#ifdef PIXC_LAN_AUTH
+struct PixcReplySigner;
+// `signer`: sign the reply (pairing v2). `lockHeld`: the caller already holds the JSON buffer lock,
+// so serveJson must not defer - a deferred request is run again, and a signed request run twice is
+// refused as a replay.
+void serveJson(AsyncWebServerRequest* request, const PixcReplySigner* signer = nullptr, bool lockHeld = false);
+#else
 void serveJson(AsyncWebServerRequest* request);
+#endif
 #ifdef WLED_ENABLE_JSONLIVE
 bool serveLiveLeds(AsyncWebServerRequest* request, uint32_t wsClient = 0);
 #endif
@@ -450,6 +458,13 @@ uint8_t extractModeName(uint8_t mode, const char *src, char *dest, uint8_t maxLe
 uint8_t extractModeSlider(uint8_t mode, uint8_t slider, char *dest, uint8_t maxLen, uint8_t *var = nullptr);
 int16_t extractModeDefaults(uint8_t mode, const char *segVar);
 void checkSettingsPIN(const char *pin);
+// The settings pages, /edit and OTA upload (all compiled out of ePixC builds): with PIXC_LAN_AUTH
+// never unlocked - the signed LAN API (pixc_lan.h) is the only way in; upstream's flag without.
+#ifdef PIXC_LAN_AUTH
+#define PIXC_UNLOCKED(req) false
+#else
+#define PIXC_UNLOCKED(req) correctPIN
+#endif
 uint16_t crc16(const unsigned char* data_p, size_t length);
 String computeSHA1(const String& input);
 String getDeviceId();

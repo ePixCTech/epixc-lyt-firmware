@@ -25,6 +25,24 @@
 #define PIXC_OTA_PUBKEY_PEM ""
 
 // -----------------------------------------------------------------------------
+// CI ONLY - NEVER SHIPPABLE. `PixC_V1_citest` (platformio_override.ini) sets
+// EPIXC_CI_TEST_ONLY_OTA_KEY so CI can compile, size-check and gate-check a release-SHAPED image
+// (no dev flags, no plaintext paths) while the real key does not exist yet (D184). The key below is
+// a throwaway P-256 public key whose private half was discarded when it was generated on
+// 2026-09-25: nothing can sign for it, so an image built this way refuses every OTA, exactly like
+// an unsigned dev image. It reports "-CI-TEST-KEY" in its version and CI uploads it under a
+// NOT-SHIPPABLE artifact name. The static_assert below still guards every other build.
+// -----------------------------------------------------------------------------
+#ifdef EPIXC_CI_TEST_ONLY_OTA_KEY
+  #undef PIXC_OTA_PUBKEY_PEM
+  #define PIXC_OTA_PUBKEY_PEM \
+    "-----BEGIN PUBLIC KEY-----\n" \
+    "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE+mwPzzuKWEmMljqq5sntR6nX3wS3\n" \
+    "E6/+UCycr/U9YRws/PUkvebZQSyPW4QGubpauwqWDbbBVuE4e1zYvlfB0w==\n" \
+    "-----END PUBLIC KEY-----\n"
+#endif
+
+// -----------------------------------------------------------------------------
 // Build-time guard. The runtime check in verifySignature() is fail-closed and stays that way —
 // this is about *when* you find out.
 //

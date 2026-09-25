@@ -496,6 +496,7 @@ void handleNotifications()
   }
 
   //hyperion / raw RGB
+#ifndef PIXC_LAN_AUTH   // ePixC: the Hyperion socket is never opened (wled.cpp); compiled out as well
   if (!packetSize && udpRgbConnected) {
     packetSize = rgbUdp.parsePacket();
     if (packetSize) {
@@ -516,6 +517,7 @@ void handleNotifications()
       return;
     }
   }
+#endif
 
   localIP = Network.localIP();
   //notifier and UDP realtime
@@ -566,6 +568,20 @@ void handleNotifications()
     return;
   }
 
+#ifdef PIXC_LAN_AUTH
+  // =============================================================================================
+  // ePixC LAN gate, UDP side (audit S2). Everything below this point on the notifier port is
+  // refused: TPM2.NET and WARLS/DRGB/DRGBW/DNRGB realtime, WLED's HTTP-style API ("A=128&FX=9",
+  // any packet starting A-Z) and the JSON API (any packet starting '{'). The last two reached
+  // handleSet()/deserializeState() - reboot, preset writes, full state - with no PIN from any host
+  // on the LAN, including by broadcast. UDP has no field to carry a credential, so they are not
+  // gated, they are gone. The app and ePixC Sync use none of them (HTTP JSON with a PIN, and DDP).
+  // The one UDP control input left on this socket is WLED's sync notifier above, off by default
+  // (receiveGroups = 0, wled.h). What stays open on the LAN is written down in util.cpp,
+  // pixcLanAuthorised(), "WHAT THIS DOES NOT COVER".
+  // =============================================================================================
+  return;
+#else
   if (receiveDirect) {
     //TPM2.NET
     if (udpIn[0] == 0x9c) {
@@ -663,6 +679,7 @@ void handleNotifications()
   }
 
   UsermodManager::onUdpPacket(udpIn, packetSize);
+#endif  // PIXC_LAN_AUTH
 }
 
 

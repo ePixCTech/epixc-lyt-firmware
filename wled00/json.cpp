@@ -1,4 +1,7 @@
 #include "wled.h"
+#ifdef PIXC_LAN_AUTH
+#include "pixc_lan.h"
+#endif
 
 #define JSON_PATH_STATE      1
 #define JSON_PATH_INFO       2
@@ -1298,40 +1301,72 @@ class LockedJsonResponse: public AsyncJsonResponse {
   virtual ~LockedJsonResponse() { if (_holding_lock) releaseJSONBufferLock(); };
 };
 
+#ifdef PIXC_LAN_AUTH
+void serveJson(AsyncWebServerRequest* request, const PixcReplySigner* signer, bool lockHeld)
+#else
 void serveJson(AsyncWebServerRequest* request)
+#endif
 {
+#ifndef PIXC_LAN_AUTH
+  constexpr bool lockHeld = false;
+#endif
   enum class json_target {
     all, state, info, state_info, nodes, effects, palettes, networks, config, pins
   };
   json_target subJson = json_target::all;
 
   const String& url = request->url();
+#ifdef PIXC_LAN_AUTH
+  // /json/pixc/... is not served on the signed API (pixc_lan_auth.h, isPixcNamespace) - the same
+  // signed 404 on GET as on POST, rather than whatever the substring matching below would pick.
+  if (pixc::lan::isPixcNamespace(url.c_str())) {
+    if (lockHeld) releaseJSONBufferLock();
+    if (signer) pixcSendSigned(request, *signer, 404, CONTENT_TYPE_JSON, pixc::lan::kNotFoundBody);
+    else request->send(404, FPSTR(CONTENT_TYPE_JSON), pixc::lan::kNotFoundBody);
+    return;
+  }
+#endif
   if      (url.indexOf("state")    > 0) subJson = json_target::state;
   else if (url.indexOf("info")     > 0) subJson = json_target::info;
   else if (url.indexOf("si")       > 0) subJson = json_target::state_info;
   else if (url.indexOf(F("nodes")) > 0) subJson = json_target::nodes;
   else if (url.indexOf(F("eff"))   > 0) subJson = json_target::effects;
   else if (url.indexOf(F("palx"))  > 0) subJson = json_target::palettes;
+#ifdef PIXC_LAN_AUTH
+  // Effect metadata is not served on the signed LAN API: its reply is streamed and cannot be signed
+  // here, and a client drops unsigned replies. The app reads effect data from its own catalogue.
+  else if (url.indexOf(F("fxda"))  > 0) { if (lockHeld) releaseJSONBufferLock(); if (signer) pixcSendSigned(request, *signer, 404, CONTENT_TYPE_JSON, "{\"error\":\"NOT_FOUND\"}"); else serveJsonError(request, 404, ERR_NOT_IMPL); return; }
+#else
   else if (url.indexOf(F("fxda"))  > 0) { respondModeData(request); return; }
+#endif
   else if (url.indexOf(F("net"))   > 0) subJson = json_target::networks;
   else if (url.indexOf(F("cfg"))   > 0) subJson = json_target::config;
   else if (url.indexOf(F("pins"))  > 0) subJson = json_target::pins;
   #ifdef WLED_ENABLE_JSONLIVE
   else if (url.indexOf("live")     > 0) {
+    if (lockHeld) releaseJSONBufferLock();
     serveLiveLeds(request);
     return;
   }
   #endif
   else if (url.indexOf("pal") > 0) {
+    if (lockHeld) releaseJSONBufferLock();
+#ifdef PIXC_LAN_AUTH
+    if (signer) { pixcSendSigned(request, *signer, 200, CONTENT_TYPE_JSON, JSON_palette_names); return; }
+#endif
     request->send_P(200, FPSTR(CONTENT_TYPE_JSON), JSON_palette_names);
     return;
   }
   else if (url.length() > 6) { //not just /json
+    if (lockHeld) releaseJSONBufferLock();
+#ifdef PIXC_LAN_AUTH
+    if (signer) { pixcSendSigned(request, *signer, 501, CONTENT_TYPE_JSON, "{\"error\":\"NOT_IMPLEMENTED\"}"); return; }
+#endif
     serveJsonError(request, 501, ERR_NOT_IMPL);
     return;
   }
 
-  if (!requestJSONBufferLock(JSON_LOCK_SERVEJSON)) {
+  if (!lockHeld && !requestJSONBufferLock(JSON_LOCK_SERVEJSON)) {
     request->deferResponse();    
     return;
   }
@@ -1379,6 +1414,17 @@ void serveJson(AsyncWebServerRequest* request)
   [[maybe_unused]] size_t len = response->setLength();
   DEBUG_PRINTF_P(PSTR("JSON content length: %u\n"), len);
 
+#ifdef PIXC_LAN_AUTH
+  // Pairing v2: sign the reply. ArduinoJson's output is deterministic, so hashing a serialization
+  // into a streaming SHA-256 gives the digest of exactly the bytes the response will send.
+  if (signer != nullptr && signer->active) {
+    PixcHashPrint hp;
+    serializeJson(lDoc, hp);
+    char bh[65];
+    hp.hex(bh);
+    pixcSignResponse(response, *signer, bh);
+  }
+#endif
   request->send(response);
 }
 

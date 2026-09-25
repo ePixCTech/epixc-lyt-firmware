@@ -1,5 +1,9 @@
 #define WLED_DEFINE_GLOBAL_VARS //only in one source file, wled.cpp!
 #include "wled.h"
+#ifdef PIXC_LAN_AUTH
+#include "pixc_device.h"
+#include "../usermods/pixc_connect_blink/pixc_logic.h"
+#endif
 #include "wled_ethernet.h"
 #include "ota_update.h"
 #ifdef WLED_ENABLE_AOTA
@@ -62,6 +66,10 @@ void WLED::loop()
   handleIR();        // 2nd call to function needed for ESP32 to return valid results -- should be good for ESP8266, too
   #endif
   handleConnection();
+  #if defined(PIXC_MQTT_ESP_IDF) && !defined(WLED_DISABLE_MQTT)
+  // ePixC: MQTT callbacks run here, on the loop task, not on esp-mqtt's (pixc_mqtt_client.h).
+  if (mqtt != nullptr) mqtt->loop();
+  #endif
   #ifdef WLED_ENABLE_ADALIGHT
   handleSerial();
   #endif
@@ -539,7 +547,7 @@ void WLED::setup()
   #endif
 
   // fill in unique mdns default
-  if (strcmp(cmDNS, DEFAULT_MDNS_NAME) == 0) sprintf_P(cmDNS, PSTR("wled-%*s"), 6, escapedMac.c_str() + 6);
+  if (strcmp(cmDNS, DEFAULT_MDNS_NAME) == 0) sprintf_P(cmDNS, PSTR("epixc-%*s"), 6, escapedMac.c_str() + 6);
 #ifndef WLED_DISABLE_MQTT
   if (mqttDeviceTopic[0] == 0) sprintf_P(mqttDeviceTopic, PSTR("wled/%*s"), 6, escapedMac.c_str() + 6);
   if (mqttClientID[0] == 0)    sprintf_P(mqttClientID, PSTR("WLED-%*s"), 6, escapedMac.c_str() + 6);
@@ -600,7 +608,9 @@ void WLED::setup()
   #if defined(ARDUINO_ARCH_ESP32) && defined(WLED_DISABLE_BROWNOUT_DET)
   WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 1); //enable brownout detector
   #endif
+#ifndef PIXC_CONFIRM_ON_BROKER
   markOTAvalid();
+#endif  // ePixC confirms the image once it reaches the broker (pixc_connect_blink, D35)
 }
 
 void WLED::beginStrip()
@@ -648,10 +658,31 @@ void WLED::initAP(bool resetAP)
   if (apBehavior == AP_BEHAVIOR_BUTTON_ONLY && !resetAP)
     return;
 
+#ifdef PIXC_LAN_AUTH
+  // Pairing v2 hotspot (audit S4/S16, D306): "ePixC-XXXX" from the MAC, so two lights in range are
+  // told apart, and the per-unit password from factory NVS, printed on the label as a Wi-Fi QR. No
+  // config value chooses either. A release unit with no factory password opens NO hotspot: it
+  // must never broadcast a guessable one (dev builds fall back to PIXC_DEV_AP_PSK).
+  {
+    // Factory NVS cannot change while running, so "no password" is decided once: handleConnection()
+    // calls initAP() on every loop pass while offline, and an NVS open each time stalls the LEDs.
+    static int8_t havePsk = -1;
+    if (havePsk == 0) return;
+    pixc::hotspotName(escapedMac.c_str(), apSSID, sizeof(apSSID));
+    if (!pixcFactoryApPsk(apPass, sizeof(apPass))) {
+      havePsk = 0;
+      DEBUG_PRINTLN(F("[ePixC] no factory hotspot password: hotspot stays off"));
+      return;
+    }
+    havePsk = 1;
+    apHide = 0;
+  }
+#else
   if (resetAP) {
     WLED_SET_AP_SSID();
     strcpy_P(apPass, PSTR(WLED_AP_PASS));
   }
+#endif
   DEBUG_PRINT(F("Opening access point "));
   DEBUG_PRINTLN(apSSID);
   WiFi.softAPConfig(IPAddress(4, 3, 2, 1), IPAddress(4, 3, 2, 1), IPAddress(255, 255, 255, 0));
@@ -668,6 +699,7 @@ void WLED::initAP(bool resetAP)
     if (udpPort > 0 && udpPort != ntpLocalPort) {
       udpConnected = notifierUdp.begin(udpPort);
     }
+#ifndef PIXC_LAN_AUTH   // ePixC: only DDP is a realtime input - see handleNotifications() in udp.cpp
     if (udpRgbPort > 0 && udpRgbPort != ntpLocalPort && udpRgbPort != udpPort) {
       udpRgbConnected = rgbUdp.begin(udpRgbPort);
     }
@@ -675,6 +707,7 @@ void WLED::initAP(bool resetAP)
       udp2Connected = notifier2Udp.begin(udpPort2);
     }
     e131.begin(false, e131Port, e131Universe, E131_MAX_UNIVERSE_COUNT);
+#endif
     ddp.begin(false, DDP_DEFAULT_PORT);
 
     dnsServer.setErrorReplyCode(DNSReplyCode::NoError);
@@ -849,29 +882,41 @@ void WLED::initInterfaces()
   if (aOtaEnabled) ArduinoOTA.begin();
 #endif
 
-  // mDNS responder DISABLED for ePixC — the app discovers devices by scanning
-  // for the ePixC-AP Wi-Fi SSID (initial pairing) and via the cloud once
-  // provisioned, so no mDNS advertisement is needed.
-  // if (strlen(cmDNS) > 0) {
-  //   MDNS.end();
-  //   MDNS.begin(cmDNS);
-  //   MDNS.addService("http", "tcp", 80);
-  //   MDNS.addService("wled", "tcp", 80);
-  //   MDNS.addServiceTxt("wled", "tcp", "mac", escapedMac.c_str());
-  // }
+#ifdef PIXC_LAN_AUTH
+  // ePixC LAN discovery (audit P3, pairing v2): `_pixc._tcp` on port 80 with TXT mac=<12 hex> and
+  // v=2, which the app browses for (app_config.dart lanService). It matches `mac` against the
+  // home's lights, then trusts the address only after a signed reply. Nothing else is advertised:
+  // no `_http`, no `_wled`. Cost: the IDF mDNS task (4 KB stack, CONFIG_MDNS_TASK_STACK_SIZE) and a
+  // few KB of heap for the service records - check free_heap in the health telemetry.
+  if (strlen(cmDNS) > 0) {
+    MDNS.end();   // "end" before a second "begin", https://github.com/esp8266/Arduino/issues/7213
+    if (MDNS.begin(cmDNS)) {
+      MDNS.addService("pixc", "tcp", 80);
+      MDNS.addServiceTxt("pixc", "tcp", "mac", escapedMac.c_str());
+      MDNS.addServiceTxt("pixc", "tcp", "v", "2");
+      DEBUG_PRINTLN(F("mDNS started: _pixc._tcp"));
+    }
+  }
+#endif
   server.begin();
 
   if (udpPort > 0 && udpPort != ntpLocalPort) {
     udpConnected = notifierUdp.begin(udpPort);
+#ifndef PIXC_LAN_AUTH   // ePixC: no Hyperion (19446) and no supplemental notifier/TPM2 port (65506)
     if (udpConnected && udpRgbPort != udpPort)
       udpRgbConnected = rgbUdp.begin(udpRgbPort);
     if (udpConnected && udpPort2 != udpPort && udpPort2 != udpRgbPort)
       udp2Connected = notifier2Udp.begin(udpPort2);
+#endif
   }
   if (ntpEnabled)
     ntpConnected = ntpUdp.begin(ntpLocalPort);
 
+#ifndef PIXC_LAN_AUTH
+  // ePixC: no E1.31 / Art-Net listener. Neither the app nor ePixC Sync speaks it (Sync is DDP-only,
+  // epixc-sync src/ddp.cpp), and like every realtime protocol it carries no credential.
   e131.begin(e131Multicast, e131Port, e131Universe, E131_MAX_UNIVERSE_COUNT);
+#endif
   ddp.begin(false, DDP_DEFAULT_PORT);
   reconnectHue();
   interfacesInited = true;

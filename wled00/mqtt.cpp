@@ -5,6 +5,9 @@
  */
 
 #ifndef WLED_DISABLE_MQTT
+#ifdef PIXC_MQTT_ESP_IDF
+#include "../usermods/pixc_connect_blink/pixc_logic.h"   // redactJsonSecrets() for debug output
+#endif
 #define MQTT_KEEP_ALIVE_TIME 60    // contact the MQTT broker every 60 seconds
 
 #if MQTT_MAX_TOPIC_LEN > 32
@@ -35,11 +38,20 @@ static void onMqttConnect(bool sessionPresent)
   char subuf[MQTT_MAX_TOPIC_LEN + 9];
 
   if (mqttDeviceTopic[0] != 0) {
+#ifdef PIXC_MQTT_ESP_IDF
+    // ePixC: the cloud speaks only `<base>/api` (plus the usermod's /cfg, /reset, /ota), and
+    // publishes it at QoS 1 - a QoS 0 subscription downgraded every command to fire-and-forget.
+    // The bare device topic ("ON"/"T"/a number) and `/col` are WLED home-automation surfaces no
+    // part of ePixC uses; not subscribing them removes two unauthenticated-by-design parsers.
+    snprintf_P(subuf, sizeof(subuf)-1, sTopicFormat, MQTT_MAX_TOPIC_LEN, mqttDeviceTopic, "api");
+    mqtt->subscribe(subuf, 1);
+#else
     mqtt->subscribe(mqttDeviceTopic, 0);
     snprintf_P(subuf, sizeof(subuf)-1, sTopicFormat, MQTT_MAX_TOPIC_LEN, mqttDeviceTopic, "col");
     mqtt->subscribe(subuf, 0);
     snprintf_P(subuf, sizeof(subuf)-1, sTopicFormat, MQTT_MAX_TOPIC_LEN, mqttDeviceTopic, "api");
     mqtt->subscribe(subuf, 0);
+#endif
   }
 
   if (mqttGroupTopic[0] != 0) {
@@ -89,7 +101,23 @@ static void onMqttMessage(char* topic, char* payload, AsyncMqttClientMessageProp
     DEBUG_PRINTLN(F("MQTT partial packet received."));
     return; // process next packet
   }
+#ifdef PIXC_MQTT_ESP_IDF
+  // Never the raw payload: the cloud /cfg carries the settings PIN, and WLED_DEBUG builds print to
+  // a UART header anyone with the board can read. A redacted copy keeps the shape visible.
+  #ifdef WLED_DEBUG
+  {
+    char* dbg = static_cast<char*>(p_malloc(total + 1));
+    if (dbg) {
+      memcpy(dbg, payloadStr, total + 1);
+      pixc::redactJsonSecrets(dbg);
+      DEBUG_PRINTLN(dbg);
+      p_free(dbg);
+    }
+  }
+  #endif
+#else
   DEBUG_PRINTLN(payloadStr);
+#endif
 
   size_t topicPrefixLen = strlen(mqttDeviceTopic);
   if (strncmp(topic, mqttDeviceTopic, topicPrefixLen) == 0) {
@@ -167,7 +195,10 @@ void publishMqtt()
   if (!WLED_MQTT_CONNECTED) return;
   DEBUG_PRINTLN(F("Publish MQTT"));
 
-  #ifndef USERMOD_SMARTNEST
+  #if !defined(USERMOD_SMARTNEST) && !defined(PIXC_MQTT_ESP_IDF)
+  // ePixC skips WLED's g/c/v publishes: the usermod already reports state in the shape the cloud
+  // reads (`<base>/state`), the backend ignores these three, and `/v` is up to 1 KB of XML on every
+  // state change. The retained "online" status is published on connect in onMqttConnect() above.
   char s[10];
   char subuf[MQTT_MAX_TOPIC_LEN + 16];
 

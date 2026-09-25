@@ -1,4 +1,7 @@
 #include "wled.h"
+#ifdef PIXC_LAN_AUTH
+#include "pixc_lan.h"
+#endif
 
 #ifndef WLED_DISABLE_OTA
   #include "ota_update.h"  
@@ -200,7 +203,7 @@ static String msgProcessor(const String& var)
 
 
 static void handleUpload(AsyncWebServerRequest *request, const String& filename, size_t index, uint8_t *data, size_t len, bool isFinal) {
-  if (!correctPIN) {
+  if (!PIXC_UNLOCKED(request)) {
     if (isFinal) request->send(401, FPSTR(CONTENT_TYPE_PLAIN), FPSTR(s_unlock_cfg));
     return;
   }
@@ -239,7 +242,7 @@ static void createEditHandler() {
 
   editHandler = &server.on(F("/edit"), static_cast<WebRequestMethod>(HTTP_GET), [](AsyncWebServerRequest *request) {
     // PIN check for GET/DELETE, for POST it is done in handleUpload()
-    if (!correctPIN) {
+    if (!PIXC_UNLOCKED(request)) {
       serveMessage(request, 401, FPSTR(s_accessdenied), FPSTR(s_unlock_cfg), 254);
       return;
     }
@@ -334,7 +337,7 @@ static bool captivePortal(AsyncWebServerRequest *request)
   if (!request->hasHeader(F("Host"))) return false;
 
   String hostH = request->getHeader(F("Host"))->value();
-  if (!isIp(hostH) && hostH.indexOf(F("wled.me")) < 0 && hostH.indexOf(cmDNS) < 0 && hostH.indexOf(':') < 0) {
+  if (!isIp(hostH) && hostH.indexOf(F("epixc.in")) < 0 && hostH.indexOf(cmDNS) < 0 && hostH.indexOf(':') < 0) {
     DEBUG_PRINTLN(F("Captive portal"));
     AsyncWebServerResponse *response = request->beginResponse(302);
     response->addHeader(F("Location"), F("http://4.3.2.1"));
@@ -344,12 +347,17 @@ static bool captivePortal(AsyncWebServerRequest *request)
   return false;
 }
 
+
 void initServer()
 {
+#ifndef PIXC_LAN_AUTH
   //CORS compatiblity
   DefaultHeaders::Instance().addHeader(F("Access-Control-Allow-Origin"), "*");
   DefaultHeaders::Instance().addHeader(F("Access-Control-Allow-Methods"), "*");
   DefaultHeaders::Instance().addHeader(F("Access-Control-Allow-Headers"), "*");
+#endif
+  // ePixC: no CORS (audit S14). The wildcard let any web page the owner opened drive the LAN API
+  // from the owner's own browser. The app and ePixC Sync are not browsers and need none of it.
 
 #ifdef WLED_ENABLE_HTML
 #ifdef WLED_ENABLE_WEBSOCKETS
@@ -412,8 +420,29 @@ void initServer()
   });
 #endif
 
+#ifdef PIXC_LAN_AUTH
+  // Pairing v2: GET /json/id, GET/POST /json/pixc/pair (pixc_lan.cpp). Before /json, whose
+  // handlers would otherwise catch these paths as prefixes.
+  pixcRegisterRoutes(server);
+#endif
+
   const static char _json[] PROGMEM = "/json";
   server.on(FPSTR(_json), HTTP_GET, [](AsyncWebServerRequest *request){
+#ifdef PIXC_LAN_AUTH
+    // Every read is signed-request only (pairing v2): /json/info is a map of the house and
+    // /json/state everything needed to forge a write. The lock is taken BEFORE the signature is
+    // checked, because a request that has to wait for the lock is deferred and run again, and a
+    // verified request run twice would be refused as a replay.
+    //
+    // The cheap refusals (rate limit, no key, malformed header, stale boot) run BEFORE the lock, so
+    // a flood of junk cannot hold the lock the owner's signed requests need.
+    if (!pixcPreAuthorise(request)) return;
+    if (!requestJSONBufferLock(JSON_LOCK_SERVEJSON)) { request->deferResponse(); return; }
+    PixcReplySigner signer;
+    if (!pixcAuthorise(request, nullptr, 0, signer)) { releaseJSONBufferLock(); return; }
+    serveJson(request, &signer, true);
+    return;
+#endif
     serveJson(request);
   });
 
@@ -421,22 +450,49 @@ void initServer()
     bool verboseResponse = false;
     bool isConfig = false;
 
+#ifdef PIXC_LAN_AUTH
+    if (!pixcPreAuthorise(request)) return;   // cheap refusals before the lock (see the GET handler)
+#endif
     if (!requestJSONBufferLock(JSON_LOCK_SERVER)) {
       request->deferResponse();
       return;
     }
 
+#ifdef PIXC_LAN_AUTH
+    // Pairing v2: the signature covers the body exactly as received, so it is verified BEFORE
+    // deserializeJson(), which parses a mutable buffer in place (ArduinoJson zero-copy) and would
+    // change the bytes being hashed. After the lock, so a deferred request is never verified twice.
+    PixcReplySigner signer;
+    if (!pixcAuthorise(request, static_cast<const uint8_t*>(request->_tempObject), request->contentLength(), signer)) {
+      releaseJSONBufferLock();
+      return;
+    }
+#endif
     DeserializationError error = deserializeJson(*pDoc, (uint8_t*)(request->_tempObject));
     JsonObject root = pDoc->as<JsonObject>();
     if (error || root.isNull()) {
       releaseJSONBufferLock();
+#ifdef PIXC_LAN_AUTH
+      pixcSendSigned(request, signer, 400, CONTENT_TYPE_JSON, "{\"error\":\"BAD_REQUEST\"}");
+#else
       serveJsonError(request, 400, ERR_JSON);
+#endif
       return;
     }
+#ifdef PIXC_LAN_AUTH
+    // The realtime lease and the factory reset, which carry ePixC's own keys.
+    if (pixcHandleAuthedPost(request, root, signer)) { releaseJSONBufferLock(); return; }
+#else
     if (root.containsKey("pin")) checkSettingsPIN(root["pin"].as<const char*>());
+#endif
 
     const String& url = request->url();
     isConfig = url.indexOf(F("cfg")) > -1;
+#ifdef PIXC_LAN_AUTH
+    // What a LAN config write may not change, whoever signed it: the broker, the access point, the
+    // provisioning keys, OTA settings (pixc_lan.cpp). The LAN key itself is set only by the cloud.
+    if (isConfig) pixcSanitizeLanCfg(root);
+#endif
     if (!isConfig) {
       /*
       #ifdef WLED_DEBUG
@@ -447,11 +503,15 @@ void initServer()
       */
       verboseResponse = deserializeState(root);
     } else {
+#ifndef PIXC_LAN_AUTH
+      // With PIXC_LAN_AUTH this caller already passed the per-caller gate above, which is stricter
+      // than the global flag: the global one would admit a caller on the strength of another's PIN.
       if (!correctPIN && strlen(settingsPIN)>0) {
         releaseJSONBufferLock();
         serveJsonError(request, 401, ERR_DENIED);
         return;
       }
+#endif
       verboseResponse = deserializeConfig(root); //use verboseResponse to determine whether cfg change should be saved immediately
     }
     releaseJSONBufferLock();
@@ -464,13 +524,26 @@ void initServer()
         // publish state to MQTT as requested in wled#4643 even if only WS response selected
         publishMqtt();
         #endif
+#ifdef PIXC_LAN_AUTH
+        // Re-take the lock without deferring: a deferred signed request would run again as a replay.
+        if (!requestJSONBufferLock(JSON_LOCK_SERVEJSON)) {
+          pixcSendSigned(request, signer, 503, CONTENT_TYPE_JSON, "{\"error\":\"BUSY\"}");
+          return;
+        }
+        serveJson(request, &signer, true);
+#else
         serveJson(request);
+#endif
         return; //if JSON contains "v"
       } else {
         configNeedsWrite = true; //Save new settings to FS
       }
     }
+#ifdef PIXC_LAN_AUTH
+    pixcSendSigned(request, signer, 200, CONTENT_TYPE_JSON, "{\"success\":true}");
+#else
     request->send(200, CONTENT_TYPE_JSON, F("{\"success\":true}"));
+#endif
   }, JSON_BUFFER_SIZE);
   server.addHandler(handler);
 
@@ -547,7 +620,7 @@ void initServer()
         setOTAReplied(request);
         return;
       }
-      if (!correctPIN) {
+      if (!PIXC_UNLOCKED(request)) {
         serveMessage(request, 401, FPSTR(s_accessdenied), FPSTR(s_unlock_cfg), 254);
         setOTAReplied(request);
         return;
@@ -596,7 +669,7 @@ void initServer()
         setBootloaderOTAReplied(request);
         return;
       }
-      if (!correctPIN) {
+      if (!PIXC_UNLOCKED(request)) {
         serveMessage(request, 401, FPSTR(s_accessdenied), FPSTR(s_unlock_cfg), 254);
         setBootloaderOTAReplied(request);
         return;
@@ -681,6 +754,12 @@ void initServer()
     if (captivePortal(request)) return;
     #endif
 
+#ifdef PIXC_LAN_AUTH
+    // No CORS preflight (S14), and no legacy /win query API: it reached handleSet() - a full state
+    // write - through this not-found handler, and ePixC's clients use the signed JSON API only.
+    request->send(404, FPSTR(CONTENT_TYPE_PLAIN), F("Not found"));
+    return;
+#endif
     //make API CORS compatible
     if (request->method() == HTTP_OPTIONS)
     {
@@ -740,7 +819,7 @@ void serveSettingsJS(AsyncWebServerRequest* request)
     request->send_P(501, FPSTR(CONTENT_TYPE_JAVASCRIPT), PSTR("alert('Settings for this request are not implemented.');"));
     return;
   }
-  if (subPage > 0 && !correctPIN && strlen(settingsPIN)>0) {
+  if (subPage > 0 && !PIXC_UNLOCKED(request) && strlen(settingsPIN)>0) {
     request->send_P(401, FPSTR(CONTENT_TYPE_JAVASCRIPT), PSTR("alert('PIN incorrect.');"));
     return;
   }
@@ -783,7 +862,7 @@ void serveSettings(AsyncWebServerRequest* request, bool post) {
   //else if (url.indexOf("/edit")   >= 0) subPage = 10;
   else subPage = SUBPAGE_WELCOME;
 
-  bool pinRequired = !correctPIN && strlen(settingsPIN) > 0 && (subPage > (WLED_WIFI_CONFIGURED ? SUBPAGE_MENU : SUBPAGE_WIFI) && subPage < SUBPAGE_LOCK);
+  bool pinRequired = !PIXC_UNLOCKED(request) && strlen(settingsPIN) > 0 && (subPage > (WLED_WIFI_CONFIGURED ? SUBPAGE_MENU : SUBPAGE_WIFI) && subPage < SUBPAGE_LOCK);
   if (pinRequired) {
     originalSubPage = subPage;
     subPage = SUBPAGE_PINREQ; // require PIN
@@ -820,12 +899,12 @@ void serveSettings(AsyncWebServerRequest* request, bool post) {
 #ifndef WLED_DISABLE_2D
       case SUBPAGE_2D     : strcpy_P(s, PSTR("2D")); break;
 #endif
-      case SUBPAGE_PINREQ : strcpy_P(s, correctPIN ? PSTR("PIN accepted") : PSTR("PIN rejected")); break;
+      case SUBPAGE_PINREQ : strcpy_P(s, PIXC_UNLOCKED(request) ? PSTR("PIN accepted") : PSTR("PIN rejected")); break;
     }
 
     if (subPage != SUBPAGE_PINREQ) strcat_P(s, PSTR(" settings saved."));
 
-    if (subPage == SUBPAGE_PINREQ && correctPIN) {
+    if (subPage == SUBPAGE_PINREQ && PIXC_UNLOCKED(request)) {
       subPage = originalSubPage; // on correct PIN load settings page the user intended
     } else {
       if (!s2[0]) strcpy_P(s2, s_redirecting);

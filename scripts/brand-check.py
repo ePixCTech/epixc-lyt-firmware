@@ -64,6 +64,17 @@ IDENTIFIERS = re.compile(
 # the whole distinction: the exemption covers the protocol, not the prose around it.
 WIRE_KEYS = re.compile(r"""\["pixc"\]|\bpixc\.led_channels\b|def/light/pixc""")
 
+# Pairing v2 (2026-09-25) put more of the same protocol on the wire, and each is matched by its
+# exact shape for the same reason: the JSON key as a string literal (`"pixc"`, `{"pixc":`), its
+# dotted cfg paths (`pixc.reprovision`, `pixc.ind_led`), the LAN path `/json/pixc/...`, the mDNS
+# service `_pixc._tcp` and its registration, the C++ namespace `pixc::` / `namespace pixc`, the
+# `pixc_*` source files and the `test/pixc/` host-test directory. None is text a customer reads.
+WIRE_KEYS_V2 = re.compile(
+    r"""\{?"pixc"\s*:?|\bpixc\.[a-z_]+\b|/json/pixc\b|_pixc\._tcp|\bpixc::|namespace pixc\b|"""
+    r"""\bpixc_(?:lan_auth|lan_guard|lan|device|mqtt_client|logic)\b|test/pixc/|"""
+    # The two LAN header names, and the key named in code quotes (`pixc`).
+    r"""\bX-PixC-(?:Auth|Sig)\b|`pixc`""")
+
 
 def main() -> int:
     hits = []
@@ -77,6 +88,7 @@ def main() -> int:
             text = path.read_text(encoding="utf-8", errors="ignore")
             flat = re.sub(r"\s+", " ", text)
             flat = WIRE_KEYS.sub(" ", flat)
+            flat = WIRE_KEYS_V2.sub(" ", flat)
             flat = IDENTIFIERS.sub(" ", flat)
             for m in FORBIDDEN.finditer(flat):
                 hits.append(f"  {path}: …{flat[max(0, m.start() - 50):m.start() + 50].strip()}…")

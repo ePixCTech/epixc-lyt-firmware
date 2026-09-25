@@ -1,7 +1,7 @@
 var d=document;
 var loc = false, locip, locproto = "http:";
 
-function H(pg="")   { window.open("https://kno.wled.ge/"+pg); }
+function H(pg="")   { window.open("https://epixc.in/"+pg); }
 function GH()       { window.open("https://github.com/wled-dev/WLED"); }
 function gId(c)     { return d.getElementById(c); } // getElementById
 function cE(e)      { return d.createElement(e); } // createElement

@@ -155,12 +155,12 @@ static void sanitizeHostname(char* hostname, size_t maxLen) {
  *   preferMDNSname -> use mDNS name if set, otherwise fall back to WLED "server description" name (legacy behaviour)
  */
 void getWLEDhostname(char* hostname, size_t maxLen, bool preferMDNS) {
-  if (maxLen <= 6) { strlcpy(hostname, "wled", maxLen); return; } // buffer too small (should not happen)
+  if (maxLen <= 6) { strlcpy(hostname, "epixc", maxLen); return; } // buffer too small (should not happen)
   if (preferMDNS && (strlen(cmDNS) > 0) && (strcmp_P(cmDNS, PSTR(DEFAULT_MDNS_NAME)) != 0)) {     // avoid "x" = not set (use wled-MAC)
     strlcpy(hostname, cmDNS, maxLen);
     sanitizeHostname(hostname, maxLen);  // sanitize cmDNS name
     if (strlen(hostname) < 1) {          // if result is empty -> fall back to wled-MAC
-      snprintf_P(hostname, maxLen, PSTR("wled-%*s"), 6, escapedMac.c_str() + 6);
+      snprintf_P(hostname, maxLen, PSTR("epixc-%*s"), 6, escapedMac.c_str() + 6);
       hostname[maxLen -1] = '\0';        // ensure string termination
     }
   } else {
@@ -176,7 +176,7 @@ void getWLEDhostname(char* hostname, size_t maxLen, bool preferMDNS) {
  */
 void prepareHostname(char* hostname, size_t maxLen)
 {
-  if (maxLen <= 6) { strlcpy(hostname, "wled", maxLen); return; } // buffer too small (should not happen)
+  if (maxLen <= 6) { strlcpy(hostname, "epixc", maxLen); return; } // buffer too small (should not happen)
   if (strncasecmp_P(serverDescription, PSTR("wled"), 4) == 0)     // avoid wled-WLED-... as a hostname
     strlcpy(hostname, serverDescription, maxLen);
   else
@@ -186,7 +186,7 @@ void prepareHostname(char* hostname, size_t maxLen)
   size_t sanOffset = hostname[4] != '-' ? 4 : 5;            // ensure that "WLED foo" and "WLED!foo" get sanitized
   sanitizeHostname(hostname+sanOffset, maxLen-sanOffset);   // sanitize name, keep "wled-" intact
   if (strlen(hostname) <= sanOffset)
-    snprintf_P(hostname, maxLen, PSTR("wled-%*s"), 6, escapedMac.c_str() + 6); // fallback to wled-MAC if sanitization cleaned everything
+    snprintf_P(hostname, maxLen, PSTR("epixc-%*s"), 6, escapedMac.c_str() + 6); // fallback to wled-MAC if sanitization cleaned everything
 }
 
 
@@ -481,9 +481,37 @@ void checkSettingsPIN(const char* pin) {
   if (!pin) return;
   if (!correctPIN && millis() - lastEditTime < PIN_RETRY_COOLDOWN) return; // guard against PIN brute force
   //bool correctBefore = correctPIN; // unused
+#ifdef PIXC_LAN_AUTH
+  // An EMPTY PIN MUST NOT UNLOCK. Upstream treats "no PIN set" as "no protection wanted", which is
+  // the right default for a hobby controller somebody flashed themselves and the wrong one for a
+  // unit sold to a customer: a factory-fresh ePixC has no PIN yet, and under the upstream rule that
+  // is precisely the state in which anybody on the Wi-Fi can drive it.
+  //
+  // So the empty-PIN arm is dropped here rather than the whole function replaced - the brute-force
+  // cooldown above and the 15-minute relock in wled.cpp are both wanted unchanged.
+  correctPIN = (strlen(settingsPIN) == 4 && strncmp(settingsPIN, pin, 4) == 0);
+#else
   correctPIN = (strlen(settingsPIN) == 0 || strncmp(settingsPIN, pin, 4) == 0);
+#endif
   lastEditTime = millis();
 }
+
+
+// The ePixC LAN gate (PIXC_LAN_AUTH) is pairing v2's signed LAN API: wled00/pixc_lan.{h,cpp}.
+// It replaced the per-caller 4-digit PIN gate that lived here (D303/D304, audit S3/S13/S17).
+//
+// WHAT IT DOES NOT COVER, stated rather than implied. Realtime pixel protocols carry no credential
+// field, so each one left listening is open by decision (audit S2, 2026-09):
+//  - DDP, UDP 4048. KEPT for ePixC Sync, and since pairing v2 accepted only from an address holding
+//    a realtime lease (an authenticated POST /json {"pixc":{"rt_lease":N}}, e131.cpp).
+//  - AudioReactive sync receive, UDP 11988, only when the owner switched it on through the signed
+//    /json/cfg (um.AudioReactive.sync.mode=2); the app's phone-mic LightSync sends it. Audio levels
+//    only, never state.
+//  - WLED's sync notifier, UDP 21324: socket open, every packet dropped unless the owner sets a
+//    receive group through the signed /json/cfg (default receiveGroups = 0).
+// Refused or never opened: the UDP JSON and HTTP-style APIs on 21324, TPM2.NET and WARLS/DRGB on
+// 21324, Hyperion 19446, the supplemental port 65506, node broadcast, and E1.31/Art-Net. See
+// handleNotifications() in udp.cpp and initInterfaces()/initAP() in wled.cpp.
 
 
 uint16_t crc16(const unsigned char* data_p, size_t length) {
