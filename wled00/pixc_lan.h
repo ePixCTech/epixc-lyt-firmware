@@ -43,6 +43,13 @@ class PixcHashPrint : public Print {
   pixc::lan::Sha256 _s;
 };
 
+// The checks that need no key material and no body: rate limit, a keyed light, a well-formed header
+// and the current boot id. Run BEFORE taking the JSON lock. On failure the reply has been sent.
+bool pixcPreAuthorise(AsyncWebServerRequest* request);
+
+// Pairing results staged by the async_tcp handler are applied here, on the loop task.
+void pixcLanLoop();
+
 // Verify the request's X-PixC-Auth over `body`. On failure the 401 (or 429) reply has been sent and
 // false is returned; on success `out` is filled for signing the reply.
 bool pixcAuthorise(AsyncWebServerRequest* request, const uint8_t* body, size_t len, PixcReplySigner& out);

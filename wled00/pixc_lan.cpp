@@ -11,6 +11,23 @@
 namespace {
 
 pixc::lan::ReplayTable replay;
+// Guards pixcLanKey, previousLanKey and `replay`: verify runs on the async_tcp task, a rotation from
+// the cloud on the loop task.
+SemaphoreHandle_t keyMutex = nullptr;
+struct KeyLock {
+  KeyLock() { if (keyMutex == nullptr) keyMutex = xSemaphoreCreateMutex(); if (keyMutex) xSemaphoreTake(keyMutex, portMAX_DELAY); }
+  ~KeyLock() { if (keyMutex) xSemaphoreGive(keyMutex); }
+};
+
+// A pairing POST, validated on the async_tcp task and applied on the loop (pixcLanLoop).
+struct PendingPair {
+  volatile bool ready = false;
+  char ssid[33];
+  char psk[65];
+  char kDev[65];
+  char kLan[33];
+  char apiHost[64];
+} pendingPair;
 // A per-address brake on hosts sending bad signatures - no global ceiling (a 128-bit key cannot be
 // guessed at any rate) and two free failures, so the one request a client signs with the key
 // before a rotation costs nothing.
@@ -39,16 +56,30 @@ void sendLimited(AsyncWebServerRequest* request, uint64_t retryAfterMs) {
   request->send(response);
 }
 
-// PATH_AND_QUERY as sent. AsyncWebServer keeps the decoded path and the parsed query parameters,
+bool unreserved(const String& s, bool path) {
+  for (size_t i = 0; i < s.length(); i++) {
+    const char c = s[i];
+    if (isalnum((unsigned char)c) || c == '-' || c == '.' || c == '_' || c == '~' || (path && c == '/')) continue;
+    return false;
+  }
+  return true;
+}
+
+// PATH_AND_QUERY as sent. AsyncWebServer keeps only the percent-DECODED path and parsed parameters,
 // not the request line, so the query is rebuilt from them in order as name=value joined by '&'.
-// Exact for the unreserved characters ePixC's clients use (e.g. /json/state?v=1).
+// That is exact only when nothing was decoded, so a path or parameter outside RFC 3986's unreserved
+// set (anything that needs %xx, or '+') is refused: empty string, and the request fails to verify.
+// ePixC's clients send /json, /json/state, /json/cfg, /json/info and ?v=1-style queries only.
+// A parameter sent with no '=' ("?flag") cannot be told from "?flag=" and is signed as the latter.
 String pathAndQuery(AsyncWebServerRequest* request) {
   String out = request->url();
+  if (!unreserved(out, true)) return String();
   bool first = true;
   const size_t n = request->params();
   for (size_t i = 0; i < n; i++) {
     const AsyncWebParameter* p = request->getParam(i);
     if (p == nullptr || p->isPost() || p->isFile()) continue;
+    if (!unreserved(p->name(), false) || !unreserved(p->value(), false)) return String();
     out += first ? '?' : '&';
     first = false;
     out += p->name();
@@ -100,38 +131,61 @@ void handlePairPost(AsyncWebServerRequest* request) {
     sendError(request, 400, "BAD_REQUEST");
     return;
   }
-  // A keyed light takes a new Wi-Fi password only from the phone that holds its key (the
-  // wrong-password retry). Anyone else must factory-reset it first.
-  if (pixcIsKeyed() && !pixc::lan::equalConstTime(pixcLanKey, kLan, pixc::lan::kKeyHexLen)) {
-    sendError(request, 409, "ALREADY_PAIRED");
-    return;
+  // A keyed light takes a new Wi-Fi password only from the phone that paired it: the same k_lan
+  // AND the same k_dev (the wrong-password retry). Anyone else - including a member or Sync, who
+  // hold k_lan but never k_dev - must factory-reset it first.
+  {
+    KeyLock lock;
+    if (pixcIsKeyed() && (!pixc::lan::equalConstTime(pixcLanKey, kLan, pixc::lan::kKeyHexLen) ||
+                          !pixc::lan::equalConstTime(pixcDeviceKey, kDev, 64))) {
+      sendError(request, 409, "ALREADY_PAIRED");
+      return;
+    }
   }
+  if (pendingPair.ready) { sendError(request, 409, "BUSY"); return; }
+  strlcpy(pendingPair.ssid, ssid, sizeof(pendingPair.ssid));
+  strlcpy(pendingPair.psk, psk, sizeof(pendingPair.psk));
+  strlcpy(pendingPair.kDev, kDev, sizeof(pendingPair.kDev));
+  strlcpy(pendingPair.kLan, kLan, sizeof(pendingPair.kLan));
+  strlcpy(pendingPair.apiHost, doc["api_host"] | "", sizeof(pendingPair.apiHost));
+  pendingPair.ready = true;   // applied by pixcLanLoop() on the loop task
+  char body[40];
+  snprintf(body, sizeof(body), "{\"mac\":\"%s\"}", escapedMac.c_str());
+  request->send(200, FPSTR(CONTENT_TYPE_JSON), body);
+}
 
+// Apply a validated pairing on the loop task: Wi-Fi and both keys in one save, then reboot.
+void applyPendingPair() {
+  PendingPair& pp = pendingPair;
   // One network, the one the phone gave. Static addressing is not offered at pairing.
+  selectedWiFi = 0;
   multiWiFi.resize(1);
   memset(multiWiFi[0].clientSSID, 0, sizeof(multiWiFi[0].clientSSID));
   memset(multiWiFi[0].clientPass, 0, sizeof(multiWiFi[0].clientPass));
-  strlcpy(multiWiFi[0].clientSSID, ssid, sizeof(multiWiFi[0].clientSSID));
-  strlcpy(multiWiFi[0].clientPass, psk, sizeof(multiWiFi[0].clientPass));
+  strlcpy(multiWiFi[0].clientSSID, pp.ssid, sizeof(multiWiFi[0].clientSSID));
+  strlcpy(multiWiFi[0].clientPass, pp.psk, sizeof(multiWiFi[0].clientPass));
   multiWiFi[0].staticIP = IPAddress(0, 0, 0, 0);
   memset(multiWiFi[0].bssid, 0, sizeof(multiWiFi[0].bssid));
-  strlcpy(pixcDeviceKey, kDev, sizeof(pixcDeviceKey));
-  if (strcmp(pixcLanKey, kLan) != 0) {
-    strlcpy(pixcLanKey, kLan, sizeof(pixcLanKey));
+  {
+    KeyLock lock;
+    const bool sameKeys = strcmp(pixcLanKey, pp.kLan) == 0 && strcmp(pixcDeviceKey, pp.kDev) == 0;
+    strlcpy(pixcDeviceKey, pp.kDev, sizeof(pixcDeviceKey));
+    strlcpy(pixcLanKey, pp.kLan, sizeof(pixcLanKey));
     previousLanKey[0] = 0;
-    replay.clear();
+    if (!sameKeys) {
+      // A new pairing starts with no broker login: the light pulls its own once registered. The
+      // wrong-password retry (same keys) keeps whatever login it already has.
+      mqttUser[0] = 0;
+      mqttPass[0] = 0;
+      mqttServer[0] = 0;
+    }
   }
-  // A new pairing starts with no broker login: the light pulls its own once registered.
-  mqttUser[0] = 0;
-  mqttPass[0] = 0;
-  mqttServer[0] = 0;
 #ifdef EPIXC_ALLOW_PLAINTEXT_PROVISION
   // Bench only: the app may point the light at a local API ("host" or "host:port").
-  const char* apiHost = doc["api_host"] | "";
-  if (apiHost[0]) {
+  if (pp.apiHost[0]) {
     StaticJsonDocument<192> um;
     char host[64];
-    strlcpy(host, apiHost, sizeof(host));
+    strlcpy(host, pp.apiHost, sizeof(host));
     char* colon = strchr(host, ':');
     JsonObject top = um.createNestedObject("PixcConnect");
     if (colon) { *colon = 0; top["apiPort"] = atoi(colon + 1); }
@@ -140,13 +194,9 @@ void handlePairPost(AsyncWebServerRequest* request) {
     UsermodManager::readFromConfig(umRoot);
   }
 #endif
-  // cfg.json (the SSID) and wsec.json (PSK, keys) in one save, from the loop task rather than this
-  // async_tcp callback; WLED::loop() writes before it honours the reboot below.
-  configNeedsWrite = true;
-  char body[40];
-  snprintf(body, sizeof(body), "{\"mac\":\"%s\"}", escapedMac.c_str());
-  request->send(200, FPSTR(CONTENT_TYPE_JSON), body);
-  pixcRebootAfter(1500);   // let the reply leave before the hotspot goes
+  memset(&pp, 0, sizeof(pp));   // clears `ready` too
+  configNeedsWrite = true;      // cfg.json (SSID) + wsec.json (PSK, keys); WLED::loop() saves
+  pixcRebootAfter(1500);        // let the reply leave before the hotspot goes
 }
 
 }  // namespace
@@ -161,10 +211,31 @@ uint32_t pixcCallerIp(AsyncWebServerRequest* request) {
 bool pixcIsKeyed() { return validKey(pixcLanKey, pixc::lan::kKeyHexLen); }
 
 bool pixcSetLanKey(const char* keyHex) {
+  KeyLock lock;
   if (!validKey(keyHex, pixc::lan::kKeyHexLen) || strcmp(keyHex, pixcLanKey) == 0) return false;
   strlcpy(previousLanKey, pixcLanKey, sizeof(previousLanKey));
   strlcpy(pixcLanKey, keyHex, sizeof(pixcLanKey));
-  replay.clear();
+  // The replay table is NOT cleared: counters are per client and boot, not per key, and clearing
+  // it would let a request captured under the pending key (clients try it by design) replay once.
+  return true;
+}
+
+void pixcLanLoop() {
+  if (pendingPair.ready) applyPendingPair();
+}
+
+bool pixcPreAuthorise(AsyncWebServerRequest* request) {
+  uint64_t retry = 0;
+  if (!authGuard.mayTry(pixcCallerIp(request), nowMs64(), &retry)) { sendLimited(request, retry); return false; }
+  if (!pixcIsKeyed()) { sendError(request, 401, "UNAUTHORISED"); return false; }
+  const AsyncWebHeader* h = request->getHeader(F("X-PixC-Auth"));
+  pixc::lan::ParsedAuth pa;
+  if (h == nullptr || !pixc::lan::parseAuthHeader(h->value().c_str(), pa)) {
+    authGuard.onWrong(pixcCallerIp(request), nowMs64());
+    sendError(request, 401, "UNAUTHORISED");
+    return false;
+  }
+  if (strcmp(pa.bootId, pixcBootId()) != 0) { sendError(request, 401, "STALE_BOOT"); return false; }
   return true;
 }
 
@@ -192,8 +263,12 @@ bool pixcAuthorise(AsyncWebServerRequest* request, const uint8_t* body, size_t l
   const String path = pathAndQuery(request);
   const String method(request->methodToString());   // "GET", "POST", ... upper case
   pixc::lan::ParsedAuth pa;
-  const pixc::lan::Verdict v = pixc::lan::verify(h ? h->value().c_str() : nullptr, pixcLanKey, previousLanKey,
-      pixcBootId(), method.c_str(), path.c_str(), body, len, replay, &pa);
+  pixc::lan::Verdict v;
+  {
+    KeyLock lock;
+    v = pixc::lan::verify(h ? h->value().c_str() : nullptr, pixcLanKey, previousLanKey,
+        pixcBootId(), method.c_str(), path.c_str(), body, len, replay, &pa);
+  }
   if (v == pixc::lan::Verdict::Ok) {
     authGuard.onRight(ip);
     out.active = true;
@@ -212,7 +287,9 @@ bool pixcAuthorise(AsyncWebServerRequest* request, const uint8_t* body, size_t l
 void pixcSignResponse(AsyncWebServerResponse* response, const PixcReplySigner& signer, const char* bodyHashHex) {
   if (!signer.active || response == nullptr) return;
   char sig[pixc::lan::kMacB64Len + 1];
-  if (!pixc::lan::replySig(pixcLanKey, pixcBootId(), signer.ctr, signer.clientId, bodyHashHex, sig)) return;
+  bool ok;
+  { KeyLock lock; ok = pixc::lan::replySig(pixcLanKey, pixcBootId(), signer.ctr, signer.clientId, bodyHashHex, sig); }
+  if (!ok) return;
   String v = F("v2 ");
   v += sig;
   response->addHeader(F("X-PixC-Sig"), v);

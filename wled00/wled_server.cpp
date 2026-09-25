@@ -433,6 +433,10 @@ void initServer()
     // /json/state everything needed to forge a write. The lock is taken BEFORE the signature is
     // checked, because a request that has to wait for the lock is deferred and run again, and a
     // verified request run twice would be refused as a replay.
+    //
+    // The cheap refusals (rate limit, no key, malformed header, stale boot) run BEFORE the lock, so
+    // a flood of junk cannot hold the lock the owner's signed requests need.
+    if (!pixcPreAuthorise(request)) return;
     if (!requestJSONBufferLock(JSON_LOCK_SERVEJSON)) { request->deferResponse(); return; }
     PixcReplySigner signer;
     if (!pixcAuthorise(request, nullptr, 0, signer)) { releaseJSONBufferLock(); return; }
@@ -446,26 +450,36 @@ void initServer()
     bool verboseResponse = false;
     bool isConfig = false;
 
+#ifdef PIXC_LAN_AUTH
+    if (!pixcPreAuthorise(request)) return;   // cheap refusals before the lock (see the GET handler)
+#endif
     if (!requestJSONBufferLock(JSON_LOCK_SERVER)) {
       request->deferResponse();
       return;
     }
 
-    DeserializationError error = deserializeJson(*pDoc, (uint8_t*)(request->_tempObject));
-    JsonObject root = pDoc->as<JsonObject>();
-    if (error || root.isNull()) {
-      releaseJSONBufferLock();
-      serveJsonError(request, 400, ERR_JSON);
-      return;
-    }
 #ifdef PIXC_LAN_AUTH
-    // Pairing v2: the signature covers the body exactly as received. Checked after the lock, so a
-    // deferred request is never verified twice (see the GET handler).
+    // Pairing v2: the signature covers the body exactly as received, so it is verified BEFORE
+    // deserializeJson(), which parses a mutable buffer in place (ArduinoJson zero-copy) and would
+    // change the bytes being hashed. After the lock, so a deferred request is never verified twice.
     PixcReplySigner signer;
     if (!pixcAuthorise(request, static_cast<const uint8_t*>(request->_tempObject), request->contentLength(), signer)) {
       releaseJSONBufferLock();
       return;
     }
+#endif
+    DeserializationError error = deserializeJson(*pDoc, (uint8_t*)(request->_tempObject));
+    JsonObject root = pDoc->as<JsonObject>();
+    if (error || root.isNull()) {
+      releaseJSONBufferLock();
+#ifdef PIXC_LAN_AUTH
+      pixcSendSigned(request, signer, 400, CONTENT_TYPE_JSON, "{\"error\":\"BAD_REQUEST\"}");
+#else
+      serveJsonError(request, 400, ERR_JSON);
+#endif
+      return;
+    }
+#ifdef PIXC_LAN_AUTH
     // The realtime lease and the factory reset, which carry ePixC's own keys.
     if (pixcHandleAuthedPost(request, root, signer)) { releaseJSONBufferLock(); return; }
 #else

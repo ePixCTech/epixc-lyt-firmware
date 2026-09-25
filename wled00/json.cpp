@@ -1322,23 +1322,36 @@ void serveJson(AsyncWebServerRequest* request)
   else if (url.indexOf(F("nodes")) > 0) subJson = json_target::nodes;
   else if (url.indexOf(F("eff"))   > 0) subJson = json_target::effects;
   else if (url.indexOf(F("palx"))  > 0) subJson = json_target::palettes;
-  else if (url.indexOf(F("fxda"))  > 0) { if (lockHeld) releaseJSONBufferLock(); respondModeData(request); return; }
+#ifdef PIXC_LAN_AUTH
+  // Effect metadata is not served on the signed LAN API: its reply is streamed and cannot be signed
+  // here, and a client drops unsigned replies. The app reads effect data from its own catalogue.
+  else if (url.indexOf(F("fxda"))  > 0) { if (lockHeld) releaseJSONBufferLock(); if (signer) pixcSendSigned(request, *signer, 404, CONTENT_TYPE_JSON, "{\"error\":\"NOT_FOUND\"}"); else serveJsonError(request, 404, ERR_NOT_IMPL); return; }
+#else
+  else if (url.indexOf(F("fxda"))  > 0) { respondModeData(request); return; }
+#endif
   else if (url.indexOf(F("net"))   > 0) subJson = json_target::networks;
   else if (url.indexOf(F("cfg"))   > 0) subJson = json_target::config;
   else if (url.indexOf(F("pins"))  > 0) subJson = json_target::pins;
   #ifdef WLED_ENABLE_JSONLIVE
   else if (url.indexOf("live")     > 0) {
+    if (lockHeld) releaseJSONBufferLock();
     serveLiveLeds(request);
     return;
   }
   #endif
   else if (url.indexOf("pal") > 0) {
     if (lockHeld) releaseJSONBufferLock();
+#ifdef PIXC_LAN_AUTH
+    if (signer) { pixcSendSigned(request, *signer, 200, CONTENT_TYPE_JSON, JSON_palette_names); return; }
+#endif
     request->send_P(200, FPSTR(CONTENT_TYPE_JSON), JSON_palette_names);
     return;
   }
   else if (url.length() > 6) { //not just /json
     if (lockHeld) releaseJSONBufferLock();
+#ifdef PIXC_LAN_AUTH
+    if (signer) { pixcSendSigned(request, *signer, 501, CONTENT_TYPE_JSON, "{\"error\":\"NOT_IMPLEMENTED\"}"); return; }
+#endif
     serveJsonError(request, 501, ERR_NOT_IMPL);
     return;
   }

@@ -664,12 +664,17 @@ void WLED::initAP(bool resetAP)
   // config value chooses either. A release unit with no factory password opens NO hotspot: it
   // must never broadcast a guessable one (dev builds fall back to PIXC_DEV_AP_PSK).
   {
-    static bool warned = false;
+    // Factory NVS cannot change while running, so "no password" is decided once: handleConnection()
+    // calls initAP() on every loop pass while offline, and an NVS open each time stalls the LEDs.
+    static int8_t havePsk = -1;
+    if (havePsk == 0) return;
     pixc::hotspotName(escapedMac.c_str(), apSSID, sizeof(apSSID));
     if (!pixcFactoryApPsk(apPass, sizeof(apPass))) {
-      if (!warned) { warned = true; DEBUG_PRINTLN(F("[ePixC] no factory hotspot password: hotspot stays off")); }
+      havePsk = 0;
+      DEBUG_PRINTLN(F("[ePixC] no factory hotspot password: hotspot stays off"));
       return;
     }
+    havePsk = 1;
     apHide = 0;
   }
 #else
