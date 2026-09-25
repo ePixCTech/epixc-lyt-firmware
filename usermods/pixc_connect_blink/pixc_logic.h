@@ -224,5 +224,74 @@ inline void hotspotName(const char* mac, char* out, size_t cap) {
   out[o] = 0;
 }
 
+// ---------------------------------------------------------------------------------------------
+// OTA anti-rollback (audit S6)
+// ---------------------------------------------------------------------------------------------
+//
+// Every image carries one BuildDesc, a 16-byte magic followed by its build number and security
+// version. It sits inside the image bytes, so the detached ECDSA signature the backend already
+// makes (SigningService, SHA256withECDSA over the whole image) covers it: the version cannot be
+// changed without breaking the signature, and no backend change is needed to bind it. The OTA
+// download scans the stream for the magic and refuses an image that is older than the running one
+// (build) or below the stored anti-rollback floor (security), before it is ever made bootable.
+
+// Raise by hand, in a release that fixes a vulnerability which must never be installable again.
+// A unit stores the highest value it has run (NVS pixc_ota/sec, kept across factory reset) and
+// refuses any image below it - even one signed by us.
+#ifndef PIXC_SECURITY_VERSION
+#define PIXC_SECURITY_VERSION 1
+#endif
+
+constexpr size_t kBuildMagicLen = 16;
+// The magic, spelled as bytes so the only copy of the sequence in an image is the descriptor.
+#define PIXC_BUILD_MAGIC {'e','P','i','X','C','-','B','U','I','L','D','D','E','S','C', 0x01}
+
+struct BuildDesc {
+  uint8_t magic[kBuildMagicLen];
+  uint32_t build;      // little endian, monotonic (pio-scripts/pixc_build_id.py)
+  uint32_t security;   // little endian, anti-rollback floor
+};
+
+// Finds the first BuildDesc in a byte stream fed in arbitrary chunks. `magic` is the running
+// image's own descriptor magic (so the pattern exists once in each image, as the descriptor).
+// The first byte of the magic occurs nowhere else in it, so restarting a partial match at the
+// current byte is exact.
+class DescScanner {
+ public:
+  explicit DescScanner(const uint8_t* magic) : _magic(magic) {}
+  void feed(const uint8_t* p, size_t n) {
+    for (size_t i = 0; i < n && !_found; i++) step(p[i]);
+  }
+  bool found() const { return _found; }
+  uint32_t build() const { return _build; }
+  uint32_t security() const { return _security; }
+
+ private:
+  void step(uint8_t b) {
+    if (_matched < kBuildMagicLen) {
+      if (b == _magic[_matched]) { _matched++; return; }
+      _matched = (b == _magic[0]) ? 1 : 0;
+      return;
+    }
+    const size_t k = _matched - kBuildMagicLen;      // 0..7: the two little-endian words
+    if (k < 4) _build |= static_cast<uint32_t>(b) << (8 * k);
+    else       _security |= static_cast<uint32_t>(b) << (8 * (k - 4));
+    if (++_matched == kBuildMagicLen + 8) _found = true;
+  }
+  const uint8_t* _magic;
+  size_t _matched = 0;
+  bool _found = false;
+  uint32_t _build = 0, _security = 0;
+};
+
+// Why an image may not be installed, or nullptr if it may.
+inline const char* otaRefusal(bool found, uint32_t newBuild, uint32_t newSecurity,
+                              uint32_t runningBuild, uint32_t securityFloor) {
+  if (!found) return "no build descriptor";
+  if (newSecurity < securityFloor) return "security downgrade";
+  if (newBuild < runningBuild) return "downgrade";
+  return nullptr;
+}
+
 }  // namespace pixc
 // AI: end

@@ -8,6 +8,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <algorithm>
+#include <vector>
 
 #include "pixc_logic.h"
 #include "pixc_lan_guard.h"
@@ -256,8 +258,43 @@ static void testFactoryData() {
   CHECK(std::strcmp(name, "ePixC-4A5B") == 0);
 }
 
+// ---------------------------------------------------------------------------------------------
+// S6: the signed image's build descriptor is found in a stream and older images are refused.
+// ---------------------------------------------------------------------------------------------
+static void testDescScanner() {
+  static const uint8_t magic[pixc::kBuildMagicLen] = PIXC_BUILD_MAGIC;
+  // An "image": noise, a false start of the magic, the descriptor, more noise.
+  std::vector<uint8_t> img;
+  for (int i = 0; i < 5000; i++) img.push_back(uint8_t(i * 7 + 3));
+  img.insert(img.end(), magic, magic + 5);                 // a partial match that must not stick
+  img.push_back('x');
+  img.insert(img.end(), magic, magic + pixc::kBuildMagicLen);
+  const uint32_t build = 123456, sec = 3;
+  for (int i = 0; i < 4; i++) img.push_back(uint8_t(build >> (8 * i)));
+  for (int i = 0; i < 4; i++) img.push_back(uint8_t(sec >> (8 * i)));
+  for (int i = 0; i < 3000; i++) img.push_back(uint8_t(i));
+  // Every chunk size, so the descriptor straddles every possible boundary.
+  for (size_t chunk = 1; chunk <= 40; chunk++) {
+    pixc::DescScanner sc(magic);
+    for (size_t o = 0; o < img.size(); o += chunk) sc.feed(img.data() + o, std::min(chunk, img.size() - o));
+    CHECK(sc.found());
+    CHECK(sc.build() == build);
+    CHECK(sc.security() == sec);
+  }
+  pixc::DescScanner none(magic);
+  none.feed(img.data(), 5000);
+  CHECK(!none.found());
+
+  CHECK(pixc::otaRefusal(false, 10, 1, 5, 1) != nullptr);
+  CHECK(std::strcmp(pixc::otaRefusal(true, 4, 1, 5, 1), "downgrade") == 0);
+  CHECK(std::strcmp(pixc::otaRefusal(true, 9, 1, 5, 2), "security downgrade") == 0);
+  CHECK(pixc::otaRefusal(true, 5, 1, 5, 1) == nullptr);    // a reinstall of the same build
+  CHECK(pixc::otaRefusal(true, 6, 2, 5, 1) == nullptr);
+}
+
 int main() {
   testClassifyTopic();
+  testDescScanner();
   testBootCount();
   testFactoryData();
   testJsonEscape();
