@@ -69,7 +69,9 @@ void pixcBootCounterOnBoot() {
   // counted, so the count lives in NVS (one small write per boot). A crash, watchdog or software
   // reboot clears it, so a crash loop can never wipe a unit.
   const esp_reset_reason_t r = esp_reset_reason();
-  const bool powerUp = (r == ESP_RST_POWERON || r == ESP_RST_BROWNOUT);
+  // A brownout is NOT counted: a weak supply that browns out under inrush five times in a row must
+  // not wipe the unit. Bench: confirm a wall-switch cycle reports POWERON on this board.
+  const bool powerUp = (r == ESP_RST_POWERON);
   Preferences p;
   if (!p.begin(kNsReset, false)) return;
   const pixc::BootCount next = pixc::nextBootCount(p.getUChar("n", 0), powerUp);
