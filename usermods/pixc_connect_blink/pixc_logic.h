@@ -179,5 +179,50 @@ inline size_t jsonEscape(const char* in, char* out, size_t cap) {
   return o;
 }
 
+// ---------------------------------------------------------------------------------------------
+// Factory reset gesture and factory data
+// ---------------------------------------------------------------------------------------------
+
+// Five power-ups in a row, each cut before it has run 10 s, request a factory reset (Pairing and
+// LAN security v2, "Factory reset"). `prev` is the stored count; any boot that is not a power-up
+// (crash, watchdog, software reboot) clears it, so only a person at the switch can do it.
+struct BootCount { uint8_t stored; bool reset; };
+constexpr uint8_t kPowerCyclesToReset = 5;
+inline BootCount nextBootCount(uint8_t prev, bool powerUp) {
+  if (!powerUp) return {0, false};
+  const uint8_t n = prev >= kPowerCyclesToReset ? kPowerCyclesToReset : static_cast<uint8_t>(prev + 1);
+  if (n >= kPowerCyclesToReset) return {0, true};
+  return {n, false};
+}
+
+// The factory hotspot password: 8-63 printable ASCII for WPA2. The factory tool writes 10
+// characters from [a-z2-9]; anything outside WPA2's rules is treated as absent.
+inline bool validApPsk(const char* s) {
+  if (s == nullptr) return false;
+  const size_t n = strlen(s);
+  if (n < 8 || n > 63) return false;
+  for (size_t i = 0; i < n; i++) if (s[i] < 0x20 || s[i] > 0x7e) return false;
+  return true;
+}
+
+// The hotspot name, "ePixC-" plus the last four hex digits of the MAC in upper case. `mac` is the
+// 12-hex escapedMac. Two units in range are told apart, and the app joins the one it scanned.
+inline void hotspotName(const char* mac, char* out, size_t cap) {
+  if (out == nullptr || cap == 0) return;
+  const size_t n = mac ? strlen(mac) : 0;
+  char tail[5] = "0000";
+  if (n >= 4) {
+    for (int i = 0; i < 4; i++) {
+      const char c = mac[n - 4 + i];
+      tail[i] = (c >= 'a' && c <= 'f') ? static_cast<char>(c - 'a' + 'A') : c;
+    }
+  }
+  const char* base = "ePixC-";
+  size_t o = 0;
+  for (const char* b = base; *b && o + 1 < cap; b++) out[o++] = *b;
+  for (int i = 0; i < 4 && o + 1 < cap; i++) out[o++] = tail[i];
+  out[o] = 0;
+}
+
 }  // namespace pixc
 // AI: end

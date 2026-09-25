@@ -25,6 +25,8 @@
 #include "pixc_led_bus.h"
 // Host-testable decisions (topic routing, ...). See test/pixc/.
 #include "pixc_logic.h"
+// Factory reset, power-cycle counter, factory hotspot password, boot id.
+#include "../../wled00/pixc_device.h"
 
 // ePixC API host the device calls to learn its MQTT broker (see provision()).
 // Normally written by the app during pairing (um.PixcConnect.apiHost); this is
@@ -715,11 +717,20 @@ class PixcConnectBlink : public Usermod {
       if (!busChange) serializeConfigToFS();
     }
 
-    // Factory reset: wipe config + Wi-Fi credentials and reboot back into ePixC-AP.
-    void factoryReset() {
-      WLED_FS.remove("/cfg.json");
-      WLED_FS.remove("/wsec.json");
-      doReboot = true;
+    // Factory reset from the cloud: `<base>/reset` carrying exactly {"reset":true} (epixc-backend
+    // services/mqtt RESET_PAYLOAD, QoS 1, never retained). Any other payload is ignored (audit
+    // S12): the topic used to wipe on ANY payload, so a stray or retained message was a reset loop.
+    // The wipe itself is shared with the LAN and power-cycle paths - wled00/pixc_device.cpp - and is
+    // complete: LittleFS formatted, Wi-Fi NVS erased.
+    void factoryReset(const char* payload) {
+      StaticJsonDocument<64> doc;
+      if (deserializeJson(doc, payload)) return;
+      JsonVariant v = doc["reset"];
+      if (!doc.is<JsonObject>() || !v.is<bool>() || !v.as<bool>()) {
+        DEBUG_PRINTLN(F("[ePixC] /reset ignored: payload is not {\"reset\":true}"));
+        return;
+      }
+      pixcRequestFactoryReset("cloud");
     }
 
     // Report OTA progress to the cloud on `epixc/v1/d/{mac}/ota/progress`. `status`
@@ -838,6 +849,8 @@ class PixcConnectBlink : public Usermod {
 
   public:
     void setup() override {
+      // Five short power-ups in a row are the no-app, no-cloud factory reset (wled00/pixc_device).
+      pixcBootCounterOnBoot();
       // The network worker (provisioning, OTA) - off the LED loop. See pixc_net above.
       if (!pixc_net::start()) DEBUG_PRINTLN(F("[ePixC] network worker failed to start"));
       // Say it out loud, once, at boot. The build-time guard in pixc_ota_pubkey.h means nobody
@@ -1126,7 +1139,7 @@ class PixcConnectBlink : public Usermod {
           applyCfg(payload);
           return true;
         case pixc::Topic::Reset:
-          factoryReset();
+          factoryReset(payload);
           return true;
         case pixc::Topic::Ota:
           stageOta(payload);
@@ -1165,6 +1178,7 @@ class PixcConnectBlink : public Usermod {
 
     void loop() override {
       const unsigned long now = millis();
+      pixcDeviceLoop();   // clears the power-up counter at 10 s; runs a pending factory reset
       drainNetResults(now);
       if (_rebootAt != 0 && (long)(now - _rebootAt) >= 0) { _rebootAt = 0; doReboot = true; }
 

@@ -222,8 +222,44 @@ static void testJsonEscape() {
   escapes(nullptr, "");
 }
 
+// ---------------------------------------------------------------------------------------------
+// P2: the power-cycle factory reset, and factory hotspot data.
+// ---------------------------------------------------------------------------------------------
+static void testBootCount() {
+  uint8_t n = 0;
+  for (int i = 1; i <= 4; i++) {
+    const pixc::BootCount b = pixc::nextBootCount(n, true);
+    CHECK(!b.reset);
+    CHECK(b.stored == i);
+    n = b.stored;
+  }
+  const pixc::BootCount fifth = pixc::nextBootCount(n, true);
+  CHECK(fifth.reset);
+  CHECK(fifth.stored == 0);
+  // A crash or watchdog reboot in between clears the count: a crash loop never wipes a unit.
+  CHECK(pixc::nextBootCount(4, false).stored == 0);
+  CHECK(!pixc::nextBootCount(4, false).reset);
+  // A corrupt stored value cannot overflow past the threshold without resetting.
+  CHECK(pixc::nextBootCount(200, true).reset);
+}
+
+static void testFactoryData() {
+  CHECK(pixc::validApPsk("k7m2q9x4ab"));
+  CHECK(!pixc::validApPsk("short"));
+  CHECK(!pixc::validApPsk(""));
+  CHECK(!pixc::validApPsk(nullptr));
+  CHECK(!pixc::validApPsk("tab\there!!"));
+  char name[16];
+  pixc::hotspotName("aabbccddeeff", name, sizeof(name));
+  CHECK(std::strcmp(name, "ePixC-EEFF") == 0);
+  pixc::hotspotName("001122334a5b", name, sizeof(name));
+  CHECK(std::strcmp(name, "ePixC-4A5B") == 0);
+}
+
 int main() {
   testClassifyTopic();
+  testBootCount();
+  testFactoryData();
   testJsonEscape();
   testBackoff();
   testRedaction();
