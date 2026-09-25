@@ -7,8 +7,15 @@
 #include "../usermods/pixc_connect_blink/pixc_logic.h"   // backoffWithJitter()
 #include <esp_random.h>
 
-// TLS is chosen by port rather than by a flag: 8883 is the registered MQTTS port and the only one
-// ePixC publishes. A bench broker on 1883 stays plaintext without a second build.
+// TLS ONLY (audit S10). This used to choose TLS by port - 8883 TLS, anything else plaintext - and
+// the port comes from the provisioning reply, from the PIN-gated /json/cfg and (then) from any
+// cloud /cfg push. So one config value turned the per-device MQTT credential into plaintext on the
+// wire, the same "a config value revokes the guarantee" defect ticket 33 closed for provisioning.
+//
+// A release image now has no plaintext MQTT path compiled in: it speaks TLS, and only to 8883, the
+// registered MQTTS port and the only one ePixC publishes. Any other port is refused. The bench
+// broker in epixc-backend's compose.local.yaml is plaintext on 1883, so PixC_V1_dev - and only it -
+// defines EPIXC_ALLOW_PLAINTEXT_MQTT, the same one-way pattern as EPIXC_ALLOW_PLAINTEXT_PROVISION.
 static constexpr uint16_t kMqttsPort = 8883;
 
 PixcMqttClient& PixcMqttClient::setServer(const char* host, uint16_t port) {
@@ -241,6 +248,13 @@ bool PixcMqttClient::start() {
     // The same pinned roots the provisioning fetch uses. Not the certificate bundle: a bundle
     // trusts every public CA, which means any of them can mint a certificate for our broker.
     cfg.cert_pem = PIXC_TRUSTED_ROOTS;
+  } else {
+#ifdef EPIXC_ALLOW_PLAINTEXT_MQTT
+    cfg.transport = MQTT_TRANSPORT_OVER_TCP;   // PixC_V1_dev bench broker only
+#else
+    DEBUG_PRINTF("[ePixC] MQTT refused: port %u is not TLS (8883)\n", (unsigned)_port);
+    return false;
+#endif
   }
 
   _client = esp_mqtt_client_init(&cfg);

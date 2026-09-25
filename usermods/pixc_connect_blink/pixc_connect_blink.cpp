@@ -47,8 +47,11 @@
 #ifndef PIXC_MQTT_HOST
   #define PIXC_MQTT_HOST ""
 #endif
+// The broker port when the provisioning reply names none: 8883, MQTT over TLS - the only port ePixC
+// publishes and the only one a release build will connect to (pixc_mqtt_client.cpp). It was 1883,
+// so a reply missing `mqtt_port` sent the per-device credential in plaintext (audit S10).
 #ifndef PIXC_MQTT_PORT
-  #define PIXC_MQTT_PORT 1883
+  #define PIXC_MQTT_PORT 8883
 #endif
 
 // ePixC device-edge usermod. Two jobs:
@@ -783,7 +786,19 @@ class PixcConnectBlink : public Usermod {
     void applyProvision(const pixc_net::Result& r) {
       _provisionInFlight = false;
       _provisionAttempt = 0;
-      const uint16_t port = r.port ? r.port : PIXC_MQTT_PORT;
+      uint16_t port = r.port ? r.port : PIXC_MQTT_PORT;
+#ifdef PIXC_DEV_FORCE_MQTT_PORT
+      // Bench: epixc-backend's local stack answers 8883 but its EMQX listens plaintext on 1883.
+      port = PIXC_DEV_FORCE_MQTT_PORT;
+#endif
+#ifndef EPIXC_ALLOW_PLAINTEXT_MQTT
+      if (port != 8883) {
+        // Not a TLS port. Refused here, loudly, rather than handed to a client that would refuse
+        // it anyway and leave the unit quietly offline.
+        provisionFailed(millis(), "mqtt_port is not 8883");
+        return;
+      }
+#endif
       const bool changed = strcmp(mqttServer, r.host) != 0 || mqttPort != port;
       strlcpy(mqttServer, r.host, MQTT_MAX_SERVER_LEN + 1);
       mqttPort = port;
