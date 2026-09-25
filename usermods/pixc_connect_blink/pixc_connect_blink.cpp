@@ -72,6 +72,12 @@
 //
 // Requires MQTT compiled in (do NOT set WLED_DISABLE_MQTT).
 
+#ifdef PIXC_CONFIRM_ON_BROKER
+// D35: the framework's initArduino() confirms a PENDING_VERIFY image before setup() unless this weak
+// hook (cores/esp32/esp32-hal-misc.c) says to verify later. The usermod confirms on broker connect.
+extern "C" bool verifyRollbackLater() { return true; }
+#endif
+
 // The build identity (pio-scripts/pixc_build_id.py). Absent in a build without that script.
 #ifndef PIXC_FW_BUILD
   #define PIXC_FW_BUILD 0
@@ -449,12 +455,13 @@ class PixcConnectBlink : public Usermod {
     // freshly installed OTA that will be rolled back on the next boot unless this firmware says it
     // is working.
     //
-    // On every current build it is ALWAYS false, and that is not a failure of the read — it is the
-    // whole state of play. confirmImageIfPending() names the two callers that confirm the image
-    // before this usermod ever runs. The flag is kept, and still published, because the pair
-    // (supported, armed) is the fingerprint of exactly that.
+    // With PIXC_CONFIRM_ON_BROKER (D35) nothing confirms the image before this usermod runs, so after
+    // an OTA this is true until the image reaches the broker. See confirmImageIfPending().
     bool _awaitingConfirm = false;
     bool _confirmed = false;
+    // This boot obtained broker credentials from the API (provisioning 200): the network and TLS
+    // work, so a broker that stays unreachable is evidence against the image. See loop().
+    bool _gotCredentialsThisBoot = false;
 
     // Whether the framework this image linked against has bootloader rollback compiled in — a
     // BUILD fact, taken from the prebuilt Arduino framework's sdkconfig, which is the same value
@@ -864,6 +871,7 @@ class PixcConnectBlink : public Usermod {
     // reach.
     void applyProvision(const pixc_net::Result& r) {
       _provisionInFlight = false;
+      _gotCredentialsThisBoot = true;
       _provisionAttempt = 0;
       uint16_t port = r.port ? r.port : PIXC_MQTT_PORT;
 #ifdef PIXC_DEV_FORCE_MQTT_PORT
@@ -1056,56 +1064,27 @@ class PixcConnectBlink : public Usermod {
       return false;   // already persisted; nothing for serializeConfigToFS()
     }
 
-    // Tell the bootloader this image works, so it stops being a candidate for rollback.
+    // Tell the bootloader this image works, so it stops being a candidate for rollback (D35).
     //
-    // "Works" is MEANT to be: it reached the broker. That is the whole point of the firmware — a
-    // build that boots but cannot talk to the cloud is exactly the build that should be rolled
-    // back, and it is the failure a bad OTA most plausibly produces. Confirming in setup(), which
-    // is the obvious place, would confirm every image including one that never connects again.
+    // "Works" means: it reached the broker. A build that boots but cannot talk to the cloud is the
+    // build that should be rolled back, and it is the failure a bad OTA most plausibly produces.
     //
-    // That is not what the built image does, and nothing in this function can change it, because
-    // two other callers confirm first — both unconditional, both long before Wi-Fi exists:
+    // Until 2026-09-25 this was a no-op, because two callers confirmed every image first:
+    // initArduino() (framework, under CONFIG_APP_ROLLBACK_ENABLE) and WLED's markOTAvalid() at the
+    // end of WLED::setup(). With PIXC_CONFIRM_ON_BROKER both are neutralised - the framework's weak
+    // verifyRollbackLater() hook is overridden to return true (below, at file scope), and
+    // markOTAvalid() is skipped (wled00/wled.cpp) - so a freshly installed image boots
+    // PENDING_VERIFY and the bootloader reverts it on the next reset unless this runs first.
     //
-    //   1. initArduino(), in the prebuilt Arduino core (framework-arduinoespressif32,
-    //      cores/esp32/esp32-hal-misc.c). Under CONFIG_APP_ROLLBACK_ENABLE it calls
-    //      esp_ota_mark_app_valid_cancel_rollback() itself. app_main() (cores/esp32/main.cpp) runs
-    //      it BEFORE creating the task that calls setup(), so it beats all of WLED, this usermod
-    //      included — which is why _awaitingConfirm, read in setup(), is always false.
-    //   2. WLED's own markOTAvalid() (wled00/ota_update.cpp), called unconditionally at the end of
-    //      WLED::setup() (wled00/wled.cpp). A no-op by the time it runs, but a second confirm site
-    //      to remember to handle.
-    //
-    // Read out of the linked image rather than inferred from source: in the PixC_V1_dev ELF,
-    // initArduino, WLED::setup (via markOTAvalid) and PixcConnectBlink::onMqttConnect each carry a
-    // call to esp_ota_mark_app_valid_cancel_rollback. Three confirm sites; the two that win are
-    // the unconditional ones.
-    //
-    // So the rule actually in force is "an image is good if it reaches initArduino()". That covers
-    // an image which will not start at all, and nothing else — not the LED path, not the usermod,
-    // not the web UI, not the heap under a render loop, and not the broker.
-    //
-    // Making the intended rule real takes three changes TOGETHER, and a bench unit:
-    //   a. defer the framework's confirm by overriding its weak hook —
-    //      `extern "C" bool verifyRollbackLater() { return true; }`. esp32-hal-misc.c declares it
-    //      __attribute__((weak)) precisely for this, so a strong definition here wins at link time
-    //      and no framework patch is needed.
-    //   b. stop WLED core confirming in setup() (markOTAvalid(), wled00/ota_update.cpp).
-    //   c. choose the criterion, and the deadline by which a good image must meet it.
-    //
-    // (c) is not a code question, and it is why this is still as it is. Arming rollback means a
-    // GOOD image gets reverted whenever the criterion is missed for reasons that have nothing to
-    // do with the image: a router reboot, a broker restart, a root that expired (the pinned roots
-    // carry a build-enforced deadline). The probation window is exactly ONE reset long — the
-    // bootloader reverts on the next boot, and it does not care whether that boot came from a
-    // crash or from a customer pulling the plug — so an update followed by a power cycle reverts
-    // even though nothing was wrong. A revert loop on a healthy build is its own outage, and it
-    // looks like the update system is broken.
-    //
-    // And the criterion the intent names depends on a TLS path that has never completed a
-    // handshake on hardware (platformio_override.ini, env:PixC_V1, says so). Arming a fleet-wide
-    // revert on an untested path is not a change to make from a desk. Bench first: a signed image
-    // on a real unit, confirm the revert actually fires, and measure boot-to-broker on a real
-    // network before anyone picks a window.
+    // What reverts it:
+    //   - any reset before the broker is reached: a crash, a panic, the 20 s loop watchdog, a
+    //     brownout, or the customer switching it off. The last one reverts a good image too; that
+    //     costs one re-download (the backend re-offers the release), never a broken unit.
+    //   - loop(): credentials fetched over TLS this boot (the network and the API are fine) but no
+    //     broker connection kRollbackDeadlineMs after boot. The image is marked invalid and the
+    //     unit reboots into the previous one.
+    // Bench: time boot-to-broker on a real network, confirm a crash-on-boot image reverts, and
+    // confirm a good image survives an OTA followed by a normal power cycle after connecting.
     void confirmImageIfPending() {
       if (!_awaitingConfirm || _confirmed) return;
       _confirmed = true;
@@ -1114,6 +1093,16 @@ class PixcConnectBlink : public Usermod {
       } else {
         DEBUG_PRINTLN("[ePixC] OTA image confirm FAILED; this image may be rolled back");
       }
+    }
+
+    static constexpr unsigned long kRollbackDeadlineMs = 15UL * 60 * 1000;
+
+    void checkRollbackDeadline(unsigned long now) {
+      if (!_awaitingConfirm || _confirmed || !_gotCredentialsThisBoot) return;
+      if (now < kRollbackDeadlineMs || WLED_MQTT_CONNECTED) return;
+      DEBUG_PRINTLN(F("[ePixC] new image never reached the broker: rolling back"));
+      _confirmed = true;   // once
+      esp_ota_mark_app_invalid_rollback_and_reboot();   // returns only if there is nothing to revert to
     }
 
     void onMqttConnect(bool /*sessionPresent*/) override {
@@ -1239,6 +1228,7 @@ class PixcConnectBlink : public Usermod {
     void loop() override {
       const unsigned long now = millis();
       pixcDeviceLoop();   // clears the power-up counter at 10 s; runs a pending factory reset
+      checkRollbackDeadline(now);
       drainNetResults(now);
       if (_rebootAt != 0 && (long)(now - _rebootAt) >= 0) { _rebootAt = 0; doReboot = true; }
 

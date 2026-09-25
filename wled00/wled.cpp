@@ -604,7 +604,9 @@ void WLED::setup()
   #if defined(ARDUINO_ARCH_ESP32) && defined(WLED_DISABLE_BROWNOUT_DET)
   WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 1); //enable brownout detector
   #endif
+#ifndef PIXC_CONFIRM_ON_BROKER
   markOTAvalid();
+#endif  // ePixC confirms the image once it reaches the broker (pixc_connect_blink, D35)
 }
 
 void WLED::beginStrip()
