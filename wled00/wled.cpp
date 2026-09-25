@@ -1,5 +1,9 @@
 #define WLED_DEFINE_GLOBAL_VARS //only in one source file, wled.cpp!
 #include "wled.h"
+#ifdef PIXC_LAN_AUTH
+#include "pixc_device.h"
+#include "../usermods/pixc_connect_blink/pixc_logic.h"
+#endif
 #include "wled_ethernet.h"
 #include "ota_update.h"
 #ifdef WLED_ENABLE_AOTA
@@ -654,10 +658,26 @@ void WLED::initAP(bool resetAP)
   if (apBehavior == AP_BEHAVIOR_BUTTON_ONLY && !resetAP)
     return;
 
+#ifdef PIXC_LAN_AUTH
+  // Pairing v2 hotspot (audit S4/S16, D306): "ePixC-XXXX" from the MAC, so two lights in range are
+  // told apart, and the per-unit password from factory NVS, printed on the label as a Wi-Fi QR. No
+  // config value chooses either. A release unit with no factory password opens NO hotspot: it
+  // must never broadcast a guessable one (dev builds fall back to PIXC_DEV_AP_PSK).
+  {
+    static bool warned = false;
+    pixc::hotspotName(escapedMac.c_str(), apSSID, sizeof(apSSID));
+    if (!pixcFactoryApPsk(apPass, sizeof(apPass))) {
+      if (!warned) { warned = true; DEBUG_PRINTLN(F("[ePixC] no factory hotspot password: hotspot stays off")); }
+      return;
+    }
+    apHide = 0;
+  }
+#else
   if (resetAP) {
     WLED_SET_AP_SSID();
     strcpy_P(apPass, PSTR(WLED_AP_PASS));
   }
+#endif
   DEBUG_PRINT(F("Opening access point "));
   DEBUG_PRINTLN(apSSID);
   WiFi.softAPConfig(IPAddress(4, 3, 2, 1), IPAddress(4, 3, 2, 1), IPAddress(255, 255, 255, 0));
