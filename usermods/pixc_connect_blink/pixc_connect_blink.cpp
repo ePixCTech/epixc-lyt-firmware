@@ -23,6 +23,8 @@
 // The RGB/RGBW width table, and the build-time assertion that the compiled-in bus is a width the
 // cloud is able to set. Read the header before touching applyLedWidth().
 #include "pixc_led_bus.h"
+// Host-testable decisions (topic routing, ...). See test/pixc/.
+#include "pixc_logic.h"
 
 // ePixC API host the device calls to learn its MQTT broker (see provision()).
 // Normally written by the app during pairing (um.PixcConnect.apiHost); this is
@@ -773,6 +775,12 @@ class PixcConnectBlink : public Usermod {
       // device could command the entire fleet. Nothing in ePixC ever publishes there.
       // The broker ACL also denies wled/#, so this is the first of two layers.
       mqttGroupTopic[0] = 0;
+
+      // The full MAC as the MQTT client id. WLED's default is "WLED-" plus the last three MAC
+      // bytes, which collides across Espressif OUIs; the broker then kicks the older session and
+      // the two units take turns disconnecting each other. EMQX has no client-id rule of its own
+      // (auth is on the username), so the id only has to be unique.
+      snprintf(mqttClientID, sizeof(mqttClientID), "epixc-%s", escapedMac.c_str());
     }
 
     // Called by WLED when the station connects to Wi-Fi — fetch the broker.
@@ -969,11 +977,13 @@ class PixcConnectBlink : public Usermod {
       // and `/reset` triggers a factory wipe.
       if (mqtt != nullptr) {
         String base = mqttDeviceTopic;
-        // QoS 1: /cfg carries the rotated settings PIN, which is not retained. At QoS 0 a lost
-        // message left the server waiting for a PIN the controller never got (D305).
+        // QoS 1 on all three, matching what the backend publishes (services/mqtt/src/mqtt.rs:
+        // /cfg, /ota and /api all go out AtLeastOnce). A subscription grants min(pub, sub), so a
+        // QoS 0 subscription silently downgraded every command: /cfg carries the rotated settings
+        // PIN (D305), /ota a job the backend waits on, /reset the owner's wipe.
         mqtt->subscribe((base + "/cfg").c_str(), 1);
-        mqtt->subscribe((base + "/reset").c_str(), 0);
-        mqtt->subscribe((base + "/ota").c_str(), 0);
+        mqtt->subscribe((base + "/reset").c_str(), 1);
+        mqtt->subscribe((base + "/ota").c_str(), 1);
       }
 
       if (!_blinkDone) {
@@ -991,30 +1001,34 @@ class PixcConnectBlink : public Usermod {
     }
 
     bool onMqttMessage(char* topic, char* payload) override {
-      String base = mqttDeviceTopic;
-      if (strstr(topic, (base + "/cfg").c_str()) != nullptr) {
-        applyCfg(payload);
-        return true;
-      }
-      if (strstr(topic, (base + "/reset").c_str()) != nullptr) {
-        factoryReset();
-        return true;
-      }
-      // Exact `/ota` (not `/ota/progress`, which we only publish). Stage the job
-      // and let loop() run the blocking download/flash.
-      if (base + "/ota" == topic) {
-        DynamicJsonDocument doc(512);
-        if (!deserializeJson(doc, payload)) {
-          _otaJob = (const char*)(doc["job_id"] | "");
-          _otaUrl = (const char*)(doc["url"] | "");
-          _otaVer = (const char*)(doc["version"] | "");
-          _otaSha = (const char*)(doc["sha256"] | "");
-          // The signature the image has to carry. The gateway has always sent this field and the
-          // firmware ignored it, which is why an unsigned image was applied without complaint.
-          _otaSigUrl = (const char*)(doc["sig_url"] | "");
-          if (_otaUrl.length() > 0 && !_otaPending) _otaPending = true;
+      // WLED has already stripped `mqttDeviceTopic` from `topic` (wled00/mqtt.cpp), so what arrives
+      // here is "/cfg", not "epixc/v1/d/<mac>/cfg". This used to strstr() for the FULL topic inside
+      // the stripped one, which can never match: cloud config, factory reset and OTA were all
+      // silently dead (audit S1). The classification is exact and host-tested - test/pixc/.
+      switch (pixc::classifyTopic(topic, mqttDeviceTopic)) {
+        case pixc::Topic::Cfg:
+          applyCfg(payload);
+          return true;
+        case pixc::Topic::Reset:
+          factoryReset();
+          return true;
+        case pixc::Topic::Ota: {
+          // Stage the job and let loop() run the download/flash.
+          DynamicJsonDocument doc(512);
+          if (!deserializeJson(doc, payload)) {
+            _otaJob = (const char*)(doc["job_id"] | "");
+            _otaUrl = (const char*)(doc["url"] | "");
+            _otaVer = (const char*)(doc["version"] | "");
+            _otaSha = (const char*)(doc["sha256"] | "");
+            // The signature the image has to carry. The gateway has always sent this field and the
+            // firmware ignored it, which is why an unsigned image was applied without complaint.
+            _otaSigUrl = (const char*)(doc["sig_url"] | "");
+            if (_otaUrl.length() > 0 && !_otaPending) _otaPending = true;
+          }
+          return true;
         }
-        return true;
+        case pixc::Topic::None:
+          break;
       }
       return false;
     }
