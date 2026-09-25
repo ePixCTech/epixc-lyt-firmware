@@ -40,4 +40,40 @@ env.Append(CPPDEFINES=[  # noqa: F821
     ("PIXC_FW_GIT", '\\"%s\\"' % describe),
 ])
 print("ePixC build %s (%s)" % (number, describe))
+
+# Remove a stale release binary for this env before building (audit B5). output_bins.py copies the
+# image to build_output/release/WLED_<version>_<release name>.bin only when a build SUCCEEDS, so a
+# failed build left the last good-looking file in place - once a release-named bench image from an
+# earlier day sat there under the name a production flash would pick. Only this env's own file is
+# removed; other envs' outputs are untouched.
+import glob
+import json
+import re
+
+_release = None
+try:
+    _flags = env.GetProjectOption("build_flags")  # noqa: F821
+    _flags = " ".join(_flags) if isinstance(_flags, (list, tuple)) else str(_flags)
+    _names = re.findall(r'WLED_RELEASE_NAME=\\?"([^"\\]+)', _flags)
+    _release = _names[-1] if _names else None   # the env's own (dev/citest re-set it last)
+except Exception:
+    _release = None
+if _release:
+    try:
+        with open(os.path.join(env.subst("$PROJECT_DIR"), "package.json")) as f:  # noqa: F821
+            _version = json.load(f)["version"]
+        _out = os.path.join(env.subst("$PROJECT_DIR"), "build_output", "release")  # noqa: F821
+        _built = os.path.join(env.subst("$BUILD_DIR"), "firmware.bin")  # noqa: F821
+        _built_bytes = open(_built, "rb").read() if os.path.isfile(_built) else None
+        _mine = os.path.join(_out, "WLED_%s_%s.bin" % (_version, _release))
+        # Kept only while it is byte-identical to this env's last linked image (an up-to-date build
+        # does not copy it again); anything else under this env's name is stale and goes.
+        # With no linked image to compare (after a clean) nothing is removed: PlatformIO's build
+        # cache may restore firmware.bin without re-running the copy, and the file may be current.
+        if _built_bytes is not None and os.path.isfile(_mine) and open(_mine, "rb").read() != _built_bytes:
+            for p in (_mine, _mine + ".gz"):
+                if os.path.isfile(p):
+                    os.remove(p)
+    except Exception as e:  # never fail a build over housekeeping
+        print("pixc_build_id: could not clear the previous release binary: %s" % e)
 # AI: end
