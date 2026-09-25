@@ -8,5 +8,6 @@ out="$(mktemp -d)"
 trap 'rm -rf "$out"' EXIT
 "${CXX:-c++}" -std=c++17 -Wall -Wextra -Werror -O1 \
   -I"$root/usermods/pixc_connect_blink" -I"$root/wled00" \
-  -o "$out/pixc_host_tests" "$here/test_pixc.cpp"
+  -DPIXC_VECTORS_PATH="\"$here/vectors/lan_auth_vectors.json\"" \
+  -o "$out/pixc_host_tests" "$here/test_pixc.cpp" "$here/test_lan_auth.cpp"
 "$out/pixc_host_tests"

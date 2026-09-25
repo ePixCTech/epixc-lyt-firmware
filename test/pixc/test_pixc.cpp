@@ -14,17 +14,9 @@
 #include "pixc_logic.h"
 #include "pixc_lan_guard.h"
 
-static int g_failures = 0;
-static int g_checks = 0;
+#include "test_check.h"
 
-#define CHECK(cond)                                                              \
-  do {                                                                           \
-    ++g_checks;                                                                  \
-    if (!(cond)) {                                                               \
-      ++g_failures;                                                              \
-      std::fprintf(stderr, "%s:%d: CHECK failed: %s\n", __FILE__, __LINE__, #cond); \
-    }                                                                            \
-  } while (0)
+void testLanAuthVectors();   // test_lan_auth.cpp
 
 // ---------------------------------------------------------------------------------------------
 // S1: the usermod must see its own topics after WLED strips the device prefix.
@@ -293,6 +285,7 @@ static void testDescScanner() {
 }
 
 int main() {
+  testLanAuthVectors();
   testClassifyTopic();
   testDescScanner();
   testBootCount();
