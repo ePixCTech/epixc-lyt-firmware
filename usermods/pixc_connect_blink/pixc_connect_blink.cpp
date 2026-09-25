@@ -1166,8 +1166,9 @@ class PixcConnectBlink : public Usermod {
 
       // The full MAC as the MQTT client id. WLED's default is "WLED-" plus the last three MAC
       // bytes, which collides across Espressif OUIs; the broker then kicks the older session and
-      // the two units take turns disconnecting each other. EMQX has no client-id rule of its own
-      // (auth is on the username), so the id only has to be unique.
+      // the two units take turns disconnecting each other. The broker now requires exactly this id
+      // for this light's login (backend 7a6ed35/df0dcd8, D336), so one light's credentials cannot
+      // take over another's session: do not change the format without changing the broker's rule.
       snprintf(mqttClientID, sizeof(mqttClientID), "epixc-%s", escapedMac.c_str());
     }
 
