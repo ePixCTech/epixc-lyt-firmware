@@ -58,8 +58,48 @@ static void testClassifyTopic() {
   CHECK(pixc::classifyTopic("/reset", nullptr) == Topic::Reset);
 }
 
+// ---------------------------------------------------------------------------------------------
+// B2: debug output must never carry the PIN or a password, even on a dev build.
+// ---------------------------------------------------------------------------------------------
+static void redacts(const char* in, const char* want) {
+  char buf[512];
+  std::snprintf(buf, sizeof(buf), "%s", in);
+  pixc::redactJsonSecrets(buf);
+  const bool ok = std::strcmp(buf, want) == 0;
+  CHECK(ok);
+  if (!ok) std::fprintf(stderr, "  in:   %s\n  got:  %s\n  want: %s\n", in, buf, want);
+}
+
+static void testRedaction() {
+  // The cloud /cfg payload that carries the rotated PIN (DeviceService.buildCfg).
+  redacts(R"({"def":{"bri":191},"um":{"PixcConnect":{"settingsPin":"4821"}}})",
+          R"({"def":{"bri":191},"um":{"PixcConnect":{"settingsPin":"****"}}})");
+  // The LAN body the app sends with every request.
+  redacts(R"({"on":true,"pin":"1234"})", R"({"on":true,"pin":"****"})");
+  // MQTT credential push and Wi-Fi provisioning.
+  redacts(R"({"if":{"mqtt":{"en":true,"user":"aabbccddeeff","psk":"0123abcd"}}})",
+          R"({"if":{"mqtt":{"en":true,"user":"aabbccddeeff","psk":"********"}}})");
+  redacts(R"({"nw":{"ins":[{"ssid":"Home","psk":"hunter2"}]}})",
+          R"({"nw":{"ins":[{"ssid":"Home","psk":"*******"}]}})");
+  // Bare values, whitespace, mixed case, escapes.
+  redacts(R"({"PIN" : 1234, "bri":5})", R"({"PIN" : ****, "bri":5})");
+  redacts(R"({"password":"a\"b"})", R"({"password":"****"})");
+  redacts(R"({"ota":{"pwd":"wledota"}})", R"({"ota":{"pwd":"*******"}})");
+  // Values that merely LOOK like secret keys are left alone; so is non-secret data.
+  redacts(R"({"ssid":"pin","v":true})", R"({"ssid":"pin","v":true})");
+  redacts(R"({"seg":[{"col":[[255,0,0]]}]})", R"({"seg":[{"col":[[255,0,0]]}]})");
+  // Truncated input must not read past the terminator.
+  redacts(R"({"pin":"12)", R"({"pin":"**)");
+  redacts(R"({"pi)", R"({"pi)");
+  CHECK(pixc::isSecretKey("mqttPass", 8));
+  CHECK(pixc::isSecretKey("lan_secret", 10));
+  CHECK(!pixc::isSecretKey("ping", 4));
+  CHECK(!pixc::isSecretKey("user", 4));
+}
+
 int main() {
   testClassifyTopic();
+  testRedaction();
   if (g_failures == 0) {
     std::printf("pixc host tests: %d checks passed\n", g_checks);
     return EXIT_SUCCESS;

@@ -5,6 +5,9 @@
  */
 
 #ifndef WLED_DISABLE_MQTT
+#ifdef PIXC_MQTT_ESP_IDF
+#include "../usermods/pixc_connect_blink/pixc_logic.h"   // redactJsonSecrets() for debug output
+#endif
 #define MQTT_KEEP_ALIVE_TIME 60    // contact the MQTT broker every 60 seconds
 
 #if MQTT_MAX_TOPIC_LEN > 32
@@ -98,7 +101,23 @@ static void onMqttMessage(char* topic, char* payload, AsyncMqttClientMessageProp
     DEBUG_PRINTLN(F("MQTT partial packet received."));
     return; // process next packet
   }
+#ifdef PIXC_MQTT_ESP_IDF
+  // Never the raw payload: the cloud /cfg carries the settings PIN, and WLED_DEBUG builds print to
+  // a UART header anyone with the board can read. A redacted copy keeps the shape visible.
+  #ifdef WLED_DEBUG
+  {
+    char* dbg = static_cast<char*>(p_malloc(total + 1));
+    if (dbg) {
+      memcpy(dbg, payloadStr, total + 1);
+      pixc::redactJsonSecrets(dbg);
+      DEBUG_PRINTLN(dbg);
+      p_free(dbg);
+    }
+  }
+  #endif
+#else
   DEBUG_PRINTLN(payloadStr);
+#endif
 
   size_t topicPrefixLen = strlen(mqttDeviceTopic);
   if (strncmp(topic, mqttDeviceTopic, topicPrefixLen) == 0) {

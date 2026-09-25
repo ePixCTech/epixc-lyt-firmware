@@ -44,5 +44,82 @@ inline Topic classifyTopic(const char* topic, const char* deviceTopic) {
   return Topic::None;
 }
 
+
+// ---------------------------------------------------------------------------------------------
+// Secret redaction for debug output
+// ---------------------------------------------------------------------------------------------
+
+namespace detail {
+inline char lower(char c) { return (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c; }
+
+inline bool keyEquals(const char* k, size_t n, const char* lit) {
+  size_t i = 0;
+  for (; i < n && lit[i] != 0; i++) if (lower(k[i]) != lit[i]) return false;
+  return i == n && lit[i] == 0;
+}
+
+inline bool keyContains(const char* k, size_t n, const char* lit) {
+  const size_t m = strlen(lit);
+  for (size_t i = 0; i + m <= n; i++) {
+    size_t j = 0;
+    while (j < m && lower(k[i + j]) == lit[j]) j++;
+    if (j == m) return true;
+  }
+  return false;
+}
+
+inline bool keyEndsWith(const char* k, size_t n, const char* lit) {
+  const size_t m = strlen(lit);
+  return n >= m && keyEquals(k + n - m, m, lit);
+}
+}  // namespace detail
+
+// True for a JSON key whose value is a credential: the settings PIN (`pin`, `settingsPin`), Wi-Fi
+// and MQTT pre-shared keys (`psk`), passwords (`pass`, `password`, `pwd`, `mqttPass`, `otaPass`),
+// and anything named like a key, token or secret. Case-insensitive. Deliberately broad: a false
+// positive costs one starred-out debug value, a false negative prints a customer's Wi-Fi password.
+inline bool isSecretKey(const char* k, size_t n) {
+  using namespace detail;
+  return keyEndsWith(k, n, "pin") || keyContains(k, n, "psk") || keyContains(k, n, "pass") ||
+         keyContains(k, n, "pwd") || keyContains(k, n, "secret") || keyContains(k, n, "token") ||
+         keyEquals(k, n, "key") || keyEndsWith(k, n, "_key") || keyEndsWith(k, n, "apikey");
+}
+
+// Overwrite, in place, the value of every secret-named key in a JSON text with '*' - string values
+// between their quotes, bare values (numbers, true/false) up to the next delimiter. The text keeps
+// its length and structure, so a debug print still shows which fields arrived. Not a JSON parser:
+// it only has to be right for the keys that matter and never read past the terminator.
+inline void redactJsonSecrets(char* s) {
+  if (s == nullptr) return;
+  char* p = s;
+  while (*p) {
+    if (*p != '"') { p++; continue; }
+    char* keyStart = ++p;                              // candidate key: scan to its closing quote
+    while (*p && *p != '"') { if (*p == '\\' && p[1]) p++; p++; }
+    if (!*p) return;
+    const size_t keyLen = static_cast<size_t>(p - keyStart);
+    p++;                                               // past the closing quote
+    char* q = p;
+    while (*q == ' ' || *q == '\t' || *q == '\r' || *q == '\n') q++;
+    if (*q != ':') continue;                           // it was a string value, not a key
+    q++;
+    while (*q == ' ' || *q == '\t' || *q == '\r' || *q == '\n') q++;
+    if (!isSecretKey(keyStart, keyLen)) { p = q; continue; }
+    if (*q == '"') {
+      q++;
+      while (*q && *q != '"') {
+        if (*q == '\\' && q[1]) { *q++ = '*'; }
+        *q++ = '*';
+      }
+      p = *q ? q + 1 : q;
+    } else if (*q != '{' && *q != '[') {
+      while (*q && *q != ',' && *q != '}' && *q != ']' && *q != ' ' && *q != '\n') *q++ = '*';
+      p = q;
+    } else {
+      p = q;                                           // an object/array under a secret name: descend
+    }
+  }
+}
+
 }  // namespace pixc
 // AI: end
