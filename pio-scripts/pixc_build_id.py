@@ -5,8 +5,11 @@
 #   PIXC_FW_BUILD  a monotonic build number. It is compiled into the image's build descriptor
 #                  (usermods/pixc_connect_blink/pixc_logic.h, BuildDesc), which the ECDSA signature
 #                  covers, and a unit refuses an OTA image whose number is lower than its own.
-#                  CI sets EPIXC_BUILD_NUMBER (github.run_number plus a fixed offset, so it only
-#                  ever grows); a local build uses the commit count of HEAD.
+#                  It is the HEAD commit's committer time in minutes since 1970: the same number for
+#                  the same commit on a laptop and in CI (reproducible), independent of any CI run
+#                  counter or workflow name, and increasing along the release branch. Release images
+#                  must be built from a clean checkout of that branch; EPIXC_BUILD_NUMBER overrides
+#                  it only for an explicit re-issue.
 #   PIXC_FW_GIT    `git describe --always --dirty` - which source this image came from, reported in
 #                  the announce and boot event so two images with the same package.json version can
 #                  be told apart.
@@ -29,8 +32,8 @@ def _git(*args):
 
 number = os.environ.get("EPIXC_BUILD_NUMBER", "").strip()
 if not number.isdigit():
-    count = _git("rev-list", "--count", "HEAD")
-    number = count if count.isdigit() else "0"
+    ct = _git("log", "-1", "--format=%ct", "HEAD")
+    number = str(int(ct) // 60) if ct.isdigit() else "0"
 describe = _git("describe", "--always", "--dirty", "--abbrev=10") or "unknown"
 # Keep it a safe C string and short enough for the MQTT payloads it is copied into.
 describe = "".join(c for c in describe if c.isalnum() or c in "-._+")[:40]

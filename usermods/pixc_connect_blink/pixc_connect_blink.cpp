@@ -149,7 +149,9 @@ QueueHandle_t jobs = nullptr;
 QueueHandle_t results = nullptr;
 volatile bool busy = false;             // a job is running; read by the loop, written here
 
-void post(const Result& r) { xQueueSend(results, &r, pdMS_TO_TICKS(200)); }
+// Blocks until the loop takes it: a dropped terminal result would leave the loop waiting forever
+// (provisioning or OTA marked in flight). The loop drains this queue on every pass.
+void post(const Result& r) { xQueueSend(results, &r, portMAX_DELAY); }
 
 void otaProgress(const Job& j, const char* status, int pct, const char* err = nullptr) {
   Result r = {};
@@ -539,7 +541,14 @@ class PixcConnectBlink : public Usermod {
     Prov _prov = Prov::Idle;
     bool _provWanted = false;           // a pull is due
     bool _provisionInFlight = false;    // a provisioning job is with the network worker
-    char _pendingPass[65] = "";         // the password being confirmed
+    // The login being confirmed. Kept apart from mqttServer/mqttUser/mqttPass until /confirm returns
+    // 204, so the current login keeps working meanwhile, and persisted in NVS (pixc_prov) so a
+    // reboot mid-confirm resumes the confirm instead of forgetting it.
+    char _pendingPass[65] = "";
+    char _pendingHost[MQTT_MAX_SERVER_LEN + 1] = "";
+    char _pendingUser[41] = "";
+    uint16_t _pendingPort = 0;
+    unsigned long _confirmedAt = 0;     // millis() of this boot's confirm, for the rollback window
     unsigned long _wifiUpAt = 0;        // when this Wi-Fi session started (0 = down)
     uint8_t _provisionAttempt = 0;      // consecutive failures, for the backoff
     unsigned long _nextProvisionAt = 0; // millis() before which no new attempt is made
@@ -548,6 +557,7 @@ class PixcConnectBlink : public Usermod {
     // to the network worker (pixc_net) as a self-contained job; progress comes back as results and
     // is published on `.../ota/progress` from loop(). A command while one is running is refused.
     bool _otaRunning = false;
+    char _otaJobId[48] = "";
     unsigned long _rebootAt = 0;        // OTA done: reboot once the "done" publish has had a moment
 
     // True when this image was built with no signing key baked in. Compile-time constant, so the
@@ -969,17 +979,45 @@ class PixcConnectBlink : public Usermod {
         return;
       }
 #endif
-      strlcpy(mqttServer, r.host, MQTT_MAX_SERVER_LEN + 1);
-      mqttPort = port;
-      strlcpy(mqttUser, r.user, sizeof(mqttUser));
-      strlcpy(mqttPass, r.pass, sizeof(mqttPass));
+      strlcpy(_pendingHost, r.host, sizeof(_pendingHost));
+      strlcpy(_pendingUser, r.user, sizeof(_pendingUser));
       strlcpy(_pendingPass, r.pass, sizeof(_pendingPass));
-      mqttEnabled = true;
-      serializeConfigToFS();                   // cfg.json (host, user) and wsec.json (password)
+      _pendingPort = port;
+      savePending();
       _prov = Prov::Confirm;
       _provisionAttempt = 0;
       _nextProvisionAt = 0;
-      DEBUG_PRINTF("[ePixC] broker login from API: %s:%u, confirming\n", mqttServer, mqttPort);
+      DEBUG_PRINTF("[ePixC] broker login from API: %s:%u, confirming\n", _pendingHost, _pendingPort);
+    }
+
+    void savePending() {
+      Preferences p;
+      if (!p.begin("pixc_prov", false)) return;
+      if (_pendingPass[0]) {
+        p.putString("h", _pendingHost);
+        p.putString("u", _pendingUser);
+        p.putString("pw", _pendingPass);
+        p.putUShort("p", _pendingPort);
+      } else {
+        p.clear();
+      }
+      p.end();
+    }
+
+    void loadPending() {
+      Preferences p;
+      if (!p.begin("pixc_prov", true)) return;
+      p.getString("h", _pendingHost, sizeof(_pendingHost));
+      p.getString("u", _pendingUser, sizeof(_pendingUser));
+      p.getString("pw", _pendingPass, sizeof(_pendingPass));
+      _pendingPort = p.getUShort("p", 0);
+      p.end();
+      if (strlen(_pendingPass) == 64 && _pendingHost[0] && _pendingUser[0] && _pendingPort) {
+        _prov = Prov::Confirm;   // resume: confirm it on the first Wi-Fi connection
+        DEBUG_PRINTLN(F("[ePixC] resuming an unconfirmed broker login"));
+      } else {
+        _pendingPass[0] = 0;
+      }
     }
 
     // 204 from /confirm: the broker now accepts the stored password. Connect (or reconnect with it).
@@ -988,7 +1026,17 @@ class PixcConnectBlink : public Usermod {
       _prov = Prov::Idle;
       _provWanted = false;
       _provisionAttempt = 0;
+      _gotCredentialsThisBoot = true;
+      _confirmedAt = millis() ? millis() : 1;
+      // Only now does the new login replace the current one.
+      strlcpy(mqttServer, _pendingHost, MQTT_MAX_SERVER_LEN + 1);
+      mqttPort = _pendingPort;
+      strlcpy(mqttUser, _pendingUser, sizeof(mqttUser));
+      strlcpy(mqttPass, _pendingPass, sizeof(mqttPass));
+      mqttEnabled = true;
+      serializeConfigToFS();                   // cfg.json (host, user) and wsec.json (password)
       memset(_pendingPass, 0, sizeof(_pendingPass));
+      savePending();                           // clears pixc_prov
       _brokerDownSince = 0;
       DEBUG_PRINTLN(F("[ePixC] broker login confirmed; connecting"));
       if (mqtt != nullptr) mqtt->disconnect();   // drop a session on the old password, if any
@@ -997,7 +1045,12 @@ class PixcConnectBlink : public Usermod {
 
     void confirmFailed(unsigned long now, const pixc_net::Result& r) {
       // 409: this pending password was replaced (a newer pull won). Start over with a fresh pull.
-      if (r.httpStatus == 409) { _prov = Prov::Idle; _provWanted = true; }
+      if (r.httpStatus == 409) {
+        _prov = Prov::Idle;
+        _provWanted = true;
+        memset(_pendingPass, 0, sizeof(_pendingPass));
+        savePending();
+      }
       provisionFailed(now, r.err);
     }
 
@@ -1044,16 +1097,18 @@ class PixcConnectBlink : public Usermod {
     void setup() override {
       // Five short power-ups in a row are the no-app, no-cloud factory reset (wled00/pixc_device).
       pixcBootCounterOnBoot();
-      // The anti-rollback floor only ever rises: this image's security version, once it has run.
+      // The anti-rollback floor: read here, raised to this image's security version only once the
+      // image is confirmed (raiseSecurityFloor()) - raising it while on probation would leave a
+      // rolled-back previous image refusing its own security version.
       {
         Preferences p;
-        if (p.begin("pixc_ota", false)) {
-          uint32_t floor = p.getUInt("sec", 0);
-          if (floor < PIXC_SECURITY_VERSION) { floor = PIXC_SECURITY_VERSION; p.putUInt("sec", floor); }
-          pixc_net::securityFloor = floor;
+        if (p.begin("pixc_ota", true)) {
+          const uint32_t floor = p.getUInt("sec", 0);
+          if (floor > pixc_net::securityFloor) pixc_net::securityFloor = floor;
           p.end();
         }
       }
+      loadPending();
       // The network worker (provisioning, OTA) - off the LED loop. See pixc_net above.
       if (!pixc_net::start()) DEBUG_PRINTLN(F("[ePixC] network worker failed to start"));
       // Say it out loud, once, at boot. The build-time guard in pixc_ota_pubkey.h means nobody
@@ -1086,6 +1141,7 @@ class PixcConnectBlink : public Usermod {
       if (running != nullptr && esp_ota_get_state_partition(running, &otaState) == ESP_OK) {
         _awaitingConfirm = (otaState == ESP_OTA_IMG_PENDING_VERIFY);
       }
+      if (!_awaitingConfirm) raiseSecurityFloor();   // a confirmed image may set the floor now
       // Broker is NOT hardcoded — it is fetched from the ePixC API (see
       // startProvisioning) on every Wi-Fi connect. Only seed the last-resort
       // fallback if a build-time broker was explicitly provided.
@@ -1208,9 +1264,17 @@ class PixcConnectBlink : public Usermod {
     //     unit reboots into the previous one.
     // Bench: time boot-to-broker on a real network, confirm a crash-on-boot image reverts, and
     // confirm a good image survives an OTA followed by a normal power cycle after connecting.
+    static void raiseSecurityFloor() {
+      Preferences p;
+      if (!p.begin("pixc_ota", false)) return;
+      if (p.getUInt("sec", 0) < PIXC_SECURITY_VERSION) p.putUInt("sec", PIXC_SECURITY_VERSION);
+      p.end();
+    }
+
     void confirmImageIfPending() {
       if (!_awaitingConfirm || _confirmed) return;
       _confirmed = true;
+      raiseSecurityFloor();
       if (esp_ota_mark_app_valid_cancel_rollback() == ESP_OK) {
         DEBUG_PRINTLN("[ePixC] OTA image confirmed; rollback cancelled");
       } else {
@@ -1218,11 +1282,14 @@ class PixcConnectBlink : public Usermod {
       }
     }
 
-    static constexpr unsigned long kRollbackDeadlineMs = 15UL * 60 * 1000;
+    static constexpr unsigned long kRollbackDeadlineMs = 15UL * 60 * 1000;   // after confirm
 
     void checkRollbackDeadline(unsigned long now) {
-      if (!_awaitingConfirm || _confirmed || !_gotCredentialsThisBoot) return;
-      if (now < kRollbackDeadlineMs || WLED_MQTT_CONNECTED) return;
+      // The window opens when this boot has a CONFIRMED login from the API over TLS (the network,
+      // DNS, the pinned roots and the backend all work), not at boot: a broker outage before that
+      // says nothing about the image.
+      if (!_awaitingConfirm || _confirmed || !_gotCredentialsThisBoot || _confirmedAt == 0) return;
+      if (now - _confirmedAt < kRollbackDeadlineMs || WLED_MQTT_CONNECTED) return;
       DEBUG_PRINTLN(F("[ePixC] new image never reached the broker: rolling back"));
       _confirmed = true;   // once
       esp_ota_mark_app_invalid_rollback_and_reboot();   // returns only if there is nothing to revert to
@@ -1341,16 +1408,23 @@ class PixcConnectBlink : public Usermod {
       for (const char* c = job.jobId; *c; c++) {
         if (!isxdigit((unsigned char)*c) && *c != '-') { job.jobId[0] = 0; break; }
       }
+      // QoS 1 may redeliver the job that is already running: ignore it rather than report "busy",
+      // which the backend would record as that job's terminal failure.
+      if (_otaRunning && strcmp(job.jobId, _otaJobId) == 0) return;
       if (_otaRunning || !pixc_net::submit(job)) {
         publishOtaProgress(job.jobId, "failed", 0, "busy");
         return;
       }
       _otaRunning = true;
+      strlcpy(_otaJobId, job.jobId, sizeof(_otaJobId));
     }
 
     void loop() override {
       const unsigned long now = millis();
       pixcDeviceLoop();   // clears the power-up counter at 10 s; runs a pending factory reset
+#ifdef PIXC_LAN_AUTH
+      pixcLanLoop();      // applies a pairing validated by /json/pixc/pair
+#endif
       checkRollbackDeadline(now);
       drainNetResults(now);
       if (_rebootAt != 0 && (long)(now - _rebootAt) >= 0) { _rebootAt = 0; doReboot = true; }

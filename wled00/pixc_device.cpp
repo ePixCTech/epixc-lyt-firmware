@@ -52,9 +52,9 @@ void pixcFactoryWipeNow() {
   // Wi-Fi configuration the ESP32 keeps in its own NVS namespace (WLED stores credentials there
   // with WiFi.persistent(true) on first connect).
   esp_wifi_restore();
-  {
+  for (const char* ns : {kNsReset, "pixc_prov"}) {   // the reset counter and a pending broker login
     Preferences p;
-    if (p.begin(kNsReset, false)) { p.clear(); p.end(); }
+    if (p.begin(ns, false)) { p.clear(); p.end(); }
   }
   // Everything on the filesystem: cfg.json, wsec.json (Wi-Fi PSK, device key, LAN key, broker
   // password), presets.json and any other file.

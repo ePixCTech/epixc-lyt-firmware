@@ -149,6 +149,8 @@ jobs:
       - name: Run test/pixc
         run: bash test/pixc/run.sh
 
+  # The anti-rollback build number is the HEAD commit time (pio-scripts/pixc_build_id.py), so the
+  # same commit gets the same number here and on a laptop; no CI counter is involved.
   build:
     name: PixC_V1 ${{ matrix.target }} (ESP32-S3)
     runs-on: ubuntu-latest
@@ -161,10 +163,6 @@ jobs:
         #          same image with a throwaway key whose private half does not exist (CI ONLY,
         #          never shippable, see pixc_ota_pubkey.h). Every release check runs on it.
         target: [dev, release]
-    env:
-      # A monotonic build number for the anti-rollback descriptor (pio-scripts/pixc_build_id.py).
-      # The offset keeps CI numbers above any local commit-count build.
-      EPIXC_BUILD_NUMBER: ${{ github.run_number }}0000
     steps:
       # Whether this run is allowed to produce something a device could install.
       #
