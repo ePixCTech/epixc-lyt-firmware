@@ -182,8 +182,27 @@ static void testPinGuardCeiling() {
   }
 }
 
+// ---------------------------------------------------------------------------------------------
+// R1/R3: retry timing.
+// ---------------------------------------------------------------------------------------------
+static void testBackoff() {
+  // Attempt 0 waits between base/2 and base; each attempt doubles; the cap holds; jitter spans.
+  CHECK(pixc::backoffWithJitter(0, 2000, 300000, 0) == 1000);
+  CHECK(pixc::backoffWithJitter(0, 2000, 300000, 1000) == 2000);
+  CHECK(pixc::backoffWithJitter(0, 2000, 300000, 1001) == 1000);
+  CHECK(pixc::backoffWithJitter(3, 2000, 300000, 0) == 8000);
+  CHECK(pixc::backoffWithJitter(3, 2000, 300000, 8000) == 16000);
+  CHECK(pixc::backoffWithJitter(20, 2000, 300000, 0) == 150000);
+  CHECK(pixc::backoffWithJitter(255, 2000, 300000, 0xFFFFFFFFu) <= 300000);
+  for (uint32_t r = 0; r < 100000; r += 7) {
+    const uint32_t v = pixc::backoffWithJitter(5, 2000, 300000, r);
+    CHECK(v >= 32000 && v <= 64000);
+  }
+}
+
 int main() {
   testClassifyTopic();
+  testBackoff();
   testRedaction();
   testPinGuardBackoff();
   testPinGuardOwnerNeverLockedOut();

@@ -62,6 +62,10 @@ void WLED::loop()
   handleIR();        // 2nd call to function needed for ESP32 to return valid results -- should be good for ESP8266, too
   #endif
   handleConnection();
+  #if defined(PIXC_MQTT_ESP_IDF) && !defined(WLED_DISABLE_MQTT)
+  // ePixC: MQTT callbacks run here, on the loop task, not on esp-mqtt's (pixc_mqtt_client.h).
+  if (mqtt != nullptr) mqtt->loop();
+  #endif
   #ifdef WLED_ENABLE_ADALIGHT
   handleSerial();
   #endif

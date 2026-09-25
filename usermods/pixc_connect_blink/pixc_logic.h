@@ -121,5 +121,25 @@ inline void redactJsonSecrets(char* s) {
   }
 }
 
+// ---------------------------------------------------------------------------------------------
+// Retry timing
+// ---------------------------------------------------------------------------------------------
+
+// Exponential backoff with jitter: the attempt-th retry waits a random time in [d/2, d], where
+// d = min(baseMs * 2^attempt, maxMs). `rnd` is any 32-bit random value (esp_random() on the device).
+//
+// The jitter is the point. After a broker restart or a neighbourhood power cut the whole fleet
+// disconnects in the same second; with a fixed retry they all come back in the same second too,
+// each doing an RSA-4096 chain verification, and the broker sees a thundering herd on every retry.
+// Spreading each wave over half its interval turns that spike into a ramp.
+inline uint32_t backoffWithJitter(uint8_t attempt, uint32_t baseMs, uint32_t maxMs, uint32_t rnd) {
+  uint64_t d = baseMs;
+  for (uint8_t i = 0; i < attempt && d < maxMs; i++) d <<= 1;
+  if (d > maxMs) d = maxMs;
+  const uint64_t half = d / 2;
+  const uint64_t span = d - half + 1;
+  return static_cast<uint32_t>(half + (rnd % span));
+}
+
 }  // namespace pixc
 // AI: end
