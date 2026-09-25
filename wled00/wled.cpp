@@ -877,16 +877,22 @@ void WLED::initInterfaces()
   if (aOtaEnabled) ArduinoOTA.begin();
 #endif
 
-  // mDNS responder DISABLED for ePixC — the app discovers devices by scanning
-  // for the ePixC-AP Wi-Fi SSID (initial pairing) and via the cloud once
-  // provisioned, so no mDNS advertisement is needed.
-  // if (strlen(cmDNS) > 0) {
-  //   MDNS.end();
-  //   MDNS.begin(cmDNS);
-  //   MDNS.addService("http", "tcp", 80);
-  //   MDNS.addService("wled", "tcp", 80);
-  //   MDNS.addServiceTxt("wled", "tcp", "mac", escapedMac.c_str());
-  // }
+#ifdef PIXC_LAN_AUTH
+  // ePixC LAN discovery (audit P3, pairing v2): `_pixc._tcp` on port 80 with TXT mac=<12 hex> and
+  // v=2, which the app browses for (app_config.dart lanService). It matches `mac` against the
+  // home's lights, then trusts the address only after a signed reply. Nothing else is advertised:
+  // no `_http`, no `_wled`. Cost: the IDF mDNS task (4 KB stack, CONFIG_MDNS_TASK_STACK_SIZE) and a
+  // few KB of heap for the service records - check free_heap in the health telemetry.
+  if (strlen(cmDNS) > 0) {
+    MDNS.end();   // "end" before a second "begin", https://github.com/esp8266/Arduino/issues/7213
+    if (MDNS.begin(cmDNS)) {
+      MDNS.addService("pixc", "tcp", 80);
+      MDNS.addServiceTxt("pixc", "tcp", "mac", escapedMac.c_str());
+      MDNS.addServiceTxt("pixc", "tcp", "v", "2");
+      DEBUG_PRINTLN(F("mDNS started: _pixc._tcp"));
+    }
+  }
+#endif
   server.begin();
 
   if (udpPort > 0 && udpPort != ntpLocalPort) {
