@@ -188,6 +188,13 @@ static void testBackoff() {
   CHECK(pixc::backoffWithJitter(3, 2000, 300000, 8000) == 16000);
   CHECK(pixc::backoffWithJitter(20, 2000, 300000, 0) == 150000);
   CHECK(pixc::backoffWithJitter(255, 2000, 300000, 0xFFFFFFFFu) <= 300000);
+  CHECK(pixc::backoffPlusMinus20(0, 5000, 300000, 0) == 4000);
+  CHECK(pixc::backoffPlusMinus20(0, 5000, 300000, 2000) == 6000);
+  CHECK(pixc::backoffPlusMinus20(10, 5000, 300000, 0) == 240000);
+  for (uint32_t r = 0; r < 50000; r += 13) {
+    const uint32_t v = pixc::backoffPlusMinus20(2, 5000, 300000, r);
+    CHECK(v >= 16000 && v <= 24000);
+  }
   for (uint32_t r = 0; r < 100000; r += 7) {
     const uint32_t v = pixc::backoffWithJitter(5, 2000, 300000, r);
     CHECK(v >= 32000 && v <= 64000);

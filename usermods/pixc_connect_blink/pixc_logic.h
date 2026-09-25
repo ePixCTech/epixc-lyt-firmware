@@ -141,6 +141,16 @@ inline uint32_t backoffWithJitter(uint8_t attempt, uint32_t baseMs, uint32_t max
   return static_cast<uint32_t>(half + (rnd % span));
 }
 
+// The pairing v2 provisioning schedule: d = min(base * 2^attempt, max), then +-20 % jitter
+// (vault: Pairing and LAN security v2, "Provisioning on the light").
+inline uint32_t backoffPlusMinus20(uint8_t attempt, uint32_t baseMs, uint32_t maxMs, uint32_t rnd) {
+  uint64_t d = baseMs;
+  for (uint8_t i = 0; i < attempt && d < maxMs; i++) d <<= 1;
+  if (d > maxMs) d = maxMs;
+  const uint64_t lo = d * 8 / 10, span = d * 4 / 10 + 1;
+  return static_cast<uint32_t>(lo + (rnd % span));
+}
+
 // ---------------------------------------------------------------------------------------------
 // JSON string escaping
 // ---------------------------------------------------------------------------------------------

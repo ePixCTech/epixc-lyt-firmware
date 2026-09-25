@@ -18,6 +18,13 @@
 /// kept in separate translation units instead.
 int pixcHttpsGet(const char* url, char* out, size_t cap);
 
+/// POST a JSON body over TLS against the pinned roots (pairing v2 provisioning).
+///
+/// Returns the HTTP status (0 when no response was received: TLS refused, host unreachable,
+/// timeout). The response body, if any, is NUL-terminated into [out] (truncated to cap-1) and its
+/// length stored in [outLen]. Any status is returned - the caller needs 404 and 401 as answers.
+int pixcHttpsPostJson(const char* url, const char* body, char* out, size_t cap, int* outLen, int timeoutMs);
+
 // ---------------------------------------------------------------------------------------------
 // Streaming GET, for bodies too large to buffer.
 //
