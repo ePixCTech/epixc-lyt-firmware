@@ -600,13 +600,16 @@ class PixcConnectBlink : public Usermod {
     }
 
     void publishHealth() {
-      char buf[256];
-      String ssid = WiFi.SSID();
+      char buf[320];
+      // Escaped: an SSID is 32 arbitrary bytes, and a `"` or `\` in one made this invalid JSON, so
+      // the backend dropped the whole health message (audit C2). 32 bytes escape to at most 192.
+      char ssid[200];
+      pixc::jsonEscape(WiFi.SSID().c_str(), ssid, sizeof(ssid));
       String ip = WiFi.localIP().toString();
       int signal = constrain(2 * (WiFi.RSSI() + 100), 0, 100);
       snprintf(buf, sizeof(buf),
         "{\"rssi\":%d,\"signal\":%d,\"ssid\":\"%s\",\"ip\":\"%s\",\"free_heap\":%u,\"uptime\":%lu,\"fw_version\":\"%s\"}",
-        (int)WiFi.RSSI(), signal, ssid.c_str(), ip.c_str(),
+        (int)WiFi.RSSI(), signal, ssid, ip.c_str(),
         (unsigned)ESP.getFreeHeap(),
         (unsigned long)(millis() / 1000), fwVersion());
       publishKind("health", buf);
@@ -726,8 +729,10 @@ class PixcConnectBlink : public Usermod {
       if (!WLED_MQTT_CONNECTED) return;
       char buf[224];
       if (err && err[0]) {
+        char e[64];
+        pixc::jsonEscape(err, e, sizeof(e));
         snprintf(buf, sizeof(buf), "{\"job_id\":\"%s\",\"status\":\"%s\",\"percent\":%d,\"error\":\"%s\"}",
-                 jobId, status, percent, err);
+                 jobId, status, percent, e);
       } else {
         snprintf(buf, sizeof(buf), "{\"job_id\":\"%s\",\"status\":\"%s\",\"percent\":%d}",
                  jobId, status, percent);
@@ -1146,6 +1151,11 @@ class PixcConnectBlink : public Usermod {
       // firmware ignored it, which is why an unsigned image was applied without complaint.
       strlcpy(job.sigUrl, doc["sig_url"] | "", sizeof(job.sigUrl));
       if (job.url[0] == 0) return;
+      // The job id is echoed into JSON on ota/progress; the backend drops a progress whose id is
+      // not a UUID anyway, so anything else is refused here rather than escaped.
+      for (const char* c = job.jobId; *c; c++) {
+        if (!isxdigit((unsigned char)*c) && *c != '-') { job.jobId[0] = 0; break; }
+      }
       if (_otaRunning || !pixc_net::submit(job)) {
         publishOtaProgress(job.jobId, "failed", 0, "busy");
         return;

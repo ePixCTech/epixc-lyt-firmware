@@ -141,5 +141,43 @@ inline uint32_t backoffWithJitter(uint8_t attempt, uint32_t baseMs, uint32_t max
   return static_cast<uint32_t>(half + (rnd % span));
 }
 
+// ---------------------------------------------------------------------------------------------
+// JSON string escaping
+// ---------------------------------------------------------------------------------------------
+
+// Write `in` into `out` as the inside of a JSON string: quote, backslash and control characters
+// escaped, everything else (UTF-8 included) copied. Always NUL-terminates; never splits an escape;
+// stops early rather than overflow. Returns the number of characters written.
+//
+// Audit C2: an SSID is up to 32 arbitrary bytes, and one containing `"` or `\` made the health
+// JSON invalid, so the backend dropped the whole message and the network screen went blank.
+inline size_t jsonEscape(const char* in, char* out, size_t cap) {
+  if (out == nullptr || cap == 0) return 0;
+  size_t o = 0;
+  static const char* hex = "0123456789abcdef";
+  for (const unsigned char* p = reinterpret_cast<const unsigned char*>(in ? in : ""); *p; p++) {
+    char esc[7];
+    size_t n = 0;
+    switch (*p) {
+      case '"':  esc[0] = '\\'; esc[1] = '"';  n = 2; break;
+      case '\\': esc[0] = '\\'; esc[1] = '\\'; n = 2; break;
+      case '\n': esc[0] = '\\'; esc[1] = 'n';  n = 2; break;
+      case '\r': esc[0] = '\\'; esc[1] = 'r';  n = 2; break;
+      case '\t': esc[0] = '\\'; esc[1] = 't';  n = 2; break;
+      default:
+        if (*p < 0x20) {
+          esc[0] = '\\'; esc[1] = 'u'; esc[2] = '0'; esc[3] = '0';
+          esc[4] = hex[*p >> 4]; esc[5] = hex[*p & 0xF]; n = 6;
+        } else {
+          esc[0] = static_cast<char>(*p); n = 1;
+        }
+    }
+    if (o + n >= cap) break;
+    for (size_t i = 0; i < n; i++) out[o++] = esc[i];
+  }
+  out[o] = 0;
+  return o;
+}
+
 }  // namespace pixc
 // AI: end

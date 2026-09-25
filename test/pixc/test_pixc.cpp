@@ -200,8 +200,31 @@ static void testBackoff() {
   }
 }
 
+// ---------------------------------------------------------------------------------------------
+// C2: the SSID in the health JSON is escaped.
+// ---------------------------------------------------------------------------------------------
+static void escapes(const char* in, const char* want, size_t cap = 128) {
+  char out[128];
+  pixc::jsonEscape(in, out, cap);
+  const bool ok = std::strcmp(out, want) == 0;
+  CHECK(ok);
+  if (!ok) std::fprintf(stderr, "  in: %s\n  got: %s\n  want: %s\n", in, out, want);
+}
+
+static void testJsonEscape() {
+  escapes("Home", "Home");
+  escapes("Bob's \"5G\"", "Bob's \\\"5G\\\"");
+  escapes("a\\b", "a\\\\b");
+  escapes("tab\there", "tab\\there");
+  escapes("\x01x", "\\u0001x");
+  escapes("வீடு", "வீடு");                     // UTF-8 passes through
+  escapes("\"\"\"\"", "\\\"\\\"", 6);      // never splits an escape at the cap
+  escapes(nullptr, "");
+}
+
 int main() {
   testClassifyTopic();
+  testJsonEscape();
   testBackoff();
   testRedaction();
   testPinGuardBackoff();
