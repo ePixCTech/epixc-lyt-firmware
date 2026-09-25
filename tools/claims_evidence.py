@@ -66,25 +66,20 @@ CLAIMS = [
         # build says nothing about. Either one alone can be true while the device is wide open.
         "id": "lan-api-needs-the-device-pin",
         "section": "Protocols",
-        "ticket": "33, D295, D297, D300",
-        "row": "**The controller's own JSON API refuses an unauthorised caller** — a state write, "
-               "the legacy `/win` query API and every `GET /json` (including `cfg`) need the "
-               "settings PIN the app writes during pairing. The realtime pixel inputs above stay "
-               "open because none of those protocols can carry a credential.",
+        "ticket": "33, D295, D297, D300, pairing v2",
+        # Pairing v2 (2026-09-25; vault: 05-Firmware/Pairing and LAN security v2). The id is kept
+        # so the vault's Claims Checklist row does not lose its history; the claim is stronger.
+        "row": "**The controller's own JSON API refuses an unsigned caller** — every `/json` "
+               "request except `/json/id` and the hotspot-only `/json/pixc/pair` must be signed "
+               "with the light's LAN key, and the key itself is never sent. The legacy `/win` "
+               "query API is gone. DDP pixels are taken only from an address a signed request "
+               "leased them to.",
         "evidence": [
-            {"file": "wled00/util.cpp", "must": "present",
-             "pattern": r"bool pixcLanAuthorised\(uint32_t callerIp\)"},
-            # THE ENGINE FLATTENS WHITESPACE before matching (`flattened()`, a few lines up:
-            # `re.sub(r"\s+", " ", text)`), so this file arrives as one long line. Two patterns
-            # were written and both went red on a correct build before that was read: `^...$`
-            # anchors, which need `re.M` the engine does not pass, and then a leading `\n`, which
-            # cannot exist after flattening. The lookbehind is the version that works on the text
-            # the engine actually sees.
-            #
-            # It still has to reject a DISABLED flag, which is the whole point - D297 planted
-            # exactly that (`;   -D PIXC_LAN_AUTH`) and the firmware built green with the LAN API
-            # wide open. Flattening turns that into `; -D PIXC_LAN_AUTH`, so refusing a `;` or `#`
-            # immediately before is enough, and it is checked in both directions.
+            {"file": "wled00/pixc_lan.cpp", "must": "present",
+             "pattern": r"bool pixcAuthorise\(AsyncWebServerRequest\* request"},
+            {"file": "wled00/wled_server.cpp", "must": "present", "pattern": r"pixcAuthorise\("},
+            {"file": "wled00/pixc_lan.cpp", "must": "present", "pattern": r"bool pixcRealtimeAllowed\(uint32_t ip\)"},
+            # See the flattening note in the history of this row: a disabled flag must not pass.
             {"file": "platformio_override.ini", "must": "present",
              "pattern": r"(?<![;#] )-D PIXC_LAN_AUTH\b"},
         ],
