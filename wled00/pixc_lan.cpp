@@ -140,7 +140,9 @@ void handlePairPost(AsyncWebServerRequest* request) {
     UsermodManager::readFromConfig(umRoot);
   }
 #endif
-  serializeConfigToFS();   // cfg.json (the SSID) and wsec.json (PSK, keys), one save
+  // cfg.json (the SSID) and wsec.json (PSK, keys) in one save, from the loop task rather than this
+  // async_tcp callback; WLED::loop() writes before it honours the reboot below.
+  configNeedsWrite = true;
   char body[40];
   snprintf(body, sizeof(body), "{\"mac\":\"%s\"}", escapedMac.c_str());
   request->send(200, FPSTR(CONTENT_TYPE_JSON), body);
