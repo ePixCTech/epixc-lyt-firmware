@@ -691,30 +691,58 @@ class PixcConnectBlink : public Usermod {
       return true;
     }
 
-    // Apply a WLED config fragment pushed by the cloud over `epixc/v1/d/{mac}/cfg`
-    // (power plan -> def.bri, restore-on-power -> def.on, slow-fade -> light.tr.dur).
-    // Only native WLED cfg keys take effect; unknown keys are ignored safely.
+    // Apply a config fragment pushed by the cloud over `epixc/v1/d/{mac}/cfg`.
     //
-    // `pixc.led_channels` is the one exception: a key the core knows nothing about, read here.
-    // The cloud has to be able to say how wide the strip is, and there is no native WLED cfg key
-    // that says it without also saying which pin it is on — which the cloud has no business
-    // knowing. See pixc_led_bus.h for the boundary and why it is drawn there.
+    // A WHITELIST, not WLED's config parser (audit S11). This used to hand the whole payload to
+    // deserializeConfig(), which accepts the Wi-Fi list, the access point, the broker and its
+    // topics, the LED pins and the power limiter - so anyone who could publish on the device's
+    // /cfg (a broker or backend compromise) owned the unit persistently, without the OTA key. And
+    // because deserializeConfig() resets keys a fragment omits (gamma, target FPS, global
+    // auto-white mode), every legitimate push quietly reset them too.
+    //
+    // What the backend sends (epixc-backend DeviceService.buildCfg), and all that is applied:
+    //   def.bri, def.on      power plan brightness cap and restore-on-power
+    //   light.tr.dur         slow-fade, in 100 ms units
+    //   pixc.led_channels    "RGB" / "RGBW" - see applyLedWidth() and pixc_led_bus.h
+    //   um.PixcConnect.settingsPin   the LAN credential, see applyLanKey()
+    // Everything else, including pixc.ind_led / pixc.ind_blink (no indicator LED is fitted), is
+    // ignored.
     void applyCfg(const char* payload) {
-      // This WLED fork uses ArduinoJson v6 — JsonDocument is abstract; use a
-      // sized DynamicJsonDocument. The cfg fragment (def/light/pixc) is small.
       DynamicJsonDocument doc(2048);
       if (deserializeJson(doc, payload)) return;
       JsonObject root = doc.as<JsonObject>();
-      deserializeConfig(root, false);
+      if (root.isNull()) return;
+      bool changed = false;
+
+      JsonObject def = root["def"];
+      if (!def.isNull()) {
+        if (def["bri"].is<int>()) {
+          const int b = def["bri"];
+          if (b >= 1 && b <= 255 && briS != b) { briS = (byte)b; changed = true; }
+        }
+        if (def["on"].is<bool>() && turnOnAtBoot != def["on"].as<bool>()) {
+          turnOnAtBoot = def["on"]; changed = true;
+        }
+      }
+      JsonVariant dur = root["light"]["tr"]["dur"];
+      if (dur.is<int>()) {
+        const int d = dur;
+        if (d >= 0 && d <= 655 && transitionDelayDefault != (uint16_t)(d * 100)) {
+          transitionDelay = transitionDelayDefault = (uint16_t)(d * 100);
+          strip.setTransition(transitionDelayDefault);
+          changed = true;
+        }
+      }
+      if (applyLanKey(root["um"]["PixcConnect"]["settingsPin"] | (const char*)nullptr)) changed = true;
 
       bool busChange = applyLedWidth(root["pixc"]["led_channels"] | (const char*)nullptr);
 
-      // Only write now if the buses are staying put. When they are not, WLED::loop() re-inits them
-      // and sets configNeedsWrite itself, and serializing at this moment would persist the buses
-      // as they are about to stop being — the width would be correct in RAM and stale on flash
-      // until the next push. WLED's own deserializer refuses the save for the same reason
-      // (wled00/cfg.cpp:770).
-      if (!busChange) serializeConfigToFS();
+      // Only write when something changed (the backend re-sends the same fragment for its PIN
+      // sweep), and only if the buses are staying put. When they are not, WLED::loop() re-inits
+      // them and sets configNeedsWrite itself; serializing now would persist the buses as they are
+      // about to stop being (WLED's own deserializer refuses the save for the same reason).
+      if (busChange) return;
+      if (changed) serializeConfigToFS();
     }
 
     // Factory reset from the cloud: `<base>/reset` carrying exactly {"reset":true} (epixc-backend
@@ -960,40 +988,27 @@ class PixcConnectBlink : public Usermod {
       // 200 and the config round-trips; they simply do not move the host.
 #endif
 
-      // The settings PIN, set by the app during pairing. Founder's call, 2026-08-28, ticket 33.
-      //
-      // WLED's own `settingsPIN` lives in wsec.json and is only ever written by the settings FORM
-      // (`set.cpp`), which the app does not speak. Accepting it here lets the app set it in the
-      // same `/json/cfg` POST it already sends while it is connected directly to the device's own
-      // access point — the one moment in a device's life when an unauthenticated write on that
-      // link is not a weakness, because there is nothing else on the network.
-      //
-      // Why a PIN at all, when the provisioning host is now compiled in: `POST /json/cfg` can
-      // still rewrite the LED bus, the MQTT settings and the access point. Closing the host was
-      // the specific fix; this closes the door.
-      //
-      // Four digits, because that is WLED's format (`set.cpp` accepts length 4 or 0) and the
-      // whole point is to reuse the gate the core already enforces rather than invent a second
-      // one. "0000" is WLED's placeholder for "unchanged" and is rejected there, so it is
-      // rejected here too — otherwise the app could believe it had set a PIN that was ignored.
-      const char* pin = top["settingsPin"] | (const char*)nullptr;
-      if (pin != nullptr && strlen(pin) == 4 && strcmp(pin, "0000") != 0 &&
-          strcmp(pin, settingsPIN) != 0) {
-        strlcpy(settingsPIN, pin, 5);
-        // Persist immediately. wsec.json is written by serializeConfigSec() and NOT by the
-        // ordinary config save that follows this call, so without this the PIN would hold until
-        // the next reboot and then silently vanish — a lock that quietly stops locking.
-        serializeConfigSec();
-#ifdef PIXC_LAN_AUTH
-        // Every remembered LAN unlock was granted on the old PIN. The server rotates the PIN when
-        // someone who knew it leaves the home (D305); an unlock that outlived the rotation would
-        // keep them in. The settings page and /json/cfg paths already forget; this one did not.
-        pixcLanForgetAll();
-#endif
-        DEBUG_PRINTLN(F("[ePixC] settings PIN set"));
-      }
-
+      // `settingsPin` is deliberately NOT read here any more. readFromConfig() is also what
+      // POST /json/cfg reaches from the LAN, and the LAN credential must only ever be set by the
+      // cloud (applyCfg -> applyLanKey) or at pairing - otherwise one LAN client could change the
+      // key and shut every other member out.
       return true;
+    }
+
+    // The LAN credential from the cloud (`um.PixcConnect.settingsPin`). Returns true if it changed.
+    bool applyLanKey(const char* pin) {
+      if (pin == nullptr || strlen(pin) != 4 || strcmp(pin, "0000") == 0 ||
+          strcmp(pin, settingsPIN) == 0) return false;
+      for (const char* c = pin; *c; c++) if (*c < '0' || *c > '9') return false;
+      strlcpy(settingsPIN, pin, 5);
+      // wsec.json is written by serializeConfigSec(), not by the ordinary config save.
+      serializeConfigSec();
+#ifdef PIXC_LAN_AUTH
+      // Every remembered LAN unlock was granted on the old PIN (D305).
+      pixcLanForgetAll();
+#endif
+      DEBUG_PRINTLN(F("[ePixC] settings PIN set"));
+      return false;   // already persisted; nothing for serializeConfigToFS()
     }
 
     // Tell the bootloader this image works, so it stops being a candidate for rollback.
