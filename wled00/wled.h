@@ -446,8 +446,15 @@ WLED_GLOBAL byte cacheInvalidate       _INIT(0);       // used to invalidate bro
 
 // Sync CONFIG
 WLED_GLOBAL NodesMap Nodes;
+#ifdef PIXC_LAN_AUTH
+// ePixC: no WLED node discovery. The broadcast announces name, IP and build to the whole LAN, and the
+// supplemental port it uses (udpPort2) is not opened at all with the LAN gate (wled.cpp).
+WLED_GLOBAL bool nodeListEnabled _INIT(false);
+WLED_GLOBAL bool nodeBroadcastEnabled _INIT(false);
+#else
 WLED_GLOBAL bool nodeListEnabled _INIT(true);
 WLED_GLOBAL bool nodeBroadcastEnabled _INIT(true);
+#endif
 
 #ifndef WLED_DISABLE_INFRARED
 WLED_GLOBAL int8_t irPin        _INIT(IRPIN);
@@ -690,7 +697,14 @@ WLED_GLOBAL unsigned long notificationSentTime _INIT(0);
 WLED_GLOBAL byte notificationSentCallMode _INIT(CALL_MODE_INIT);
 WLED_GLOBAL uint8_t notificationCount _INIT(0);
 WLED_GLOBAL uint8_t syncGroups    _INIT(0x01);                // sync send groups this instance syncs to (bit mapped)
+#ifdef PIXC_LAN_AUTH
+// ePixC: WLED's UDP sync notifier (port 21324) carries no credential, so a receive group by default
+// would let any LAN host set on/bri/colour/effect past the PIN gate (audit S2). Off unless the owner
+// opts in through the PIN-gated /json/cfg (if.sync.recv.grp). No part of ePixC sends these packets.
+WLED_GLOBAL uint8_t receiveGroups _INIT(0x00);
+#else
 WLED_GLOBAL uint8_t receiveGroups _INIT(0x01);                // sync receive groups this instance belongs to (bit mapped)
+#endif
 #ifdef WLED_SAVE_RAM
 // this will save us 8 bytes of RAM while increasing code by ~400 bytes
 typedef class Receive {

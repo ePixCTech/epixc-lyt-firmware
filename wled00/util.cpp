@@ -534,11 +534,23 @@ void checkSettingsPIN(const char* pin) {
  * =============================================================================================
  * WHAT THIS DOES NOT COVER, STATED RATHER THAN IMPLIED
  * =============================================================================================
- * DDP and E1.31 on UDP carry no credential field - there is nowhere in either protocol to put a
- * PIN - so realtime pixel data stays open by decision, not by omission. A DDP sender can push
- * frames while it keeps sending and can do nothing else: it cannot change config, write a preset,
- * or survive a reboot. ePixC Sync depends on that path. See the Debt Register and
- * [[Offline and LAN-First]].
+ * Realtime pixel protocols carry no credential field - there is nowhere to put a PIN - so each one
+ * left listening is open by decision. After the 2026-09 audit (S2) exactly these remain:
+ *
+ *  - DDP, UDP 4048. KEPT: ePixC Sync is built on it (epixc-sync src/ddp.cpp, unicast, dest id 1).
+ *    A DDP sender can overwrite pixels while it keeps sending, and nothing else: no config, no
+ *    preset, no reboot, and the strip returns to its own state 2.5 s after the stream stops.
+ *  - AudioReactive sync receive, UDP 11988. Only when the owner switched it on through the
+ *    PIN-gated /json/cfg (um.AudioReactive.sync.mode=2); the app's phone-mic LightSync sends it.
+ *    Carries audio levels, never state.
+ *  - WLED's sync notifier, UDP 21324. Listening socket only; every packet is dropped unless the
+ *    owner sets a receive group through the PIN-gated /json/cfg (default receiveGroups = 0).
+ *
+ * Refused or not opened at all: the UDP JSON and HTTP-style APIs on 21324 (they reached
+ * deserializeState()/handleSet() - reboot, preset writes - with no PIN), TPM2.NET and
+ * WARLS/DRGB/DNRGB on 21324, Hyperion on 19446, the supplemental notifier/TPM2 port 65506,
+ * WLED node broadcast, and E1.31/Art-Net (5568/6454), which nothing in ePixC speaks. See
+ * handleNotifications() in udp.cpp and initInterfaces()/initAP() in wled.cpp.
  */
 /*
  * =============================================================================================

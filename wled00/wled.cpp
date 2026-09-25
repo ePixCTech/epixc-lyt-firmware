@@ -668,6 +668,7 @@ void WLED::initAP(bool resetAP)
     if (udpPort > 0 && udpPort != ntpLocalPort) {
       udpConnected = notifierUdp.begin(udpPort);
     }
+#ifndef PIXC_LAN_AUTH   // ePixC: only DDP is a realtime input - see handleNotifications() in udp.cpp
     if (udpRgbPort > 0 && udpRgbPort != ntpLocalPort && udpRgbPort != udpPort) {
       udpRgbConnected = rgbUdp.begin(udpRgbPort);
     }
@@ -675,6 +676,7 @@ void WLED::initAP(bool resetAP)
       udp2Connected = notifier2Udp.begin(udpPort2);
     }
     e131.begin(false, e131Port, e131Universe, E131_MAX_UNIVERSE_COUNT);
+#endif
     ddp.begin(false, DDP_DEFAULT_PORT);
 
     dnsServer.setErrorReplyCode(DNSReplyCode::NoError);
@@ -863,15 +865,21 @@ void WLED::initInterfaces()
 
   if (udpPort > 0 && udpPort != ntpLocalPort) {
     udpConnected = notifierUdp.begin(udpPort);
+#ifndef PIXC_LAN_AUTH   // ePixC: no Hyperion (19446) and no supplemental notifier/TPM2 port (65506)
     if (udpConnected && udpRgbPort != udpPort)
       udpRgbConnected = rgbUdp.begin(udpRgbPort);
     if (udpConnected && udpPort2 != udpPort && udpPort2 != udpRgbPort)
       udp2Connected = notifier2Udp.begin(udpPort2);
+#endif
   }
   if (ntpEnabled)
     ntpConnected = ntpUdp.begin(ntpLocalPort);
 
+#ifndef PIXC_LAN_AUTH
+  // ePixC: no E1.31 / Art-Net listener. Neither the app nor ePixC Sync speaks it (Sync is DDP-only,
+  // epixc-sync src/ddp.cpp), and like every realtime protocol it carries no credential.
   e131.begin(e131Multicast, e131Port, e131Universe, E131_MAX_UNIVERSE_COUNT);
+#endif
   ddp.begin(false, DDP_DEFAULT_PORT);
   reconnectHue();
   interfacesInited = true;
