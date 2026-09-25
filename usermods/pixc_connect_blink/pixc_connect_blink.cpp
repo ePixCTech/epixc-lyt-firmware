@@ -28,6 +28,9 @@
 #include "pixc_logic.h"
 // Factory reset, power-cycle counter, factory hotspot password, boot id.
 #include "../../wled00/pixc_device.h"
+#ifdef PIXC_LAN_AUTH
+#include "../../wled00/pixc_lan.h"
+#endif
 
 // ePixC API host the device calls to learn its MQTT broker (see provision()).
 // Normally written by the app during pairing (um.PixcConnect.apiHost); this is
@@ -1048,19 +1051,17 @@ class PixcConnectBlink : public Usermod {
       return true;
     }
 
-    // The LAN credential from the cloud (`um.PixcConnect.settingsPin`). Returns true if it changed.
-    bool applyLanKey(const char* pin) {
-      if (pin == nullptr || strlen(pin) != 4 || strcmp(pin, "0000") == 0 ||
-          strcmp(pin, settingsPIN) == 0) return false;
-      for (const char* c = pin; *c; c++) if (*c < '0' || *c > '9') return false;
-      strlcpy(settingsPIN, pin, 5);
-      // wsec.json is written by serializeConfigSec(), not by the ordinary config save.
-      serializeConfigSec();
+    // The LAN credential from the cloud (`um.PixcConnect.settingsPin`): since pairing v2 the 32-hex
+    // LAN key (the wire name is kept so the rename touches no other repo). The server rotates it when
+    // somebody who held it leaves the home. Persisted at once in wsec.json.
+    bool applyLanKey(const char* key) {
 #ifdef PIXC_LAN_AUTH
-      // Every remembered LAN unlock was granted on the old PIN (D305).
-      pixcLanForgetAll();
+      if (key == nullptr || !pixcSetLanKey(key)) return false;
+      serializeConfigSec();
+      DEBUG_PRINTLN(F("[ePixC] LAN key rotated by the cloud"));
+#else
+      (void)key;
 #endif
-      DEBUG_PRINTLN(F("[ePixC] settings PIN set"));
       return false;   // already persisted; nothing for serializeConfigToFS()
     }
 

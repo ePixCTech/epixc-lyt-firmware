@@ -1,7 +1,4 @@
 #include "wled.h"
-#ifdef PIXC_LAN_AUTH
-#include "pixc_lan_guard.h"
-#endif
 #include "fcn_declare.h"
 #include "const.h"
 #include "src/dependencies/fastled_slim/fastled_slim.h"
@@ -500,209 +497,21 @@ void checkSettingsPIN(const char* pin) {
 }
 
 
-#ifdef PIXC_LAN_AUTH
-/**
- * Whether the caller on the LAN may use the JSON API at all.
- *
- * =============================================================================================
- * WHY THIS EXISTS: THREE UNAUTHENTICATED WRITE PATHS, NOT ONE
- * =============================================================================================
- * Upstream gates `POST /json/cfg`, `/settings`, `/edit` and OTA on `correctPIN`. It does NOT gate
- * a plain state write. `POST /json {"on":true,"seg":[...]}` runs `deserializeState()` with no
- * check whatsoever, `GET /json` returns state plus network information to anybody who asks, and
- * the legacy `/win&A=128&FX=9` query API reaches `handleSet()` through the not-found handler with
- * nothing in front of it. Any of the three lets a stranger on the customer's Wi-Fi take the lights.
- *
- * That is defensible for the project this is forked from - a controller on your own bench, where
- * a PIN prompt between you and your lights is friction with no threat behind it. It is not
- * defensible for a unit somebody bought.
- *
- * =============================================================================================
- * THE PAIRING WINDOW, AND WHY IT IS NOT A HOLE
- * =============================================================================================
- * Founder's call, 2026-09-05: the device ships LOCKED, and the app writes the PIN during pairing.
- * Which raises the obvious problem - if a factory-fresh unit refuses every request, the app cannot
- * reach it to set the PIN, and the device is a brick in a box.
- *
- * The window is `apActive && !WLED_CONNECTED`: the device is running its own access point and has
- * no station connection. To be inside it an attacker must already have joined the setup AP, which
- * means being in radio range of a unit that is out of its box and not yet paired. That is a
- * different and much smaller threat than "anybody on the home Wi-Fi, forever".
- *
- * It closes the moment the device joins a network, which is the same moment the app has written
- * the PIN - so the window is open for the length of one pairing and never again unless the owner
- * factory-resets. It is deliberately NOT "unprovisioned", which would stay open on the customer's
- * own Wi-Fi if pairing half-failed.
- *
- * =============================================================================================
- * WHAT THIS DOES NOT COVER, STATED RATHER THAN IMPLIED
- * =============================================================================================
- * Realtime pixel protocols carry no credential field - there is nowhere to put a PIN - so each one
- * left listening is open by decision. After the 2026-09 audit (S2) exactly these remain:
- *
- *  - DDP, UDP 4048. KEPT: ePixC Sync is built on it (epixc-sync src/ddp.cpp, unicast, dest id 1).
- *    A DDP sender can overwrite pixels while it keeps sending, and nothing else: no config, no
- *    preset, no reboot, and the strip returns to its own state 2.5 s after the stream stops.
- *  - AudioReactive sync receive, UDP 11988. Only when the owner switched it on through the
- *    PIN-gated /json/cfg (um.AudioReactive.sync.mode=2); the app's phone-mic LightSync sends it.
- *    Carries audio levels, never state.
- *  - WLED's sync notifier, UDP 21324. Listening socket only; every packet is dropped unless the
- *    owner sets a receive group through the PIN-gated /json/cfg (default receiveGroups = 0).
- *
- * Refused or not opened at all: the UDP JSON and HTTP-style APIs on 21324 (they reached
- * deserializeState()/handleSet() - reboot, preset writes - with no PIN), TPM2.NET and
- * WARLS/DRGB/DNRGB on 21324, Hyperion on 19446, the supplemental notifier/TPM2 port 65506,
- * WLED node broadcast, and E1.31/Art-Net (5568/6454), which nothing in ePixC speaks. See
- * handleNotifications() in udp.cpp and initInterfaces()/initAP() in wled.cpp.
- */
-/*
- * =============================================================================================
- * PER CALLER, NOT PER DEVICE (Debt Register D303, 2026-09-23)
- * =============================================================================================
- * This gate first read the upstream `correctPIN` flag, which is ONE boolean for the whole device.
- * Two consequences, both found while checking how ePixC Sync talks to a light:
- *
- *  1. Anybody on the LAN rode on somebody else's unlock. The moment the app (or ePixC Sync) sent
- *     the right PIN, every host on the network was authorised for up to 15 minutes, PIN or not.
- *  2. Anybody could lock the owner out. A wrong PIN from any host set the flag false and started a
- *     3-second cooldown in which the RIGHT PIN is refused too - repeat every 3 s and the owner's
- *     app can never unlock: a denial of service needing no credential at all.
- *
- * So the unlock is remembered per caller IP: a small table of callers that presented the PIN, each
- * relocking after PIN_TIMEOUT without a request (sliding, so an app that keeps talking stays in),
- * and a table of callers that got it wrong, each in its OWN cooldown. A stranger's wrong guesses
- * now cost the stranger, not the owner. A PIN change forgets every caller.
- *
- * An IP is not an identity, and this is not claimed to be one: a host that can spoof the owner's
- * address on the LAN can already read the owner's PIN off the wire (plain HTTP). The fix is for
- * the two holes above, which needed no such capability. Since the audit, the settings pages, /edit
- * and OTA ask the same per-caller question (pixcCallerUnlocked) instead of the global flag.
- */
-/*
- * Hardening after the 2026-09-23 security audit (D303 follow-up), revised after the 2026-09-25
- * firmware audit (S3):
- *  - Brute force is limited by pixc::PinGuard (pixc_lan_guard.h): per-address exponential backoff
- *    plus a small global budget of wrong guesses that, once spent, still hears any address that has
- *    not itself failed - so an attacker's failures never lock the owner's app or Sync out. The
- *    device-wide lockout this replaced did exactly that (every caller not "remembered" was locked,
- *    and since D304 the app and Sync are never remembered). Worst case ~368 guesses a day, one host
- *    ~36; the arithmetic is in the header and pinned by test/pixc.
- *  - A refusal by the limiter is PIXC_PIN_LIMITED, which the HTTP handlers answer with 429, never
- *    401: the app and Sync treat 401 as "PIN rotated, switch to the pending one" (D305).
- *  - The PIN this device held before its last change is answered 401 but not counted: the app and
- *    Sync send it once after every rotation, by design.
- *  - 64-bit milliseconds: millis() wraps at 49.7 days and would revive a stale unlock.
- *  - Constant-time compare of exactly four characters.
- *  - A remembered unlock (the web page's PIN prompt only) lasts 15 idle minutes, never 12 hours.
- */
-namespace {
-struct LanCaller { uint32_t ip; uint64_t at; uint64_t since; };
-constexpr uint8_t kLanCallers = 6;               // a household's phones, desktops and web UI
-constexpr uint64_t kUnlockMax = 12ULL * 3600000; // absolute ceiling on one unlock
-LanCaller lanAllowed[kLanCallers];               // ip 0 = free slot
-pixc::PinGuard pinGuard;
-char lastSeenPin[5] = "";                        // settingsPIN as of the previous attempt
-char previousPin[5] = "";                        // the PIN before the last change (not counted)
-bool pinsPrimed = false;
-
-uint64_t nowMs() {
-#ifdef ARDUINO_ARCH_ESP32
-  return static_cast<uint64_t>(esp_timer_get_time() / 1000);
-#else
-  static uint32_t last = 0; static uint64_t high = 0;  // widen millis() across its wrap
-  uint32_t m = millis(); if (m < last) high += 1ULL << 32; last = m; return high + m;
-#endif
-}
-
-int8_t lanFind(const LanCaller* t, uint32_t ip) {
-  for (uint8_t i = 0; i < kLanCallers; i++) if (t[i].ip == ip) return i;
-  return -1;
-}
-
-// Remember `ip` now: its own slot, else a free one, else the one heard from longest ago.
-void lanPut(LanCaller* t, uint32_t ip) {
-  const uint64_t now = nowMs();
-  int8_t slot = lanFind(t, ip);
-  if (slot < 0) slot = lanFind(t, 0);
-  if (slot < 0) {
-    slot = 0;
-    for (uint8_t i = 1; i < kLanCallers; i++) if (t[i].at < t[slot].at) slot = i;
-  }
-  if (t[slot].ip != ip) t[slot].since = now;
-  t[slot].ip = ip;
-  t[slot].at = now;
-}
-
-bool fourCharsEqual(const char* a, const char* b) {
-  if (strnlen(a, 5) != 4 || strnlen(b, 5) != 4) return false;  // exactly four, both sides
-  uint8_t diff = 0;
-  for (uint8_t i = 0; i < 4; i++) diff |= static_cast<uint8_t>(a[i] ^ b[i]);  // no early exit
-  return diff == 0;
-}
-
-// Track PIN changes lazily, so every site that writes settingsPIN (set.cpp, cfg.cpp, the usermod's
-// cloud /cfg) is covered without each having to report it.
-void notePinChanges() {
-  if (!pinsPrimed) { strlcpy(lastSeenPin, settingsPIN, 5); pinsPrimed = true; return; }
-  if (strncmp(lastSeenPin, settingsPIN, 5) != 0) {
-    strlcpy(previousPin, lastSeenPin, 5);
-    strlcpy(lastSeenPin, settingsPIN, 5);
-  }
-}
-}  // namespace
-
-/*
- * D304 (2026-09-24): an unlock was remembered for the caller's IP for 15 idle minutes, so whoever
- * got that address next (a DHCP lease handed on, several phones behind one NAT, a guest network)
- * inherited it. ePixC's own clients (the app and Sync) send the PIN with EVERY request, so for them
- * nothing needs remembering: `remember` is false and a right PIN authorises that request alone.
- * Only a PIN sent on its own, which is how the stock web page's prompt unlocks a browser, is
- * remembered.
- */
-PixcPinResult pixcLanUnlock(uint32_t callerIp, const char* pin, bool remember, uint32_t* retryAfterMs) {
-  if (retryAfterMs) *retryAfterMs = 0;
-  if (!pin || !callerIp) return PIXC_PIN_WRONG;
-  notePinChanges();
-  // No PIN set yet: nothing to guess, so nothing is counted. The pairing window decides access.
-  if (strlen(settingsPIN) != 4) return PIXC_PIN_WRONG;
-  const uint64_t now = nowMs();
-  uint64_t wait = 0;
-  if (!pinGuard.mayTry(callerIp, now, &wait)) {
-    if (retryAfterMs) *retryAfterMs = wait > 0xFFFFFFFFULL ? 0xFFFFFFFFUL : static_cast<uint32_t>(wait);
-    return PIXC_PIN_LIMITED;
-  }
-  if (fourCharsEqual(settingsPIN, pin)) {
-    pinGuard.onRight(callerIp);
-    if (remember) lanPut(lanAllowed, callerIp);
-    return PIXC_PIN_OK;
-  }
-  int8_t allowed = lanFind(lanAllowed, callerIp);
-  if (allowed >= 0) lanAllowed[allowed].ip = 0;           // a wrong PIN ends that caller's own unlock
-  if (!fourCharsEqual(previousPin, pin)) pinGuard.onWrong(callerIp, now);  // the stale PIN is free
-  return PIXC_PIN_WRONG;
-}
-
-void pixcLanForgetAll() {
-  for (uint8_t i = 0; i < kLanCallers; i++) lanAllowed[i].ip = 0;
-}
-
-bool pixcLanAuthorised(uint32_t callerIp) {
-  // The pairing window, only for a unit that has never been given a PIN. It used to be open
-  // whenever the setup access point was up with no Wi-Fi - which also happens when a paired unit
-  // loses its router (jammed, or simply rebooting), and the AP's password is the public default.
-  if (apActive && !WLED_CONNECTED && strlen(settingsPIN) == 0) return true;
-  int8_t i = callerIp ? lanFind(lanAllowed, callerIp) : -1;
-  if (i < 0) return false;
-  const uint64_t now = nowMs();
-  if (now - lanAllowed[i].at > PIN_TIMEOUT || now - lanAllowed[i].since > kUnlockMax) { lanAllowed[i].ip = 0; return false; }
-  lanAllowed[i].at = now;
-  return true;
-}
-
-bool pixcCallerUnlocked(AsyncWebServerRequest* request) {
-  return pixcLanAuthorised(pixcCallerIp(request));
-}
-#endif
+// The ePixC LAN gate (PIXC_LAN_AUTH) is pairing v2's signed LAN API: wled00/pixc_lan.{h,cpp}.
+// It replaced the per-caller 4-digit PIN gate that lived here (D303/D304, audit S3/S13/S17).
+//
+// WHAT IT DOES NOT COVER, stated rather than implied. Realtime pixel protocols carry no credential
+// field, so each one left listening is open by decision (audit S2, 2026-09):
+//  - DDP, UDP 4048. KEPT for ePixC Sync, and since pairing v2 accepted only from an address holding
+//    a realtime lease (an authenticated POST /json {"pixc":{"rt_lease":N}}, e131.cpp).
+//  - AudioReactive sync receive, UDP 11988, only when the owner switched it on through the signed
+//    /json/cfg (um.AudioReactive.sync.mode=2); the app's phone-mic LightSync sends it. Audio levels
+//    only, never state.
+//  - WLED's sync notifier, UDP 21324: socket open, every packet dropped unless the owner sets a
+//    receive group through the signed /json/cfg (default receiveGroups = 0).
+// Refused or never opened: the UDP JSON and HTTP-style APIs on 21324, TPM2.NET and WARLS/DRGB on
+// 21324, Hyperion 19446, the supplemental port 65506, node broadcast, and E1.31/Art-Net. See
+// handleNotifications() in udp.cpp and initInterfaces()/initAP() in wled.cpp.
 
 
 uint16_t crc16(const unsigned char* data_p, size_t length) {

@@ -24,6 +24,9 @@ bool pixcFactoryResetPending();
 // signed image, and the password printed on its label must keep working. Does not return.
 [[noreturn]] void pixcFactoryWipeNow();
 
+// Reboot `ms` from now, from the loop (so a reply can leave first).
+void pixcRebootAfter(uint32_t ms);
+
 // Call once, early in setup: counts short power-ups in NVS, and requests a reset on the fifth.
 void pixcBootCounterOnBoot();
 // Call every loop: clears the counter once this boot has lasted kPowerCycleClearMs, and runs a

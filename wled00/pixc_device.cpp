@@ -18,6 +18,7 @@ constexpr const char* kNsFactory = "pixc_fac";    // written by tools/factory_pr
 constexpr uint32_t kPowerCycleClearMs = 10000;    // a boot this long is not part of a reset gesture
 
 bool resetPending = false;
+uint32_t rebootAt = 0;
 bool counterCleared = false;
 const char* resetWhy = "";
 char bootId[9] = "";
@@ -78,7 +79,10 @@ void pixcBootCounterOnBoot() {
   if (next.reset) pixcRequestFactoryReset("power-cycle");
 }
 
+void pixcRebootAfter(uint32_t ms) { rebootAt = millis() + (ms ? ms : 1); }
+
 void pixcDeviceLoop() {
+  if (rebootAt != 0 && (long)(millis() - rebootAt) >= 0) { rebootAt = 0; doReboot = true; }
   if (!counterCleared && millis() > kPowerCycleClearMs) {
     counterCleared = true;
     Preferences p;

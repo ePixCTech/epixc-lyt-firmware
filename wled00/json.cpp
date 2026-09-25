@@ -1,4 +1,7 @@
 #include "wled.h"
+#ifdef PIXC_LAN_AUTH
+#include "pixc_lan.h"
+#endif
 
 #define JSON_PATH_STATE      1
 #define JSON_PATH_INFO       2
@@ -1298,8 +1301,15 @@ class LockedJsonResponse: public AsyncJsonResponse {
   virtual ~LockedJsonResponse() { if (_holding_lock) releaseJSONBufferLock(); };
 };
 
+#ifdef PIXC_LAN_AUTH
+void serveJson(AsyncWebServerRequest* request, const PixcReplySigner* signer, bool lockHeld)
+#else
 void serveJson(AsyncWebServerRequest* request)
+#endif
 {
+#ifndef PIXC_LAN_AUTH
+  constexpr bool lockHeld = false;
+#endif
   enum class json_target {
     all, state, info, state_info, nodes, effects, palettes, networks, config, pins
   };
@@ -1312,7 +1322,7 @@ void serveJson(AsyncWebServerRequest* request)
   else if (url.indexOf(F("nodes")) > 0) subJson = json_target::nodes;
   else if (url.indexOf(F("eff"))   > 0) subJson = json_target::effects;
   else if (url.indexOf(F("palx"))  > 0) subJson = json_target::palettes;
-  else if (url.indexOf(F("fxda"))  > 0) { respondModeData(request); return; }
+  else if (url.indexOf(F("fxda"))  > 0) { if (lockHeld) releaseJSONBufferLock(); respondModeData(request); return; }
   else if (url.indexOf(F("net"))   > 0) subJson = json_target::networks;
   else if (url.indexOf(F("cfg"))   > 0) subJson = json_target::config;
   else if (url.indexOf(F("pins"))  > 0) subJson = json_target::pins;
@@ -1323,15 +1333,17 @@ void serveJson(AsyncWebServerRequest* request)
   }
   #endif
   else if (url.indexOf("pal") > 0) {
+    if (lockHeld) releaseJSONBufferLock();
     request->send_P(200, FPSTR(CONTENT_TYPE_JSON), JSON_palette_names);
     return;
   }
   else if (url.length() > 6) { //not just /json
+    if (lockHeld) releaseJSONBufferLock();
     serveJsonError(request, 501, ERR_NOT_IMPL);
     return;
   }
 
-  if (!requestJSONBufferLock(JSON_LOCK_SERVEJSON)) {
+  if (!lockHeld && !requestJSONBufferLock(JSON_LOCK_SERVEJSON)) {
     request->deferResponse();    
     return;
   }
@@ -1379,6 +1391,17 @@ void serveJson(AsyncWebServerRequest* request)
   [[maybe_unused]] size_t len = response->setLength();
   DEBUG_PRINTF_P(PSTR("JSON content length: %u\n"), len);
 
+#ifdef PIXC_LAN_AUTH
+  // Pairing v2: sign the reply. ArduinoJson's output is deterministic, so hashing a serialization
+  // into a streaming SHA-256 gives the digest of exactly the bytes the response will send.
+  if (signer != nullptr && signer->active) {
+    PixcHashPrint hp;
+    serializeJson(lDoc, hp);
+    char bh[65];
+    hp.hex(bh);
+    pixcSignResponse(response, *signer, bh);
+  }
+#endif
   request->send(response);
 }
 

@@ -49,6 +49,13 @@ namespace pixc {
 
 class PinGuard {
  public:
+  // `globalBudget` turns rules 2-3 on (needed for a 4-digit PIN). Pairing v2's 128-bit LAN key
+  // cannot be guessed at any rate, so there it is off - no ceiling a stranger could spend - and
+  // the guard is only a per-address brake on a misbehaving host, with `freeFails` wrong requests
+  // in a row allowed before any backoff (a client tries the pre-rotation key once, by design).
+  explicit PinGuard(bool globalBudget = true, uint8_t freeFails = 0)
+      : _globalBudget(globalBudget), _freeFails(freeFails) {}
+
   static constexpr uint64_t kBackoffBaseMs = 1000;                  // first wrong PIN: wait 1 s
   static constexpr uint64_t kBackoffMaxMs = 60ULL * 60 * 1000;      // never more than 1 h
   static constexpr uint64_t kForgetAfterMs = 24ULL * 60 * 60 * 1000; // a quiet day forgives
@@ -69,7 +76,7 @@ class PinGuard {
     uint64_t wait = 0;
     const Slot* s = find(ip);
     if (s != nullptr && now < s->nextAt) wait = s->nextAt - now;
-    if (wait == 0 && _tokens == 0 && burned(ip)) {
+    if (wait == 0 && _globalBudget && _tokens == 0 && burned(ip)) {
       // Budget spent and this address has already failed today: wait for the next token.
       wait = kBudgetRefillMs - (now - _lastRefill);
     }
@@ -80,12 +87,17 @@ class PinGuard {
   // A wrong PIN from `ip`, which mayTry() had allowed.
   void onWrong(uint32_t ip, uint64_t now) {
     tick(now);
-    if (_tokens > 0) _tokens--;
-    burn(ip);
+    if (_globalBudget) {
+      if (_tokens > 0) _tokens--;
+      burn(ip);
+    }
     Slot* s = slotFor(ip, now);
     if (s == nullptr) return;           // table full of addresses still backing off: rules 2-3 hold
     if (s->fails < 60) s->fails++;
-    const uint8_t shift = s->fails - 1 > 40 ? 40 : static_cast<uint8_t>(s->fails - 1);
+    s->lastAt = now;
+    if (s->fails <= _freeFails) { s->nextAt = now; return; }
+    const uint8_t over = static_cast<uint8_t>(s->fails - _freeFails);
+    const uint8_t shift = over - 1 > 40 ? 40 : static_cast<uint8_t>(over - 1);
     uint64_t backoff = kBackoffBaseMs << shift;
     if (backoff > kBackoffMaxMs) backoff = kBackoffMaxMs;
     s->lastAt = now;
@@ -146,6 +158,8 @@ class PinGuard {
     return pick;
   }
 
+  bool _globalBudget;
+  uint8_t _freeFails;
   Slot _slots[kSlots];
   uint32_t _burned[8] = {0, 0, 0, 0, 0, 0, 0, 0};
   uint8_t _tokens = kBudgetBurst;

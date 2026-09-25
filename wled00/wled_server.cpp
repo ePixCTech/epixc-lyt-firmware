@@ -1,4 +1,7 @@
 #include "wled.h"
+#ifdef PIXC_LAN_AUTH
+#include "pixc_lan.h"
+#endif
 
 #ifndef WLED_DISABLE_OTA
   #include "ota_update.h"  
@@ -344,25 +347,17 @@ static bool captivePortal(AsyncWebServerRequest *request)
   return false;
 }
 
-#ifdef PIXC_LAN_AUTH
-// The brute-force limiter refused to evaluate this caller's PIN (pixc_lan_guard.h). 429 with
-// Retry-After, deliberately not 401: the app and ePixC Sync read a 401 as "the PIN was rotated" and
-// switch to the pending PIN (D305); a rate limit must not send them down that path.
-static void servePinLimited(AsyncWebServerRequest* request, uint32_t retryAfterMs) {
-  const uint32_t secs = retryAfterMs / 1000 + 1;
-  AsyncWebServerResponse* response = request->beginResponse(429, FPSTR(CONTENT_TYPE_JSON),
-      String(F("{\"error\":")) + ERR_DENIED + F(",\"retry_after\":") + secs + '}');
-  response->addHeader(F("Retry-After"), String(secs));
-  request->send(response);
-}
-#endif
 
 void initServer()
 {
+#ifndef PIXC_LAN_AUTH
   //CORS compatiblity
   DefaultHeaders::Instance().addHeader(F("Access-Control-Allow-Origin"), "*");
   DefaultHeaders::Instance().addHeader(F("Access-Control-Allow-Methods"), "*");
   DefaultHeaders::Instance().addHeader(F("Access-Control-Allow-Headers"), "*");
+#endif
+  // ePixC: no CORS (audit S14). The wildcard let any web page the owner opened drive the LAN API
+  // from the owner's own browser. The app and ePixC Sync are not browsers and need none of it.
 
 #ifdef WLED_ENABLE_HTML
 #ifdef WLED_ENABLE_WEBSOCKETS
@@ -426,40 +421,23 @@ void initServer()
 #endif
 
 #ifdef PIXC_LAN_AUTH
-  // Who am I, with no PIN: the MAC only, which anyone on the LAN already sees in ARP. ePixC's app
-  // and Sync compare it with the MAC the cloud holds BEFORE they send the PIN, so a host that took
-  // over the light's address is never handed it (D308 interim; the full fix is a long per-device
-  // LAN secret). /json/info stays gated: it is a map of the house. Registered before /json, whose
-  // handler would otherwise catch this path as a prefix.
-  server.on(F("/json/id"), HTTP_GET, [](AsyncWebServerRequest *request){
-    request->send(200, FPSTR(CONTENT_TYPE_JSON), String(F("{\"mac\":\"")) + escapedMac + F("\"}"));
-  });
+  // Pairing v2: GET /json/id, GET/POST /json/pixc/pair (pixc_lan.cpp). Before /json, whose
+  // handlers would otherwise catch these paths as prefixes.
+  pixcRegisterRoutes(server);
 #endif
 
   const static char _json[] PROGMEM = "/json";
   server.on(FPSTR(_json), HTTP_GET, [](AsyncWebServerRequest *request){
 #ifdef PIXC_LAN_AUTH
-    // A read is gated too, founder's call 2026-09-05. `serveJson` answers /json/info with the SSID,
-    // the IP, the MAC-derived name and the build - a map of the house drawn for anybody who asks -
-    // and /json/state with everything needed to write a convincing forgery back. The cost is that
-    // the app must hold a PIN before it can render a device tile from the LAN, which it does: the
-    // same PIN it wrote during pairing.
-    //
-    // `?pin=` is read here because a GET HAS NO BODY. Every other unlock in this firmware arrives
-    // as a `pin` key inside a JSON object; a read has nowhere to put one, so without this the
-    // gated read would be unreachable by any correct client - a rule with no way to satisfy it.
-    // It goes through `pixcLanUnlock` like every other attempt, so the brute-force limiter
-    // (pixc_lan_guard.h) counts it the same way.
-    //
-    // A PIN in a query string is logged by proxies in a way a body is not. On a LAN request to a
-    // device on the same subnet there is no proxy, and the alternative was leaving reads open.
-    // A read carries its PIN every time and is authorised by it alone, never remembered (D304).
-    uint32_t retryMs = 0;
-    const PixcPinResult readPin = request->hasArg(F("pin"))
-        ? pixcLanUnlock(pixcCallerIp(request), request->arg(F("pin")).c_str(), false, &retryMs)
-        : PIXC_PIN_WRONG;
-    if (readPin == PIXC_PIN_LIMITED) { servePinLimited(request, retryMs); return; }
-    if (readPin != PIXC_PIN_OK && !pixcLanAuthorised(pixcCallerIp(request))) { serveJsonError(request, 401, ERR_DENIED); return; }
+    // Every read is signed-request only (pairing v2): /json/info is a map of the house and
+    // /json/state everything needed to forge a write. The lock is taken BEFORE the signature is
+    // checked, because a request that has to wait for the lock is deferred and run again, and a
+    // verified request run twice would be refused as a replay.
+    if (!requestJSONBufferLock(JSON_LOCK_SERVEJSON)) { request->deferResponse(); return; }
+    PixcReplySigner signer;
+    if (!pixcAuthorise(request, nullptr, 0, signer)) { releaseJSONBufferLock(); return; }
+    serveJson(request, &signer, true);
+    return;
 #endif
     serveJson(request);
   });
@@ -481,19 +459,15 @@ void initServer()
       return;
     }
 #ifdef PIXC_LAN_AUTH
-    // Per caller (D303): the PIN unlocks the host that sent it, not the device for everybody.
-    // A PIN with a command authorises that request only; a PIN on its own (the web page's prompt)
-    // unlocks the browser for a while (D304).
-    uint32_t retryMs = 0;
-    const PixcPinResult pinResult = root.containsKey("pin")
-        ? pixcLanUnlock(pixcCallerIp(request), root["pin"].as<const char*>(), root.size() == 1, &retryMs)
-        : PIXC_PIN_WRONG;
-    if (pinResult == PIXC_PIN_LIMITED) {
+    // Pairing v2: the signature covers the body exactly as received. Checked after the lock, so a
+    // deferred request is never verified twice (see the GET handler).
+    PixcReplySigner signer;
+    if (!pixcAuthorise(request, static_cast<const uint8_t*>(request->_tempObject), request->contentLength(), signer)) {
       releaseJSONBufferLock();
-      servePinLimited(request, retryMs);
       return;
     }
-    const bool thisPin = pinResult == PIXC_PIN_OK;
+    // The realtime lease and the factory reset, which carry ePixC's own keys.
+    if (pixcHandleAuthedPost(request, root, signer)) { releaseJSONBufferLock(); return; }
 #else
     if (root.containsKey("pin")) checkSettingsPIN(root["pin"].as<const char*>());
 #endif
@@ -501,19 +475,9 @@ void initServer()
     const String& url = request->url();
     isConfig = url.indexOf(F("cfg")) > -1;
 #ifdef PIXC_LAN_AUTH
-    // THE GAP THIS WHOLE CHANGE EXISTS FOR. Upstream checks the PIN on the `isConfig` arm below and
-    // nothing on the other one, so `POST /json {"on":false}` from any device on the network reached
-    // `deserializeState()` untouched. Gated here rather than inside `deserializeState` because that
-    // function is also reached from MQTT, presets and the API - paths that have already been
-    // authorised by other means and must not start demanding a LAN PIN.
-    //
-    // AFTER `checkSettingsPIN` above, deliberately: it lets one request carry both the credential
-    // and the command, `{"pin":"4821","on":true}`, which is what the app sends on a cold LAN start.
-    if (!thisPin && !pixcLanAuthorised(pixcCallerIp(request))) {
-      releaseJSONBufferLock();
-      serveJsonError(request, 401, ERR_DENIED);
-      return;
-    }
+    // What a LAN config write may not change, whoever signed it: the broker, the access point, the
+    // provisioning keys, OTA settings (pixc_lan.cpp). The LAN key itself is set only by the cloud.
+    if (isConfig) pixcSanitizeLanCfg(root);
 #endif
     if (!isConfig) {
       /*
@@ -546,13 +510,26 @@ void initServer()
         // publish state to MQTT as requested in wled#4643 even if only WS response selected
         publishMqtt();
         #endif
+#ifdef PIXC_LAN_AUTH
+        // Re-take the lock without deferring: a deferred signed request would run again as a replay.
+        if (!requestJSONBufferLock(JSON_LOCK_SERVEJSON)) {
+          pixcSendSigned(request, signer, 503, CONTENT_TYPE_JSON, "{\"error\":\"BUSY\"}");
+          return;
+        }
+        serveJson(request, &signer, true);
+#else
         serveJson(request);
+#endif
         return; //if JSON contains "v"
       } else {
         configNeedsWrite = true; //Save new settings to FS
       }
     }
+#ifdef PIXC_LAN_AUTH
+    pixcSendSigned(request, signer, 200, CONTENT_TYPE_JSON, "{\"success\":true}");
+#else
     request->send(200, CONTENT_TYPE_JSON, F("{\"success\":true}"));
+#endif
   }, JSON_BUFFER_SIZE);
   server.addHandler(handler);
 
@@ -763,6 +740,12 @@ void initServer()
     if (captivePortal(request)) return;
     #endif
 
+#ifdef PIXC_LAN_AUTH
+    // No CORS preflight (S14), and no legacy /win query API: it reached handleSet() - a full state
+    // write - through this not-found handler, and ePixC's clients use the signed JSON API only.
+    request->send(404, FPSTR(CONTENT_TYPE_PLAIN), F("Not found"));
+    return;
+#endif
     //make API CORS compatible
     if (request->method() == HTTP_OPTIONS)
     {
@@ -772,18 +755,6 @@ void initServer()
       return;
     }
 
-#ifdef PIXC_LAN_AUTH
-    // The third open write path, and the least obvious: the legacy query API arrives through the
-    // NOT-FOUND handler, so `/win&A=128&FX=9` is a full state write that never passes any of the
-    // checks a reader would think to look at. It is gated here, before `handleSet` sees it, and the
-    // reply is deliberately the same 401 the JSON API gives rather than the 404 this handler exists
-    // to serve - a stranger learns that the endpoint is protected, which is not worth hiding, and
-    // the app's own diagnostics can tell "locked" from "gone".
-    if (!pixcLanAuthorised(pixcCallerIp(request)) && request->url().indexOf(F("win")) > -1) {
-      request->send(401, FPSTR(CONTENT_TYPE_PLAIN), F("Locked. Unlock with the app."));
-      return;
-    }
-#endif
     if(handleSet(request, request->url())) return;
     #ifndef WLED_DISABLE_ALEXA
     if(espalexa.handleAlexaApiCall(request)) return;
@@ -977,12 +948,5 @@ void serveSettings(AsyncWebServerRequest* request, bool post) {
     default:                content = PAGE_settings;      len = PAGE_settings_length;      break;
   }
   handleStaticContent(request, "", code, contentType, content, len);
-}
-#endif
-#ifdef PIXC_LAN_AUTH
-// The address the request came from, as the per-caller LAN gate keys on it (util.cpp, D303).
-uint32_t pixcCallerIp(AsyncWebServerRequest* request) {
-  AsyncClient* c = request ? request->client() : nullptr;
-  return c ? (uint32_t)c->remoteIP() : 0;
 }
 #endif

@@ -10,10 +10,6 @@ void handleSettingsSet(AsyncWebServerRequest *request, byte subPage)
   if (subPage == SUBPAGE_PINREQ)
   {
     checkSettingsPIN(request->arg(F("PIN")).c_str());
-#ifdef PIXC_LAN_AUTH
-    // The web UI's own PIN prompt: unlock the browser that answered it for the JSON API too.
-    pixcLanUnlock(pixcCallerIp(request), request->arg(F("PIN")).c_str(), true);  // the settings page: a browser
-#endif
     return;
   }
 
@@ -650,9 +646,6 @@ void handleSettingsSet(AsyncWebServerRequest *request, byte subPage)
         unsigned numZeros = 0;
         for (unsigned i = 0; i < pinLen; i++) numZeros += (pin[i] == '0');
         if (numZeros < pinLen || pinLen == 0) { // ignore 0000 input (placeholder)
-#ifdef PIXC_LAN_AUTH
-          if (strncmp(settingsPIN, pin, 5) != 0) pixcLanForgetAll(); // a new PIN: every caller asks again
-#endif
           strlcpy(settingsPIN, pin, 5);
         }
         settingsPIN[4] = 0;

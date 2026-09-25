@@ -612,6 +612,12 @@ WLED_GLOBAL bool correctPIN     _INIT(false);
 WLED_GLOBAL bool correctPIN     _INIT(!strlen(settingsPIN));
 #endif
 WLED_GLOBAL unsigned long lastEditTime _INIT(0);
+#ifdef PIXC_LAN_AUTH
+// Pairing v2 keys, written at pairing (/json/pixc/pair) and kept in wsec.json. Never returned by
+// any interface. The LAN key is also rotated by the cloud (um.PixcConnect.settingsPin).
+WLED_GLOBAL char pixcLanKey[33]    _INIT("");   // K_lan, 32 lowercase hex: signs LAN requests/replies
+WLED_GLOBAL char pixcDeviceKey[65] _INIT("");   // K_dev, 64 lowercase hex: fetches the broker login
+#endif
 
 WLED_GLOBAL uint16_t userVar0 _INIT(0), userVar1 _INIT(0); //available for use in usermod
 

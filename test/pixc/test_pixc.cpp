@@ -284,7 +284,24 @@ static void testDescScanner() {
   CHECK(pixc::otaRefusal(true, 6, 2, 5, 1) == nullptr);
 }
 
+static void testPinGuardV2Mode() {
+  // Pairing v2: no global ceiling, two free failures, then backoff for that address only.
+  pixc::PinGuard g(false, 2);
+  const uint32_t a = lanIp(30), b = lanIp(31);
+  CHECK(g.mayTry(a, 100)); g.onWrong(a, 100);
+  CHECK(g.mayTry(a, 100)); g.onWrong(a, 100);
+  CHECK(g.mayTry(a, 100)); g.onWrong(a, 100);          // third in a row: 1 s backoff
+  CHECK(!g.mayTry(a, 500));
+  CHECK(g.mayTry(a, 1100));
+  for (int i = 0; i < 500; i++) {                      // a flood from many addresses...
+    const uint32_t ip = lanIp(uint8_t(40 + (i % 200)));
+    if (g.mayTry(ip, 2000)) g.onWrong(ip, 2000);
+  }
+  CHECK(g.mayTry(b, 2000));                            // ...never touches anyone else
+}
+
 int main() {
+  testPinGuardV2Mode();
   testLanAuthVectors();
   testClassifyTopic();
   testDescScanner();
