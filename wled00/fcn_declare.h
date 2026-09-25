@@ -452,7 +452,10 @@ int16_t extractModeDefaults(uint8_t mode, const char *segVar);
 void checkSettingsPIN(const char *pin);
 #ifdef PIXC_LAN_AUTH
 bool pixcLanAuthorised(uint32_t callerIp);
-bool pixcLanUnlock(uint32_t callerIp, const char* pin, bool remember);
+// Result of presenting a PIN. LIMITED means the brute-force limiter refused to look at it: answer
+// 429 with Retry-After, never 401 (the app and Sync read 401 as "the PIN rotated", D305).
+enum PixcPinResult : int8_t { PIXC_PIN_OK = 0, PIXC_PIN_WRONG = 1, PIXC_PIN_LIMITED = 2 };
+PixcPinResult pixcLanUnlock(uint32_t callerIp, const char* pin, bool remember, uint32_t* retryAfterMs = nullptr);
 void pixcLanForgetAll();
 uint32_t pixcCallerIp(AsyncWebServerRequest* request);
 bool pixcCallerUnlocked(AsyncWebServerRequest* request);

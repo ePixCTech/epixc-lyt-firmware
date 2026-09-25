@@ -1,4 +1,7 @@
 #include "wled.h"
+#ifdef PIXC_LAN_AUTH
+#include "pixc_lan_guard.h"
+#endif
 #include "fcn_declare.h"
 #include "const.h"
 #include "src/dependencies/fastled_slim/fastled_slim.h"
@@ -576,29 +579,31 @@ void checkSettingsPIN(const char* pin) {
  * and OTA ask the same per-caller question (pixcCallerUnlocked) instead of the global flag.
  */
 /*
- * Hardening after the 2026-09-23 security audit (D303 follow-up):
- *  - A DEVICE-WIDE failure budget as well as the per-caller cooldown. Per caller alone let a host
- *    with seven addresses rotate past a six-slot table and guess at wire speed (a 4-digit PIN in
- *    minutes) - worse than the global cooldown it replaced. Now: more than kFailBudget wrong PINs
- *    in kFailWindow locks out every caller NOT already unlocked, for a lockout that doubles each
- *    time it trips (to 15 min). An unlocked caller never needs to unlock again, so the owner is
- *    not locked out by it.
- *  - A refused caller still cooling down is never evicted; a full table refuses newcomers.
+ * Hardening after the 2026-09-23 security audit (D303 follow-up), revised after the 2026-09-25
+ * firmware audit (S3):
+ *  - Brute force is limited by pixc::PinGuard (pixc_lan_guard.h): per-address exponential backoff
+ *    plus a small global budget of wrong guesses that, once spent, still hears any address that has
+ *    not itself failed - so an attacker's failures never lock the owner's app or Sync out. The
+ *    device-wide lockout this replaced did exactly that (every caller not "remembered" was locked,
+ *    and since D304 the app and Sync are never remembered). Worst case ~368 guesses a day, one host
+ *    ~36; the arithmetic is in the header and pinned by test/pixc.
+ *  - A refusal by the limiter is PIXC_PIN_LIMITED, which the HTTP handlers answer with 429, never
+ *    401: the app and Sync treat 401 as "PIN rotated, switch to the pending one" (D305).
+ *  - The PIN this device held before its last change is answered 401 but not counted: the app and
+ *    Sync send it once after every rotation, by design.
  *  - 64-bit milliseconds: millis() wraps at 49.7 days and would revive a stale unlock.
  *  - Constant-time compare of exactly four characters.
- *  - An unlock lasts 15 idle minutes (sliding) and never more than 12 hours in all.
+ *  - A remembered unlock (the web page's PIN prompt only) lasts 15 idle minutes, never 12 hours.
  */
 namespace {
 struct LanCaller { uint32_t ip; uint64_t at; uint64_t since; };
 constexpr uint8_t kLanCallers = 6;               // a household's phones, desktops and web UI
-constexpr uint8_t kFailBudget = 10;              // wrong PINs, all callers together...
-constexpr uint64_t kFailWindow = 60000;          // ...per minute, before the lockout
-constexpr uint64_t kLockoutMax = 15ULL * 60000;  // the lockout doubles up to this
 constexpr uint64_t kUnlockMax = 12ULL * 3600000; // absolute ceiling on one unlock
 LanCaller lanAllowed[kLanCallers];               // ip 0 = free slot
-LanCaller lanRefused[kLanCallers];
-uint64_t failWindowStart = 0, lockedUntil = 0, lockout = 30000;
-uint8_t failsInWindow = 0;
+pixc::PinGuard pinGuard;
+char lastSeenPin[5] = "";                        // settingsPIN as of the previous attempt
+char previousPin[5] = "";                        // the PIN before the last change (not counted)
+bool pinsPrimed = false;
 
 uint64_t nowMs() {
 #ifdef ARDUINO_ARCH_ESP32
@@ -614,28 +619,35 @@ int8_t lanFind(const LanCaller* t, uint32_t ip) {
   return -1;
 }
 
-// Remember `ip` now: its own slot, else a free one, else - allowed table only - the one heard from
-// longest ago. Returns false when the table is full and nothing may be evicted.
-bool lanPut(LanCaller* t, uint32_t ip, bool mayEvict) {
+// Remember `ip` now: its own slot, else a free one, else the one heard from longest ago.
+void lanPut(LanCaller* t, uint32_t ip) {
   const uint64_t now = nowMs();
   int8_t slot = lanFind(t, ip);
   if (slot < 0) slot = lanFind(t, 0);
   if (slot < 0) {
-    if (!mayEvict) return false;
     slot = 0;
     for (uint8_t i = 1; i < kLanCallers; i++) if (t[i].at < t[slot].at) slot = i;
   }
   if (t[slot].ip != ip) t[slot].since = now;
   t[slot].ip = ip;
   t[slot].at = now;
-  return true;
 }
 
-bool pinMatches(const char* pin) {
-  if (strlen(settingsPIN) != 4 || strnlen(pin, 5) != 4) return false;  // exactly four, both sides
+bool fourCharsEqual(const char* a, const char* b) {
+  if (strnlen(a, 5) != 4 || strnlen(b, 5) != 4) return false;  // exactly four, both sides
   uint8_t diff = 0;
-  for (uint8_t i = 0; i < 4; i++) diff |= static_cast<uint8_t>(settingsPIN[i] ^ pin[i]);  // no early exit
+  for (uint8_t i = 0; i < 4; i++) diff |= static_cast<uint8_t>(a[i] ^ b[i]);  // no early exit
   return diff == 0;
+}
+
+// Track PIN changes lazily, so every site that writes settingsPIN (set.cpp, cfg.cpp, the usermod's
+// cloud /cfg) is covered without each having to report it.
+void notePinChanges() {
+  if (!pinsPrimed) { strlcpy(lastSeenPin, settingsPIN, 5); pinsPrimed = true; return; }
+  if (strncmp(lastSeenPin, settingsPIN, 5) != 0) {
+    strlcpy(previousPin, lastSeenPin, 5);
+    strlcpy(lastSeenPin, settingsPIN, 5);
+  }
 }
 }  // namespace
 
@@ -645,37 +657,33 @@ bool pinMatches(const char* pin) {
  * inherited it. ePixC's own clients (the app and Sync) send the PIN with EVERY request, so for them
  * nothing needs remembering: `remember` is false and a right PIN authorises that request alone.
  * Only a PIN sent on its own, which is how the stock web page's prompt unlocks a browser, is
- * remembered. Returns whether this PIN was right.
+ * remembered.
  */
-bool pixcLanUnlock(uint32_t callerIp, const char* pin, bool remember) {
-  if (!pin || !callerIp) return false;
+PixcPinResult pixcLanUnlock(uint32_t callerIp, const char* pin, bool remember, uint32_t* retryAfterMs) {
+  if (retryAfterMs) *retryAfterMs = 0;
+  if (!pin || !callerIp) return PIXC_PIN_WRONG;
+  notePinChanges();
+  // No PIN set yet: nothing to guess, so nothing is counted. The pairing window decides access.
+  if (strlen(settingsPIN) != 4) return PIXC_PIN_WRONG;
   const uint64_t now = nowMs();
-  // Expired refusals free their slots, so a full table means callers genuinely cooling down.
-  for (uint8_t i = 0; i < kLanCallers; i++)
-    if (lanRefused[i].ip && now - lanRefused[i].at >= PIN_RETRY_COOLDOWN) lanRefused[i].ip = 0;
-  const bool alreadyIn = lanFind(lanAllowed, callerIp) >= 0;
-  int8_t refused = lanFind(lanRefused, callerIp);
-  if (refused >= 0) return false;                         // this caller's own cooldown
-  if (!alreadyIn && now < lockedUntil) return false;      // device-wide lockout; unlocked callers exempt
-  if (pinMatches(pin)) {
-    if (remember) lanPut(lanAllowed, callerIp, true);
-    return true;
+  uint64_t wait = 0;
+  if (!pinGuard.mayTry(callerIp, now, &wait)) {
+    if (retryAfterMs) *retryAfterMs = wait > 0xFFFFFFFFULL ? 0xFFFFFFFFUL : static_cast<uint32_t>(wait);
+    return PIXC_PIN_LIMITED;
+  }
+  if (fourCharsEqual(settingsPIN, pin)) {
+    pinGuard.onRight(callerIp);
+    if (remember) lanPut(lanAllowed, callerIp);
+    return PIXC_PIN_OK;
   }
   int8_t allowed = lanFind(lanAllowed, callerIp);
   if (allowed >= 0) lanAllowed[allowed].ip = 0;           // a wrong PIN ends that caller's own unlock
-  lanPut(lanRefused, callerIp, false);                    // full of active cooldowns: nothing evicted
-  if (now - failWindowStart > kFailWindow) { failWindowStart = now; failsInWindow = 0; }
-  if (++failsInWindow > kFailBudget) {
-    lockedUntil = now + lockout;
-    lockout = lockout * 2 > kLockoutMax ? kLockoutMax : lockout * 2;
-    failsInWindow = 0;
-    failWindowStart = now;
-  }
-  return false;
+  if (!fourCharsEqual(previousPin, pin)) pinGuard.onWrong(callerIp, now);  // the stale PIN is free
+  return PIXC_PIN_WRONG;
 }
 
 void pixcLanForgetAll() {
-  for (uint8_t i = 0; i < kLanCallers; i++) lanAllowed[i].ip = lanRefused[i].ip = 0;
+  for (uint8_t i = 0; i < kLanCallers; i++) lanAllowed[i].ip = 0;
 }
 
 bool pixcLanAuthorised(uint32_t callerIp) {
@@ -687,7 +695,6 @@ bool pixcLanAuthorised(uint32_t callerIp) {
   if (i < 0) return false;
   const uint64_t now = nowMs();
   if (now - lanAllowed[i].at > PIN_TIMEOUT || now - lanAllowed[i].since > kUnlockMax) { lanAllowed[i].ip = 0; return false; }
-  if (lockout > 30000 && now > lockedUntil + kLockoutMax) lockout = 30000;  // quiet again: reset the backoff
   lanAllowed[i].at = now;
   return true;
 }

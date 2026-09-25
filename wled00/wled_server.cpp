@@ -344,6 +344,19 @@ static bool captivePortal(AsyncWebServerRequest *request)
   return false;
 }
 
+#ifdef PIXC_LAN_AUTH
+// The brute-force limiter refused to evaluate this caller's PIN (pixc_lan_guard.h). 429 with
+// Retry-After, deliberately not 401: the app and ePixC Sync read a 401 as "the PIN was rotated" and
+// switch to the pending PIN (D305); a rate limit must not send them down that path.
+static void servePinLimited(AsyncWebServerRequest* request, uint32_t retryAfterMs) {
+  const uint32_t secs = retryAfterMs / 1000 + 1;
+  AsyncWebServerResponse* response = request->beginResponse(429, FPSTR(CONTENT_TYPE_JSON),
+      String(F("{\"error\":")) + ERR_DENIED + F(",\"retry_after\":") + secs + '}');
+  response->addHeader(F("Retry-After"), String(secs));
+  request->send(response);
+}
+#endif
+
 void initServer()
 {
   //CORS compatiblity
@@ -435,15 +448,18 @@ void initServer()
     // `?pin=` is read here because a GET HAS NO BODY. Every other unlock in this firmware arrives
     // as a `pin` key inside a JSON object; a read has nowhere to put one, so without this the
     // gated read would be unreachable by any correct client - a rule with no way to satisfy it.
-    // It goes through `checkSettingsPIN` like every other attempt, so the brute-force cooldown and
-    // the 15-minute relock apply unchanged.
+    // It goes through `pixcLanUnlock` like every other attempt, so the brute-force limiter
+    // (pixc_lan_guard.h) counts it the same way.
     //
     // A PIN in a query string is logged by proxies in a way a body is not. On a LAN request to a
     // device on the same subnet there is no proxy, and the alternative was leaving reads open.
     // A read carries its PIN every time and is authorised by it alone, never remembered (D304).
-    const bool readPin = request->hasArg(F("pin")) &&
-        pixcLanUnlock(pixcCallerIp(request), request->arg(F("pin")).c_str(), false);
-    if (!readPin && !pixcLanAuthorised(pixcCallerIp(request))) { serveJsonError(request, 401, ERR_DENIED); return; }
+    uint32_t retryMs = 0;
+    const PixcPinResult readPin = request->hasArg(F("pin"))
+        ? pixcLanUnlock(pixcCallerIp(request), request->arg(F("pin")).c_str(), false, &retryMs)
+        : PIXC_PIN_WRONG;
+    if (readPin == PIXC_PIN_LIMITED) { servePinLimited(request, retryMs); return; }
+    if (readPin != PIXC_PIN_OK && !pixcLanAuthorised(pixcCallerIp(request))) { serveJsonError(request, 401, ERR_DENIED); return; }
 #endif
     serveJson(request);
   });
@@ -468,8 +484,16 @@ void initServer()
     // Per caller (D303): the PIN unlocks the host that sent it, not the device for everybody.
     // A PIN with a command authorises that request only; a PIN on its own (the web page's prompt)
     // unlocks the browser for a while (D304).
-    const bool thisPin = root.containsKey("pin") &&
-        pixcLanUnlock(pixcCallerIp(request), root["pin"].as<const char*>(), root.size() == 1);
+    uint32_t retryMs = 0;
+    const PixcPinResult pinResult = root.containsKey("pin")
+        ? pixcLanUnlock(pixcCallerIp(request), root["pin"].as<const char*>(), root.size() == 1, &retryMs)
+        : PIXC_PIN_WRONG;
+    if (pinResult == PIXC_PIN_LIMITED) {
+      releaseJSONBufferLock();
+      servePinLimited(request, retryMs);
+      return;
+    }
+    const bool thisPin = pinResult == PIXC_PIN_OK;
 #else
     if (root.containsKey("pin")) checkSettingsPIN(root["pin"].as<const char*>());
 #endif

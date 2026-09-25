@@ -10,6 +10,7 @@
 #include <cstring>
 
 #include "pixc_logic.h"
+#include "pixc_lan_guard.h"
 
 static int g_failures = 0;
 static int g_checks = 0;
@@ -97,9 +98,96 @@ static void testRedaction() {
   CHECK(!pixc::isSecretKey("user", 4));
 }
 
+// ---------------------------------------------------------------------------------------------
+// S3: per-address backoff and a global ceiling that never locks out a correct PIN elsewhere.
+// ---------------------------------------------------------------------------------------------
+// An address on 192.168.1.0/24 as lwIP stores it on a little-endian CPU (first octet low byte).
+static uint32_t lanIp(uint8_t host) { return 192u | (168u << 8) | (1u << 16) | (uint32_t(host) << 24); }
+
+static void testPinGuardBackoff() {
+  pixc::PinGuard g;
+  const uint32_t a = lanIp(66);
+  uint64_t t = 1000000;
+  CHECK(g.mayTry(a, t));
+  g.onWrong(a, t);
+  uint64_t wait = 0;
+  CHECK(!g.mayTry(a, t + 999, &wait));
+  CHECK(wait == 1);
+  CHECK(g.mayTry(a, t + 1000));
+  g.onWrong(a, t + 1000);                       // 2nd: 2 s
+  CHECK(!g.mayTry(a, t + 2999));
+  CHECK(g.mayTry(a, t + 3000));
+  g.onWrong(a, t + 3000);                       // 3rd: 4 s
+  CHECK(!g.mayTry(a, t + 6999));
+  CHECK(g.mayTry(a, t + 7000));
+  g.onRight(a);                                 // a right PIN forgives the address
+  g.onWrong(a, t + 7000);
+  CHECK(g.mayTry(a, t + 8000));                 // back to 1 s
+}
+
+static void testPinGuardOwnerNeverLockedOut() {
+  pixc::PinGuard g;
+  const uint32_t attacker = lanIp(66), owner = lanIp(20), sync = lanIp(21);
+  uint64_t t = 5000;
+  int ownerRefused = 0;
+  // A day of an attacker guessing as fast as it is allowed, every 100 ms, while the owner's app
+  // and Sync talk to the light every second with the right PIN.
+  for (uint64_t ms = 0; ms < 24ULL * 3600 * 1000; ms += 100) {
+    if (g.mayTry(attacker, t + ms)) g.onWrong(attacker, t + ms);
+    if (ms % 1000 == 0) {
+      if (g.mayTry(owner, t + ms)) g.onRight(owner); else ownerRefused++;
+      if (g.mayTry(sync, t + ms)) g.onRight(sync); else ownerRefused++;
+    }
+  }
+  CHECK(ownerRefused == 0);
+}
+
+static void testPinGuardCeiling() {
+  // A single address: the backoff alone keeps it to a few dozen guesses a day.
+  {
+    pixc::PinGuard g;
+    int guesses = 0;
+    for (uint64_t ms = 0; ms < 24ULL * 3600 * 1000; ms += 100) {
+      if (g.mayTry(lanIp(66), ms + 1)) { g.onWrong(lanIp(66), ms + 1); guesses++; }
+    }
+    std::printf("  single-host attacker: %d wrong guesses/day\n", guesses);
+    CHECK(guesses <= 40);
+  }
+  // Every address of the /24, rotating as fast as allowed: bounded by budget + one per address.
+  {
+    pixc::PinGuard g;
+    int guesses = 0;
+    for (uint64_t sec = 0; sec < 24ULL * 3600; sec++) {
+      for (int h = 1; h < 255; h++) {
+        const uint64_t now = sec * 1000 + 1;
+        if (g.mayTry(lanIp(uint8_t(h)), now)) { g.onWrong(lanIp(uint8_t(h)), now); guesses++; }
+      }
+    }
+    std::printf("  whole-/24 attacker:   %d wrong guesses/day\n", guesses);
+    CHECK(guesses <= pixc::PinGuard::kBudgetBurst + 96 + 256);
+    CHECK(guesses >= 100);                      // and the bound is not vacuous
+  }
+  // With the budget spent, a fresh host is still heard exactly once.
+  {
+    pixc::PinGuard g;
+    for (int i = 0; i < 40; i++) {
+      const uint32_t ip = lanIp(uint8_t(100 + i));
+      if (g.mayTry(ip, 10)) g.onWrong(ip, 10);
+    }
+    CHECK(g.tokens() == 0);
+    CHECK(g.mayTry(lanIp(200), 10));            // never failed: evaluated
+    g.onWrong(lanIp(200), 10);
+    CHECK(!g.mayTry(lanIp(200), 2000));         // failed with no budget: refused until a token
+    CHECK(g.mayTry(lanIp(201), 2000));          // a different fresh host: still heard
+  }
+}
+
 int main() {
   testClassifyTopic();
   testRedaction();
+  testPinGuardBackoff();
+  testPinGuardOwnerNeverLockedOut();
+  testPinGuardCeiling();
   if (g_failures == 0) {
     std::printf("pixc host tests: %d checks passed\n", g_checks);
     return EXIT_SUCCESS;
