@@ -171,6 +171,11 @@ bool deserializeConfig(JsonObject doc, bool fromFS) {
 
   uint16_t total = hw_led[F("total")] | strip.getLengthTotal();
   uint16_t ablMilliampsMax = hw_led[F("maxpwr")] | BusManager::ablMilliampsMax();
+#ifdef PIXC_ABL_CEILING_MA
+  // ePixC (audit R4, D52): the limiter is what keeps a 5 m run inside the bundled 60 W supply, so
+  // no config write - LAN or cloud - may raise it or switch it off (0 disables it in WLED).
+  if (ablMilliampsMax == 0 || ablMilliampsMax > PIXC_ABL_CEILING_MA) ablMilliampsMax = PIXC_ABL_CEILING_MA;
+#endif
   BusManager::setMilliampsMax(ablMilliampsMax);
   Bus::setGlobalAWMode(hw_led[F("rgbwm")] | AW_GLOBAL_DISABLED);
   CJSON(strip.correctWB, hw_led["cct"]);
@@ -240,6 +245,13 @@ bool deserializeConfig(JsonObject doc, bool fromFS) {
       uint8_t AWmode = elm[F("rgbwm")] | RGBW_MODE_MANUAL_ONLY;
       uint8_t maPerLed = elm[F("ledma")] | LED_MILLIAMPS_DEFAULT;
       uint16_t maMax = elm[F("maxpwr")] | (ablMilliampsMax * length) / total; // rough (incorrect?) per strip ABL calculation when no config exists
+#ifdef PIXC_ABL_CEILING_MA
+      // ePixC: the per-LED figure is the rated strip current the limiter and the energy estimate
+      // are both built on (platformio_override.ini). Locked: a lower value makes the limiter let
+      // more current through and under-reports energy; 0 switches the limiter off for this bus.
+      maPerLed = LED_MILLIAMPS_DEFAULT;
+      if (maMax == 0 || maMax > PIXC_ABL_CEILING_MA) maMax = PIXC_ABL_CEILING_MA;
+#endif
       // To disable brightness limiter we either set output max current to 0 or single LED current to 0 (we choose output max current)
       if (Bus::isPWM(ledType) || Bus::isOnOff(ledType) || Bus::isVirtual(ledType)) { // analog and virtual
         maPerLed = 0;
