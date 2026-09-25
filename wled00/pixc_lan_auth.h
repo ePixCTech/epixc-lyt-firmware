@@ -164,6 +164,18 @@ inline bool isLowerHex(const char* s, size_t n) {
   return true;
 }
 
+// A WPA passphrase is 8-63 characters; 64 characters is the pre-shared key itself, in hex (either
+// case). Empty is an open network.
+inline bool validPsk(const char* s, size_t n) {
+  if (n == 0 || (n >= 8 && n <= 63)) return true;
+  if (n != 64) return false;
+  for (size_t i = 0; i < n; i++) {
+    const char c = s[i];
+    if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))) return false;
+  }
+  return true;
+}
+
 // Standard base64 with padding. 32 bytes -> 44 characters.
 inline void base64(const uint8_t* in, size_t n, char* out /* 4*ceil(n/3)+1 */) {
   static const char* T = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -338,12 +350,16 @@ inline const char* verdictCode(Verdict v) {
   switch (v) {
     case Verdict::StaleBoot: return "STALE_BOOT";
     case Verdict::Replay:    return "REPLAY";
+    // Signed with the key before the last rotation: the client's copy is stale, so it re-reads the
+    // key from the cloud rather than giving up on the light. Says nothing a stranger could use: only
+    // someone who once held the key can produce this MAC.
+    case Verdict::PreviousKey: return "STALE_KEY";
     default:                 return "UNAUTHORISED";
   }
 }
 
 // Verify one request. `keyHex` is the light's K_lan (32 hex) or empty; `previousKeyHex` the key
-// before the last rotation or empty - a request signed with it is refused as Unauthorised but
+// before the last rotation or empty - a request signed with it is refused (401 STALE_KEY) and
 // reported as PreviousKey, so the caller does not count it against the sender (clients try the old
 // key once after every rotation, by design). On Ok the counter is recorded in `replay`.
 inline Verdict verify(const char* authHeader, const char* keyHex, const char* previousKeyHex,

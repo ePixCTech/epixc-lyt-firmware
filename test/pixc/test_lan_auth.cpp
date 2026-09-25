@@ -71,6 +71,21 @@ void testLanAuthVectors() {
     // Signed with the key before a rotation: refused, but told apart so it is not counted.
     CHECK(verify(v["header"], "ffffffffffffffffffffffffffffffff", key, v["boot_id"], v["method"], v["path_and_query"], b, bl, fresh, nullptr) == Verdict::PreviousKey);
   }
+  // Each refusal has its own code, so a client can tell a stale key (re-read it) from a wrong one.
+  CHECK(strcmp(verdictCode(Verdict::PreviousKey), "STALE_KEY") == 0);
+  CHECK(strcmp(verdictCode(Verdict::StaleBoot), "STALE_BOOT") == 0);
+  CHECK(strcmp(verdictCode(Verdict::Replay), "REPLAY") == 0);
+  CHECK(strcmp(verdictCode(Verdict::Unauthorised), "UNAUTHORISED") == 0);
+  // The Wi-Fi password the phone hands over: open, a passphrase of 8-63, or a 64-hex PSK.
+  const std::string hex64(64, 'a'), hex64Upper(64, 'F'), notHex64 = std::string(63, 'a') + "g";
+  CHECK(validPsk("", 0));
+  CHECK(!validPsk("1234567", 7));
+  CHECK(validPsk("12345678", 8));
+  CHECK(validPsk(std::string(63, 'x').c_str(), 63));
+  CHECK(validPsk(hex64.c_str(), 64));
+  CHECK(validPsk(hex64Upper.c_str(), 64));
+  CHECK(!validPsk(notHex64.c_str(), 64));
+  CHECK(!validPsk(std::string(65, 'a').c_str(), 65));
   for (JsonObject v : doc["replies"].as<JsonArray>()) {
     replies++;
     const char* body = v["body_utf8"];

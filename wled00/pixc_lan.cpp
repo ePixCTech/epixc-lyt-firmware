@@ -126,7 +126,7 @@ void handlePairPost(AsyncWebServerRequest* request) {
   const char* kLan = doc["k_lan"] | "";
   const size_t ssidLen = strlen(ssid), pskLen = strlen(psk);
   // Validate everything before storing anything: a malformed body stores nothing.
-  if (ssidLen == 0 || ssidLen > 32 || (pskLen != 0 && (pskLen < 8 || pskLen > 63)) ||
+  if (ssidLen == 0 || ssidLen > 32 || !pixc::lan::validPsk(psk, pskLen) ||
       !validKey(kDev, 64) || !validKey(kLan, pixc::lan::kKeyHexLen)) {
     sendError(request, 400, "BAD_REQUEST");
     return;
