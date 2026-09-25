@@ -1316,6 +1316,16 @@ void serveJson(AsyncWebServerRequest* request)
   json_target subJson = json_target::all;
 
   const String& url = request->url();
+#ifdef PIXC_LAN_AUTH
+  // /json/pixc/... is not served on the signed API (pixc_lan_auth.h, isPixcNamespace) - the same
+  // signed 404 on GET as on POST, rather than whatever the substring matching below would pick.
+  if (pixc::lan::isPixcNamespace(url.c_str())) {
+    if (lockHeld) releaseJSONBufferLock();
+    if (signer) pixcSendSigned(request, *signer, 404, CONTENT_TYPE_JSON, pixc::lan::kNotFoundBody);
+    else request->send(404, FPSTR(CONTENT_TYPE_JSON), pixc::lan::kNotFoundBody);
+    return;
+  }
+#endif
   if      (url.indexOf("state")    > 0) subJson = json_target::state;
   else if (url.indexOf("info")     > 0) subJson = json_target::info;
   else if (url.indexOf("si")       > 0) subJson = json_target::state_info;

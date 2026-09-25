@@ -5,8 +5,8 @@
 // ePixC device lifecycle: factory reset (every path funnels here), the power-cycle reset counter,
 // the factory hotspot password, and this boot's random id. Compiled with PIXC_LAN_AUTH.
 //
-// One wipe for every trigger - the cloud (`<base>/reset` with {"reset":true}), the signed LAN
-// endpoint (POST /json/pixc/reset) and five short power-ups in a row - so they cannot drift apart.
+// One wipe for both triggers - the cloud (`<base>/reset` with {"reset":true}, admin, checked by the
+// server) and five short power-ups in a row - so they cannot drift apart. There is no LAN reset.
 // The old usermod reset removed cfg.json and wsec.json only, leaving presets, every other file and
 // the Wi-Fi credentials the ESP32 keeps in NVS (audit S12).
 
@@ -14,7 +14,7 @@
 #include <stdint.h>
 
 // Ask for a factory reset. The strip flashes amber three times, then pixcFactoryWipeNow() runs
-// from the loop. `why` goes to the debug log ("cloud", "lan", "power-cycle").
+// from the loop. `why` goes to the debug log ("cloud", "power-cycle").
 void pixcRequestFactoryReset(const char* why);
 bool pixcFactoryResetPending();
 

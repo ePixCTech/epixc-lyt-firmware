@@ -319,6 +319,19 @@ class ReplayTable {
   uint32_t _tick = 0;
 };
 
+// ---------------------------------------------------------------------------------------------
+// Routing of the ePixC namespace on the signed API
+// ---------------------------------------------------------------------------------------------
+// /json/pixc/pair is registered as its own (unsigned, hotspot-only) handler. Every OTHER path under
+// /json/pixc reaching the signed /json handlers is not served: the same signed 404 for all of them.
+// There is deliberately no LAN factory reset (founder, 2026-09-25): anyone holding the LAN key -
+// every member, a guest until rotation, the Sync host - could have wiped the light. Reset is the
+// cloud's {"reset":true} (admin, checked by the server) and five power-ons in a row.
+constexpr const char* kNotFoundBody = "{\"error\":\"NOT_FOUND\"}";
+inline bool isPixcNamespace(const char* url) {
+  return url != nullptr && strncmp(url, "/json/pixc", 10) == 0;
+}
+
 enum class Verdict : uint8_t { Ok, NoKey, Unauthorised, StaleBoot, Replay, PreviousKey };
 
 inline const char* verdictCode(Verdict v) {

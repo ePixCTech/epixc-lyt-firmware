@@ -100,6 +100,31 @@ void testLanAuthVectors() {
   }
   CHECK(rt.fresh("aaaaaaaaaaaaaaaa", 1));             // the accepted residual risk (design doc)
 
+  // No LAN factory reset (founder, 2026-09-25): /json/pixc/reset is routed exactly like any other
+  // unknown /json/pixc path - to the one signed 404 - and the state/config paths are not.
+  CHECK(isPixcNamespace("/json/pixc/reset"));
+  CHECK(isPixcNamespace("/json/pixc/unknown"));
+  CHECK(isPixcNamespace("/json/pixc"));
+  CHECK(!isPixcNamespace("/json"));
+  CHECK(!isPixcNamespace("/json/state"));
+  CHECK(!isPixcNamespace("/json/cfg"));
+  CHECK(!isPixcNamespace(nullptr));
+  CHECK(strcmp(kNotFoundBody, "{\"error\":\"NOT_FOUND\"}") == 0);
+  {
+    // A correctly signed request to it still reaches that 404: the signature verifies (it is a
+    // valid request), and routing - not auth - is what refuses it.
+    const char* key = "000102030405060708090a0b0c0d0e0f";
+    const char* body = "{\"reset\":true}";
+    char bh[65], mac[kMacB64Len + 1];
+    bodyHashHex(reinterpret_cast<const uint8_t*>(body), strlen(body), bh);
+    CHECK(requestMac(key, "POST", "/json/pixc/reset", "5eed1e55", 1, "8b1f2c3d4e5f6a7b", bh, mac));
+    const std::string hdr = std::string("v2 8b1f2c3d4e5f6a7b:5eed1e55:1:") + mac;
+    ReplayTable rt2;
+    CHECK(verify(hdr.c_str(), key, "", "5eed1e55", "POST", "/json/pixc/reset",
+                 reinterpret_cast<const uint8_t*>(body), strlen(body), rt2, nullptr) == Verdict::Ok);
+    CHECK(isPixcNamespace("/json/pixc/reset") == isPixcNamespace("/json/pixc/no-such-thing"));
+  }
+
   // Header parsing is strict.
   ParsedAuth pa;
   CHECK(!parseAuthHeader("v1 8b1f2c3d4e5f6a7b:5eed1e55:1:C1SCV/RrXLyvz1dmq0nUAJYiysrkbCoOTiM1r90/jyk=", pa));

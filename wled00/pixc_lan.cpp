@@ -320,15 +320,10 @@ void pixcRegisterRoutes(AsyncWebServer& srv) {
 }
 
 bool pixcHandleAuthedPost(AsyncWebServerRequest* request, JsonObject root, const PixcReplySigner& signer) {
-  if (request->url() == F("/json/pixc/reset")) {
-    JsonVariant r = root["reset"];
-    if (!r.is<bool>() || !r.as<bool>()) { pixcSendSigned(request, signer, 400, CONTENT_TYPE_JSON, "{\"error\":\"BAD_REQUEST\"}"); return true; }
-    pixcSendSigned(request, signer, 200, CONTENT_TYPE_JSON, "{\"success\":true}");
-    pixcRequestFactoryReset("lan");
-    return true;
-  }
-  if (request->url().startsWith(F("/json/pixc"))) {
-    pixcSendSigned(request, signer, 404, CONTENT_TYPE_JSON, "{\"error\":\"NOT_FOUND\"}");
+  // No LAN factory reset and no other /json/pixc/... action: one signed 404 for all (see
+  // pixc::lan::isPixcNamespace). The realtime lease below travels on POST /json itself.
+  if (pixc::lan::isPixcNamespace(request->url().c_str())) {
+    pixcSendSigned(request, signer, 404, CONTENT_TYPE_JSON, pixc::lan::kNotFoundBody);
     return true;
   }
   JsonVariant lease = root["pixc"]["rt_lease"];

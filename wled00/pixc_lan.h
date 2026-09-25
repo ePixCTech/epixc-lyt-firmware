@@ -11,7 +11,7 @@
 //                           409 ALREADY_PAIRED, 400 on a malformed body; then reboots
 //   every other /json*      X-PixC-Auth v2 required; replies carry X-PixC-Sig v2
 //   POST /json {"pixc":{"rt_lease":N}}   realtime (DDP) lease for the caller, N <= 120 s
-//   POST /json/pixc/reset {"reset":true} factory reset
+//   any other /json/pixc/...   signed 404 (there is no LAN factory reset, by decision)
 //
 // The LAN key is written at pairing and by the cloud (um.PixcConnect.settingsPin), never by a LAN
 // config write, and is never returned by any interface.
@@ -64,8 +64,8 @@ void pixcSendSigned(AsyncWebServerRequest* request, const PixcReplySigner& signe
 // match every /json/... prefix.
 void pixcRegisterRoutes(AsyncWebServer& server);
 
-// A verified POST /json{,/pixc/reset} that carries ePixC's own keys: the realtime lease and the
-// factory reset. Returns true if it answered the request; strips the `pixc` key otherwise.
+// A verified POST that carries ePixC's own keys: the realtime lease, and the signed 404 for any
+// /json/pixc/... path. Returns true if it answered the request; strips the `pixc` key otherwise.
 bool pixcHandleAuthedPost(AsyncWebServerRequest* request, JsonObject root, const PixcReplySigner& signer);
 
 // Remove what a LAN /json/cfg write may not change: the broker (if.mqtt), the access point, the
