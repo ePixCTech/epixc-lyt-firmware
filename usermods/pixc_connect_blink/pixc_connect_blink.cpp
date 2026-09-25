@@ -566,6 +566,11 @@ class PixcConnectBlink : public Usermod {
     // flashed onto a customer unit would look exactly like a healthy one until the day an update
     // was published and that single device silently refused it.
     static const char* fwVersion() {
+#ifdef EPIXC_CI_TEST_ONLY_OTA_KEY
+      static char ci[WLED_VERSION_MAX_LEN + 16];
+      if (ci[0] == '\0') snprintf(ci, sizeof(ci), "%s-CI-TEST-KEY", versionString);
+      return ci;
+#endif
       if (!kOtaDisabled) return versionString;
       static char v[WLED_VERSION_MAX_LEN + 16];
       if (v[0] == '\0') snprintf(v, sizeof(v), "%s-UNSIGNED-DEV", versionString);
