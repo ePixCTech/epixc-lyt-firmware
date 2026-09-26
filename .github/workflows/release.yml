@@ -24,11 +24,11 @@ jobs:
     needs: wled_build
     if: github.repository == 'wled/WLED'
     steps:
-    - uses: actions/download-artifact@v4
+    - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
       with:
         merge-multiple: true
     - name: Create draft release
-      uses: softprops/action-gh-release@v1
+      uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844 # v1
       with:
         body: "Release assets uploaded. Release notes pending..."
         draft: True
@@ -37,7 +37,7 @@ jobs:
           *.bin.gz
     - name: "✏️ Generate release changelog"
       id: changelog
-      uses: janheinrichmerker/action-github-changelog-generator@v2.4
+      uses: janheinrichmerker/action-github-changelog-generator@e60b5a2bd9fcd88dadf6345ff8327863fb8b490f # v2.4
       with:
           token: ${{ secrets.GITHUB_TOKEN }} 
           sinceTag: v0.15.0
@@ -45,7 +45,7 @@ jobs:
           # Exclude issues that were closed without resolution from changelog
           excludeLabels: 'stale,wontfix,duplicate,invalid,external,question,use-as-is,not_planned'       
     - name: Update release description
-      uses: softprops/action-gh-release@v1
+      uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844 # v1
       with:
         body: ${{ steps.changelog.outputs.changelog }}
         draft: True

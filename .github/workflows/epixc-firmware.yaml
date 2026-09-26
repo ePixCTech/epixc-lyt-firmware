@@ -145,7 +145,7 @@ jobs:
     name: Host tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Run test/pixc
         run: bash test/pixc/run.sh
 
@@ -203,23 +203,23 @@ jobs:
             echo "label=CI-TEST-KEY-NOT-SHIPPABLE" >> "$GITHUB_OUTPUT"
           fi
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       # pio-scripts/build_ui.py runs `npm ci` and `npm run build` as a pre-action and aborts the
       # build if node is missing, so the web UI toolchain is a hard dependency of `pio run`, not an
       # optional extra. Pin it to .nvmrc rather than taking whatever the runner image ships.
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version-file: ".nvmrc"
           cache: "npm"
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.12"
           cache: "pip"
 
       - name: Cache PlatformIO
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.platformio/.cache
@@ -737,7 +737,7 @@ jobs:
           print(f"{pkg}: CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y")
           PY
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: epixc-firmware-${{ steps.mode.outputs.label }}
           # The map goes with it: when the size gate does eventually fire, the map is what says why.
