@@ -1,0 +1,11 @@
+# Keeps the workflows' actions current. Every `uses:` is pinned to a commit SHA with its tag in a
+# comment (founder, 2026-09-26); Dependabot moves the SHA and the comment together.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]

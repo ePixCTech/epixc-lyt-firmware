@@ -23,14 +23,14 @@ jobs:
     if: github.repository == 'wled/WLED'
     steps:
       - name: Download artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           merge-multiple: true
       - name: Show Files
         run: ls -la
       - name: "✏️ Generate release changelog"
         id: changelog
-        uses: janheinrichmerker/action-github-changelog-generator@v2.4
+        uses: janheinrichmerker/action-github-changelog-generator@e60b5a2bd9fcd88dadf6345ff8327863fb8b490f # v2.4
         with:
           token: ${{ secrets.GITHUB_TOKEN }} 
           sinceTag: v16.0.0
@@ -50,7 +50,7 @@ jobs:
             *.bin
             *.bin.gz
       - name: Repository Dispatch
-        uses: peter-evans/repository-dispatch@v3
+        uses: peter-evans/repository-dispatch@ff45666b9427631e3450c54a1bcbee4d9ff4d7c0 # v3
         with:
           repository: wled/WLED-WebInstaller
           event-type: release-nightly
