@@ -587,9 +587,11 @@ class PixcConnectBlink : public Usermod {
       return v;
     }
 
-    static constexpr unsigned long kStateIntervalMs  = 5000;
-    static constexpr unsigned long kHealthIntervalMs = 30000;
-    static constexpr unsigned long kPowerIntervalMs  = 30000;
+    // Report cadence (state 5 s, health 30 s, power 60 s): pixc_logic.h, where the host tests
+    // check it.
+    static constexpr unsigned long kStateIntervalMs  = pixc::kStateIntervalMs;
+    static constexpr unsigned long kHealthIntervalMs = pixc::kHealthIntervalMs;
+    static constexpr unsigned long kPowerIntervalMs  = pixc::kPowerIntervalMs;
     // Provisioning retry: 5 s doubling to 5 min, jittered (pixc::backoffWithJitter).
     static constexpr uint32_t kProvisionBaseMs = 5000;
     static constexpr uint32_t kProvisionMaxMs = 300000;
@@ -627,10 +629,13 @@ class PixcConnectBlink : public Usermod {
     // hardcoded 5.0 made reported power wrong by up to 4.8x. The server multiplies by
     // the voltage implied by led_chip, so a wrong voltage is a config change instead of
     // a fleet reflash.
+    //
+    // The payload carries `interval_s`, the spacing it is sent at (pixc::formatPowerPayload): the
+    // server multiplies each sample by it, and counts a sample without it as 30 s, the spacing of
+    // the firmware before it.
     void publishPower() {
       char buf[96];
-      snprintf(buf, sizeof(buf), "{\"amps\":%.3f,\"estimated\":true}",
-               BusManager::currentMilliamps() / 1000.0f);
+      pixc::formatPowerPayload(buf, sizeof(buf), BusManager::currentMilliamps() / 1000.0f);
       publishKind("power", buf);
     }
 
@@ -1486,15 +1491,15 @@ class PixcConnectBlink : public Usermod {
         _lastState = now;
         publishState();
       }
-      if (now - _lastState >= kStateIntervalMs) {
+      if (pixc::reportDue(now, _lastState, kStateIntervalMs)) {
         _lastState = now;
         publishState();
       }
-      if (now - _lastHealth >= kHealthIntervalMs) {
+      if (pixc::reportDue(now, _lastHealth, kHealthIntervalMs)) {
         _lastHealth = now;
         publishHealth();
       }
-      if (now - _lastPower >= kPowerIntervalMs) {
+      if (pixc::reportDue(now, _lastPower, kPowerIntervalMs)) {
         _lastPower = now;
         publishPower();
       }
