@@ -14,6 +14,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 
 namespace pixc {
@@ -187,6 +188,36 @@ inline size_t jsonEscape(const char* in, char* out, size_t cap) {
   }
   out[o] = 0;
   return o;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Report cadence
+// ---------------------------------------------------------------------------------------------
+
+// How often each periodic report is published once the device is connected. `state` is also sent
+// within kStateChangeMinMs of a change; these are the heartbeats.
+//
+// Power is every 60 s (D349, decided 2026-09-27): it is one Postgres row per report, and at
+// 100,000 lights 30 s filled ~220 GB of raw power in the 7-day window. The server integrates
+// energy by each sample's own spacing, so a fleet part-way through the rollout (some lights at
+// 30 s, some at 60 s) reports correct kWh. Health stays at 30 s: it is not stored per sample.
+constexpr uint32_t kStateIntervalMs  = 5000;
+constexpr uint32_t kHealthIntervalMs = 30000;
+constexpr uint32_t kPowerIntervalMs  = 60000;
+
+// True when a report last sent at `last` is due again at `now`. Unsigned subtraction, so the
+// millis() wrap at ~49.7 days does not stall or burst the reports.
+inline bool reportDue(uint32_t now, uint32_t last, uint32_t intervalMs) {
+  return static_cast<uint32_t>(now - last) >= intervalMs;
+}
+
+// The `power` report: `{"amps":…,"estimated":true,"interval_s":60}`. `interval_s` is the spacing
+// this firmware reports at, and the server multiplies each sample by it to get energy; a report
+// without it is from firmware that reported every 30 s, and is counted as 30. Returns snprintf's
+// result: the length written, or the length needed when `n` is too small.
+inline int formatPowerPayload(char* buf, size_t n, float amps) {
+  return snprintf(buf, n, "{\"amps\":%.3f,\"estimated\":true,\"interval_s\":%u}",
+                  static_cast<double>(amps), static_cast<unsigned>(kPowerIntervalMs / 1000u));
 }
 
 // ---------------------------------------------------------------------------------------------

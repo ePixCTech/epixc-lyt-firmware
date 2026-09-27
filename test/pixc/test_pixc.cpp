@@ -244,6 +244,43 @@ static void testBootCount() {
   CHECK(pixc::nextBootCount(200, true).reset);
 }
 
+// ---------------------------------------------------------------------------------------------
+// Report cadence: power every 60 s (D349), health every 30 s, state every 5 s.
+// ---------------------------------------------------------------------------------------------
+static void testReportCadence() {
+  CHECK(pixc::kPowerIntervalMs == 60000);
+  CHECK(pixc::kHealthIntervalMs == 30000);
+  CHECK(pixc::kStateIntervalMs == 5000);
+
+  // An hour of loop() at 10 ms a pass, the way the usermod drives it: one report of each at
+  // connect (the announce), then whenever reportDue says so.
+  const uint32_t start = 1234;
+  uint32_t lastPower = start, lastHealth = start, lastState = start;
+  int power = 1, health = 0, state = 1;
+  for (uint32_t t = start; t < start + 3600000u; t += 10) {
+    if (pixc::reportDue(t, lastState, pixc::kStateIntervalMs)) { lastState = t; state++; }
+    if (pixc::reportDue(t, lastHealth, pixc::kHealthIntervalMs)) { lastHealth = t; health++; }
+    if (pixc::reportDue(t, lastPower, pixc::kPowerIntervalMs)) { lastPower = t; power++; }
+  }
+  CHECK(power == 60);   // the announce plus 59 more inside the hour: 60 rows, not 120
+  CHECK(health == 119);
+  CHECK(state == 720);
+
+  // Across the millis() wrap: due exactly one interval after the last, never early, never stuck.
+  const uint32_t last = 0xFFFFFFFFu - 20000u;
+  CHECK(!pixc::reportDue(last + 59999u, last, pixc::kPowerIntervalMs));
+  CHECK(pixc::reportDue(last + 60000u, last, pixc::kPowerIntervalMs));
+  CHECK(!pixc::reportDue(last, last, pixc::kPowerIntervalMs));
+
+  // The power report says its own spacing, so the server integrates a mixed 30/60 s fleet.
+  char buf[96];
+  const int n = pixc::formatPowerPayload(buf, sizeof(buf), 1.25f);
+  CHECK(n > 0 && n < static_cast<int>(sizeof(buf)));
+  CHECK(std::strcmp(buf, "{\"amps\":1.250,\"estimated\":true,\"interval_s\":60}") == 0);
+  // The largest current the bus can report still fits the usermod's buffer.
+  CHECK(pixc::formatPowerPayload(buf, sizeof(buf), 65535.0f) < static_cast<int>(sizeof(buf)));
+}
+
 static void testFactoryData() {
   CHECK(pixc::validApPsk("k7m2q9x4ab"));
   CHECK(!pixc::validApPsk("short"));
@@ -314,6 +351,7 @@ int main() {
   testDescScanner();
   testBootCount();
   testFactoryData();
+  testReportCadence();
   testJsonEscape();
   testBackoff();
   testRedaction();
