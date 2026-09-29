@@ -96,7 +96,7 @@ CLAIMS = [
         # by itself the moment `va.put("alexa", true)` disappeared (D296), because it rested on a
         # symbol rather than on somebody's memory. So the new disclosure gets the same treatment.
         #
-        # Both directions, deliberately. `pixcLanAuthorised` present says the gate exists; the
+        # Both directions, deliberately. `pixcAuthorise` present says the gate exists; the
         # `-D PIXC_LAN_AUTH` flag present says it is COMPILED, which is the half D297 proved a green
         # build says nothing about. Either one alone can be true while the device is wide open.
         "id": "lan-api-needs-the-device-pin",
