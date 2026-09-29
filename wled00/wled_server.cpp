@@ -547,6 +547,12 @@ void initServer()
   }, JSON_BUFFER_SIZE);
   server.addHandler(handler);
 
+#ifndef PIXC_LAN_AUTH
+  // ePixC: not registered (audit L3). They answered unauthenticated - uptime shows every reboot
+  // and power event, free heap is a feedback signal for a memory-exhaustion attempt - and no
+  // client uses them (epixc-app and epixc-sync checked 2026-09-30). The signed /json/info carries
+  // the same facts, and health telemetry sends free heap to the cloud. A keyed light answers only
+  // /json/id and /json/pixc/pair without a signature; these now fall through to the 404 handler.
   server.on(F("/version"), HTTP_GET, [](AsyncWebServerRequest *request){
     request->send(200, FPSTR(CONTENT_TYPE_PLAIN), (String)VERSION);
   });
@@ -558,6 +564,7 @@ void initServer()
   server.on(F("/freeheap"), HTTP_GET, [](AsyncWebServerRequest *request){
     request->send(200, FPSTR(CONTENT_TYPE_PLAIN), (String)getFreeHeapSize());
   });
+#endif
 
 #ifdef WLED_ENABLE_USERMOD_PAGE
   server.on("/u", HTTP_GET, [](AsyncWebServerRequest *request) {
