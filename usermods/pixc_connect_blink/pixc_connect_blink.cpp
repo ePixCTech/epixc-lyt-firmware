@@ -1106,7 +1106,7 @@ class PixcConnectBlink : public Usermod {
 
   public:
     void setup() override {
-      // Five short power-ups in a row are the no-app, no-cloud factory reset (wled00/pixc_device).
+      // Five 1.5-6 s power-ons in a row, then one more: the offline factory reset (pixc::ResetGesture).
       pixcBootCounterOnBoot();
       // The anti-rollback floor: read here, raised to this image's security version only once the
       // image is confirmed (raiseSecurityFloor()) - raising it while on probation would leave a
@@ -1433,7 +1433,7 @@ class PixcConnectBlink : public Usermod {
 
     void loop() override {
       const unsigned long now = millis();
-      pixcDeviceLoop();   // clears the power-up counter at 10 s; runs a pending factory reset
+      pixcDeviceLoop();   // the power-cycle gesture's 1.5 s and 6 s marks; runs a pending factory reset
 #ifdef PIXC_LAN_AUTH
       pixcLanLoop();      // applies a pairing validated by /json/pixc/pair
 #endif

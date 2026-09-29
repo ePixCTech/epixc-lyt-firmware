@@ -227,22 +227,128 @@ static void testJsonEscape() {
 // ---------------------------------------------------------------------------------------------
 // P2: the power-cycle factory reset, and factory hotspot data.
 // ---------------------------------------------------------------------------------------------
-static void testBootCount() {
-  uint8_t n = 0;
-  for (int i = 1; i <= 4; i++) {
-    const pixc::BootCount b = pixc::nextBootCount(n, true);
-    CHECK(!b.reset);
-    CHECK(b.stored == i);
-    n = b.stored;
+// A boot of the unit as pixc_device.cpp drives the gesture: load from "NVS", boot(), then tick()
+// every 10 ms until the power goes at `onMs`. Returns true if the reset was requested.
+struct GestureNvs { uint8_t n = 0; bool pend = false; int writes = 0; };
+static bool runBoot(GestureNvs& nvs, uint32_t onMs, bool powerUp = true) {
+  pixc::ResetGesture g;
+  g.n = nvs.n;
+  g.pend = nvs.pend;
+  auto store = [&]() { nvs.n = g.n; nvs.pend = g.pend; nvs.writes++; };
+  if (g.boot(powerUp)) store();
+  if (g.reset) return true;
+  for (uint32_t t = 300; t < onMs; t += 10) if (g.tick(t)) store();   // first loop a little after boot
+  return false;
+}
+
+static void testResetGesture() {
+  // Five on for 3 s each, then on: that sixth power-on requests the reset, at boot.
+  {
+    GestureNvs nvs;
+    for (int i = 0; i < 5; i++) CHECK(!runBoot(nvs, 3000));
+    CHECK(nvs.n == 4 && nvs.pend);
+    CHECK(runBoot(nvs, 3600000));
+    CHECK(nvs.n == 0 && !nvs.pend);
+    CHECK(!runBoot(nvs, 3600000));                 // and only once
   }
-  const pixc::BootCount fifth = pixc::nextBootCount(n, true);
-  CHECK(fifth.reset);
-  CHECK(fifth.stored == 0);
-  // A crash or watchdog reboot in between clears the count: a crash loop never wipes a unit.
-  CHECK(pixc::nextBootCount(4, false).stored == 0);
-  CHECK(!pixc::nextBootCount(4, false).reset);
-  // A corrupt stored value cannot overflow past the threshold without resetting.
-  CHECK(pixc::nextBootCount(200, true).reset);
+  // The same across the window, about 2 s to 5 s, mixed; the power-on after it may be anything.
+  {
+    GestureNvs nvs;
+    const uint32_t on[] = {2000, 5000, 1600, 5900, 2500};
+    for (uint32_t ms : on) CHECK(!runBoot(nvs, ms));
+    CHECK(runBoot(nvs, 200));
+  }
+  // A flicker: boots that die before 1.5 s never count, however many there are...
+  {
+    GestureNvs nvs;
+    for (int i = 0; i < 50; i++) CHECK(!runBoot(nvs, 1 + (i * 97) % 1490));
+    CHECK(nvs.n == 0 && !nvs.pend);
+    // ...and one in the middle of a gesture breaks the chain.
+    for (int i = 0; i < 4; i++) CHECK(!runBoot(nvs, 3000));
+    CHECK(!runBoot(nvs, 800));
+    CHECK(!runBoot(nvs, 3000));
+    CHECK(nvs.n == 0 && nvs.pend);                 // one qualifying boot so far, not five
+    for (int i = 0; i < 4; i++) CHECK(!runBoot(nvs, 3000));
+    CHECK(runBoot(nvs, 3000));                     // five from the flicker is a reset
+  }
+  // A normal on clears the chain: four short ons, a light left on, four more, on: no reset.
+  {
+    GestureNvs nvs;
+    for (int i = 0; i < 4; i++) CHECK(!runBoot(nvs, 3000));
+    CHECK(!runBoot(nvs, 3600000));
+    CHECK(nvs.n == 0 && !nvs.pend);
+    for (int i = 0; i < 4; i++) CHECK(!runBoot(nvs, 3000));
+    CHECK(!runBoot(nvs, 60000));
+    CHECK(nvs.n == 0 && !nvs.pend);
+    // A normal on from a clean state writes twice (1.5 s and 6 s) and never counts.
+    const int before = nvs.writes;
+    CHECK(!runBoot(nvs, 3600000));
+    CHECK(nvs.writes - before == 2);
+  }
+  // A slow pattern: ons of 7-10 s each (someone waiting to see the light come up) are not the
+  // gesture, and one slow on among fast ones restarts it.
+  {
+    GestureNvs nvs;
+    for (int i = 0; i < 10; i++) CHECK(!runBoot(nvs, 7000 + 300 * i));
+    CHECK(nvs.n == 0 && !nvs.pend);
+    for (int i = 0; i < 3; i++) CHECK(!runBoot(nvs, 3000));
+    CHECK(!runBoot(nvs, 6500));
+    for (int i = 0; i < 5; i++) CHECK(!runBoot(nvs, 3000));   // the chain restarts after it
+    CHECK(runBoot(nvs, 3000));
+  }
+  // Grid flicker: 20,000 random outages with on-times from 10 ms to 20 s. A reset happens exactly
+  // when the last five on-times all landed in 1.5-6 s, and (printed) that is rare.
+  {
+    GestureNvs nvs;
+    uint32_t lcg = 12345, run = 0;
+    int resets = 0;
+    for (int i = 0; i < 20000; i++) {
+      lcg = lcg * 1664525u + 1013904223u;
+      const uint32_t on = 10 + (lcg >> 8) % 20000;
+      const bool q = on >= pixc::kGestureMinOnMs && on < pixc::kGestureMaxOnMs;
+      const bool r = runBoot(nvs, on);
+      CHECK(r == (run == 5));                      // a reset exactly when the last five qualified
+      if (r) { resets++; run = 0; continue; }      // (the wipe then starts afresh)
+      run = q ? run + 1 : 0;
+    }
+    std::printf("  random on-times 10 ms-20 s: %d resets in 20000 power-ups\n", resets);
+  }
+  // Exactly at the edges: 1.5 s is in, 6 s is out.
+  {
+    GestureNvs nvs;
+    for (int i = 0; i < 4; i++) CHECK(!runBoot(nvs, 1510));
+    CHECK(nvs.n == 3 && nvs.pend);
+    GestureNvs nvs2;
+    for (int i = 0; i < 6; i++) CHECK(!runBoot(nvs2, 1490));
+    CHECK(nvs2.n == 0 && !nvs2.pend);
+    GestureNvs nvs3;
+    for (int i = 0; i < 6; i++) CHECK(!runBoot(nvs3, 6010));
+    CHECK(nvs3.n == 0 && !nvs3.pend);
+  }
+  // A crash, watchdog or brownout clears the chain: a crash loop never wipes a unit.
+  {
+    GestureNvs nvs;
+    for (int i = 0; i < 5; i++) CHECK(!runBoot(nvs, 3000));
+    CHECK(!runBoot(nvs, 3000, false));
+    CHECK(nvs.n == 0);
+    for (int i = 0; i < 200; i++) CHECK(!runBoot(nvs, 2500, false));
+  }
+  // A first loop that comes late (setup ran past 6 s) is a long boot, not a qualifying one.
+  {
+    pixc::ResetGesture g;
+    g.n = 3; g.pend = true;
+    g.boot(true);
+    CHECK(g.n == 4 && !g.reset);
+    CHECK(g.tick(7000));
+    CHECK(g.n == 0 && !g.pend);
+  }
+  // A corrupt stored count clears instead of counting.
+  {
+    pixc::ResetGesture g;
+    g.n = 200; g.pend = true;
+    g.boot(true);
+    CHECK(g.n == 0 && !g.reset);
+  }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -426,7 +532,7 @@ int main() {
   testLanAuthVectors();
   testClassifyTopic();
   testDescScanner();
-  testBootCount();
+  testResetGesture();
   testFactoryData();
   testReportCadence();
   testPowerReconnect();

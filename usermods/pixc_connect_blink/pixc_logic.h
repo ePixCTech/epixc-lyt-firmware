@@ -248,17 +248,78 @@ inline int formatPowerPayload(char* buf, size_t n, float amps, uint32_t interval
 // Factory reset gesture and factory data
 // ---------------------------------------------------------------------------------------------
 
-// Five power-ups in a row, each cut before it has run 10 s, request a factory reset (Pairing and
-// LAN security v2, "Factory reset"). `prev` is the stored count; any boot that is not a power-up
-// (crash, watchdog, software reboot) clears it, so only a person at the switch can do it.
-struct BootCount { uint8_t stored; bool reset; };
+// Five short power-ons in a row request a factory reset (Pairing and LAN security v2, "Factory
+// reset"): switch the light on for about 2-5 seconds and off again, five times, then on. That last
+// power-on flashes amber three times and wipes.
+//
+// A boot counts only if it stayed up between kGestureMinOnMs and kGestureMaxOnMs, and only five of
+// those IN A ROW count. Anything else breaks the chain and clears it: a flicker boot that dies
+// before 1.5 s, a normal on that runs past 6 s, and any boot that is not a power-up (crash,
+// watchdog, software reboot, brownout), so a crash loop or a sagging supply never wipes a unit.
+// Whether a boot qualified is known only once it has died inside the window, so the reset runs on
+// the power-on after the fifth. The first version counted every power-up and cleared only at
+// 10 s, so five storm or load-shedding blips under 10 s apart formatted every light on the circuit
+// at once (audit M3); now all five on-times have to land in a 4.5 s window.
+//
+// Off-time cannot be measured: nothing on the ESP32-S3 keeps time through a power cut (RTC memory
+// and the RTC timer lose power with the rest of the chip), so the "within a minute" of the gesture
+// is bounded by its on-times only - at most 5 x 6 s of running - and a stale part of a chain cannot
+// survive into a later storm, because the next normal on clears it.
+//
+// State lives in NVS (pixc_rst): `n`, the qualifying boots before this one, and `pend`, set once
+// this boot passes 1.5 s and cleared at 6 s. A boot that died with `pend` set stayed up 1.5-6 s.
+// At most three one-byte writes per boot and two on a normal on (1.5 s and 6 s): NVS wear is not a
+// concern at boot rates.
 constexpr uint8_t kPowerCyclesToReset = 5;
-inline BootCount nextBootCount(uint8_t prev, bool powerUp) {
-  if (!powerUp) return {0, false};
-  const uint8_t n = prev >= kPowerCyclesToReset ? kPowerCyclesToReset : static_cast<uint8_t>(prev + 1);
-  if (n >= kPowerCyclesToReset) return {0, true};
-  return {n, false};
-}
+constexpr uint32_t kGestureMinOnMs = 1500;
+constexpr uint32_t kGestureMaxOnMs = 6000;
+
+struct ResetGesture {
+  uint8_t n = 0;        // stored: qualifying boots in the chain, before this one
+  bool pend = false;    // stored: this boot has passed kGestureMinOnMs but not kGestureMaxOnMs
+  uint8_t stage = 0;    // RAM: 0 before 1.5 s, 1 between, 2 done
+  bool reset = false;   // RAM: request the factory reset now
+
+  // Once at boot, with the stored values loaded. Sets `reset` when the previous boot was the fifth
+  // qualifying one in a row. Returns true when the stored values changed.
+  bool boot(bool powerUp) {
+    const uint8_t was = n; const bool wasPend = pend;
+    // n is at most 4 when pend is set (the fifth resets instead), so a larger stored value is
+    // corrupt, and corrupt clears rather than counts.
+    n = (powerUp && pend && n < kPowerCyclesToReset) ? static_cast<uint8_t>(n + 1) : 0;
+    pend = false;                                          // armed again only at 1.5 s
+    stage = 0;
+    reset = n >= kPowerCyclesToReset;
+    if (reset) { n = 0; stage = 2; }
+    return n != was || pend != wasPend;
+  }
+
+  // Every loop, with the uptime. Returns true when the stored values changed.
+  bool tick(uint32_t uptimeMs) {
+    if (stage == 0 && uptimeMs >= kGestureMaxOnMs) {       // first look came late: a long boot
+      stage = 2;
+      return clear();
+    }
+    if (stage == 0 && uptimeMs >= kGestureMinOnMs) {
+      stage = 1;
+      pend = true;
+      return true;
+    }
+    if (stage == 1 && uptimeMs >= kGestureMaxOnMs) {
+      stage = 2;
+      return clear();
+    }
+    return false;
+  }
+
+ private:
+  bool clear() {
+    const bool changed = n != 0 || pend;
+    n = 0;
+    pend = false;
+    return changed;
+  }
+};
 
 // The factory hotspot password: 8-63 printable ASCII for WPA2. The factory tool writes 10
 // characters from [a-z2-9]; anything outside WPA2's rules is treated as absent.
