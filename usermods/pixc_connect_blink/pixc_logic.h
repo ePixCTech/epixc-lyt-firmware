@@ -191,6 +191,52 @@ inline size_t jsonEscape(const char* in, char* out, size_t cap) {
 }
 
 // ---------------------------------------------------------------------------------------------
+// The health report (audit L7, L10)
+// ---------------------------------------------------------------------------------------------
+
+// What the usermod reads for a health report. The heap is internal RAM only: PSRAM is plentiful and
+// TLS cannot use it, so its total says nothing useful.
+struct Health {
+  int rssi;
+  int signal;               // 0-100
+  const char* ssid;         // raw, up to 32 bytes; escaped here
+  const char* ip;           // dotted quad
+  uint32_t freeHeap;        // heap_caps_get_free_size(MALLOC_CAP_INTERNAL)
+  uint32_t largestBlock;    // heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL): fragmentation
+  uint32_t minFreeHeap;     // heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL): low-water mark
+  uint32_t uptimeS;
+  const char* fwVersion;    // at most kFwVersionMax characters are sent
+};
+
+#define PIXC_HEALTH_FMT                                                                          \
+  "{\"rssi\":%d,\"signal\":%d,\"ssid\":\"%s\",\"ip\":\"%.15s\",\"free_heap\":%u,"               \
+  "\"heap_largest\":%u,\"heap_min\":%u,\"uptime\":%u,\"fw_version\":\"%.63s\"}"
+
+// The longest report there can be, from the format: its fixed text plus each field at its widest.
+// The buffer is this size, so a report is never cut (a cut one is invalid JSON, and the backend
+// drops the whole message). The first buffer was 320 bytes against a worst case near 340.
+constexpr size_t kSsidEscapedMax = 32 * 6;                    // 32 control bytes, each \u00XX
+constexpr size_t kFwVersionMax = 63;                          // WLED_VERSION_MAX_LEN + suffix, less NUL
+constexpr size_t kHealthSpecifierChars = 2 + 2 + 2 + 5 + 2 + 2 + 2 + 2 + 5;   // "%d", "%.15s", ...
+constexpr size_t kHealthPayloadMax = (sizeof(PIXC_HEALTH_FMT) - 1 - kHealthSpecifierChars)
+    + 11 + 11                                                 // rssi, signal: INT_MIN
+    + kSsidEscapedMax + 15                                    // ssid, ip
+    + 4 * 10                                                  // four uint32
+    + kFwVersionMax
+    + 1;                                                      // NUL
+static_assert(kHealthPayloadMax <= 512, "the health report lives on the stack of the LED loop");
+
+// Formats the report into `buf` (kHealthPayloadMax bytes). Returns snprintf's result.
+inline int formatHealthPayload(char* buf, size_t n, const Health& h) {
+  char ssid[kSsidEscapedMax + 1];
+  jsonEscape(h.ssid, ssid, sizeof(ssid));
+  return snprintf(buf, n, PIXC_HEALTH_FMT, h.rssi, h.signal, ssid, h.ip ? h.ip : "",
+                  static_cast<unsigned>(h.freeHeap), static_cast<unsigned>(h.largestBlock),
+                  static_cast<unsigned>(h.minFreeHeap), static_cast<unsigned>(h.uptimeS),
+                  h.fwVersion ? h.fwVersion : "");
+}
+
+// ---------------------------------------------------------------------------------------------
 // Report cadence
 // ---------------------------------------------------------------------------------------------
 

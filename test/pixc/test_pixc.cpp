@@ -9,11 +9,14 @@
 #include <cstdlib>
 #include <cstring>
 #include <cmath>
+#include <climits>
+#include <string>
 #include <algorithm>
 #include <vector>
 
 #include "pixc_logic.h"
 #include "pixc_lan_guard.h"
+#include "src/dependencies/json/ArduinoJson-v6.h"
 
 #include "test_check.h"
 
@@ -222,6 +225,41 @@ static void testJsonEscape() {
   escapes("வீடு", "வீடு");                     // UTF-8 passes through
   escapes("\"\"\"\"", "\\\"\\\"", 6);      // never splits an escape at the cap
   escapes(nullptr, "");
+}
+
+// ---------------------------------------------------------------------------------------------
+// L7/L10: the health report is never cut, and carries the heap's fragmentation.
+// ---------------------------------------------------------------------------------------------
+static void testHealthPayload() {
+  // The widest report there can be: an SSID of 32 control bytes, the widest numbers, an over-long
+  // version. It has to fill the buffer to the byte and still parse.
+  char ssid[33];
+  for (int i = 0; i < 32; i++) ssid[i] = '\x01';
+  ssid[32] = 0;
+  std::string fw(80, 'v');
+  pixc::Health h{INT_MIN, INT_MIN, ssid, "255.255.255.255", UINT32_MAX, UINT32_MAX, UINT32_MAX,
+                 UINT32_MAX, fw.c_str()};
+  char buf[pixc::kHealthPayloadMax];
+  const int n = pixc::formatHealthPayload(buf, sizeof(buf), h);
+  std::printf("  health report: worst case %d bytes, buffer %zu\n", n, sizeof(buf));
+  CHECK(n == static_cast<int>(pixc::kHealthPayloadMax) - 1);    // the bound is exact, not loose
+  DynamicJsonDocument doc(2048);
+  CHECK(!deserializeJson(doc, buf));
+  CHECK(std::strlen(doc["ssid"].as<const char*>()) == 32);
+  CHECK(doc["heap_largest"].as<uint32_t>() == UINT32_MAX);
+  CHECK(doc["fw_version"].as<std::string>().size() == pixc::kFwVersionMax);
+  // A '"' or '\\' in the SSID keeps it valid (audit C2), and the new heap fields are there.
+  pixc::Health t{-61, 78, "Bob's \"5G\" \\ net", "192.168.1.20", 180000, 90000, 60000, 3600,
+                 "17.0.1-pixc1"};
+  CHECK(pixc::formatHealthPayload(buf, sizeof(buf), t) > 0);
+  DynamicJsonDocument d2(1024);
+  CHECK(!deserializeJson(d2, buf));
+  CHECK(d2["ssid"] == "Bob's \"5G\" \\ net");
+  CHECK(d2["free_heap"] == 180000);
+  CHECK(d2["heap_largest"] == 90000);
+  CHECK(d2["heap_min"] == 60000);
+  CHECK(d2["uptime"] == 3600);
+  CHECK(d2["rssi"] == -61 && d2["signal"] == 78);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -586,6 +624,7 @@ int main() {
   testReportCadence();
   testPowerReconnect();
   testJsonEscape();
+  testHealthPayload();
   testBackoff();
   testRedaction();
   testPinGuardBackoff();

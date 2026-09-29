@@ -10,6 +10,8 @@
 // esp_reset_reason(). Reached through Arduino's headers on ESP32 anyway, but named here because
 // this file uses it directly and an implicit include is a trap when the framework moves.
 #include <esp_system.h>
+// heap_caps_*: the health report's internal-RAM figures (free, largest block, low-water mark).
+#include <esp_heap_caps.h>
 // esp_ota_get_state_partition() / esp_ota_mark_app_valid_cancel_rollback(): the app half of
 // bootloader rollback. See confirmImageIfPending().
 #include <esp_ota_ops.h>
@@ -721,19 +723,28 @@ class PixcConnectBlink : public Usermod {
       }
     }
 
+    // Wi-Fi, heap and uptime every 30 s. The SSID is escaped (audit C2) and the buffer holds the
+    // longest report there can be (pixc::kHealthPayloadMax, audit L7). The heap is internal RAM:
+    // total free, the largest free block and the low-water mark since boot, because TLS needs one
+    // large contiguous block and total free alone cannot show fragmentation (audit L10). The
+    // backend stores the fields it knows and ignores the rest, so the two new ones are safe to send
+    // before it reads them.
     void publishHealth() {
-      char buf[320];
-      // Escaped: an SSID is 32 arbitrary bytes, and a `"` or `\` in one made this invalid JSON, so
-      // the backend dropped the whole health message (audit C2). 32 bytes escape to at most 192.
-      char ssid[200];
-      pixc::jsonEscape(WiFi.SSID().c_str(), ssid, sizeof(ssid));
-      String ip = WiFi.localIP().toString();
-      int signal = constrain(2 * (WiFi.RSSI() + 100), 0, 100);
-      snprintf(buf, sizeof(buf),
-        "{\"rssi\":%d,\"signal\":%d,\"ssid\":\"%s\",\"ip\":\"%s\",\"free_heap\":%u,\"uptime\":%lu,\"fw_version\":\"%s\"}",
-        (int)WiFi.RSSI(), signal, ssid, ip.c_str(),
-        (unsigned)ESP.getFreeHeap(),
-        (unsigned long)(millis() / 1000), fwVersion());
+      char buf[pixc::kHealthPayloadMax];
+      const String ssid = WiFi.SSID();
+      const String ip = WiFi.localIP().toString();
+      const int rssi = WiFi.RSSI();
+      pixc::Health h;
+      h.rssi = rssi;
+      h.signal = constrain(2 * (rssi + 100), 0, 100);
+      h.ssid = ssid.c_str();
+      h.ip = ip.c_str();
+      h.freeHeap = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+      h.largestBlock = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+      h.minFreeHeap = heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL);
+      h.uptimeS = millis() / 1000;
+      h.fwVersion = fwVersion();
+      pixc::formatHealthPayload(buf, sizeof(buf), h);
       publishKind("health", buf);
     }
 
