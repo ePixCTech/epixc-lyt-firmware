@@ -422,7 +422,8 @@ void initServer()
 
 #ifdef PIXC_LAN_AUTH
   // Pairing v2: GET /json/id, GET/POST /json/pixc/pair (pixc_lan.cpp). Before /json, whose
-  // handlers would otherwise catch these paths as prefixes.
+  // handlers would otherwise catch these paths as prefixes. The key lock first: the handlers use it.
+  pixcLanBegin();
   pixcRegisterRoutes(server);
 #endif
 

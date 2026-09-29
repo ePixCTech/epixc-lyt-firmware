@@ -12,10 +12,13 @@ namespace {
 
 pixc::lan::ReplayTable replay;
 // Guards pixcLanKey, previousLanKey and `replay`: verify runs on the async_tcp task, a rotation from
-// the cloud on the loop task.
+// the cloud on the loop task. Created once by pixcLanBegin(), from initServer() before the server
+// starts and before MQTT can deliver a rotation. It was created on first use, so a verify and a
+// rotation racing to be first could each make one: one leaked, and that window had no exclusion
+// (audit L6). Before pixcLanBegin() only the setup task runs, so there is nothing to exclude.
 SemaphoreHandle_t keyMutex = nullptr;
 struct KeyLock {
-  KeyLock() { if (keyMutex == nullptr) keyMutex = xSemaphoreCreateMutex(); if (keyMutex) xSemaphoreTake(keyMutex, portMAX_DELAY); }
+  KeyLock() { if (keyMutex) xSemaphoreTake(keyMutex, portMAX_DELAY); }
   ~KeyLock() { if (keyMutex) xSemaphoreGive(keyMutex); }
 };
 
@@ -302,6 +305,10 @@ void pixcSendSigned(AsyncWebServerRequest* request, const PixcReplySigner& signe
   AsyncWebServerResponse* response = request->beginResponse(code, contentType, body);
   pixcSignResponse(response, signer, bh);
   request->send(response);
+}
+
+void pixcLanBegin() {
+  if (keyMutex == nullptr) keyMutex = xSemaphoreCreateMutex();
 }
 
 void pixcRegisterRoutes(AsyncWebServer& srv) {
