@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cmath>
 #include <algorithm>
 #include <vector>
 
@@ -274,11 +275,87 @@ static void testReportCadence() {
 
   // The power report says its own spacing, so the server integrates a mixed 30/60 s fleet.
   char buf[96];
-  const int n = pixc::formatPowerPayload(buf, sizeof(buf), 1.25f);
+  const int n = pixc::formatPowerPayload(buf, sizeof(buf), 1.25f, 60);
   CHECK(n > 0 && n < static_cast<int>(sizeof(buf)));
   CHECK(std::strcmp(buf, "{\"amps\":1.250,\"estimated\":true,\"interval_s\":60}") == 0);
-  // The largest current the bus can report still fits the usermod's buffer.
-  CHECK(pixc::formatPowerPayload(buf, sizeof(buf), 65535.0f) < static_cast<int>(sizeof(buf)));
+  // The largest current and interval the usermod can report still fit its buffer.
+  CHECK(pixc::formatPowerPayload(buf, sizeof(buf), 65535.0f, pixc::kPowerMaxSampleS) < static_cast<int>(sizeof(buf)));
+}
+
+// ---------------------------------------------------------------------------------------------
+// M1: a flapping MQTT session must not over-count energy.
+// ---------------------------------------------------------------------------------------------
+// What the backend does with a sample (services/mqtt sample_seconds): round, clamp to 5-600.
+static uint32_t serverSeconds(uint32_t s) { return s < 5 ? 5 : (s > 600 ? 600 : s); }
+
+// The usermod's loop() at 10 ms a pass for `hours`, the broker session up and down on a schedule
+// from `lcg`: a sample on every (re)connect (the announce), then whenever reportDue says so. The
+// light draws `amps` the whole time. Returns the energy the server would record, in amp-seconds;
+// `trueAs` is the energy actually drawn up to the last sample.
+static double simulatePower(uint32_t seed, uint32_t upMinMs, uint32_t upMaxMs, uint32_t downMaxMs,
+                            double amps, double hours, double& trueAs, int& samples) {
+  uint32_t lcg = seed;
+  auto rnd = [&lcg](uint32_t lo, uint32_t hi) { lcg = lcg * 1664525u + 1013904223u; return lo + (lcg >> 8) % (hi - lo + 1); };
+  uint32_t last = 0;                      // _lastPower: boot
+  bool up = false, announced = false;
+  uint32_t flipAt = rnd(2000, 8000);      // first connect a few seconds after boot
+  double reportedAs = 0;
+  samples = 0;
+  const uint32_t end = static_cast<uint32_t>(hours * 3600000.0);
+  for (uint32_t t = 0; t < end; t += 10) {
+    if (t >= flipAt) {
+      up = !up;
+      if (up) announced = false;          // onMqttConnect
+      flipAt = t + (up ? rnd(upMinMs, upMaxMs) : rnd(10, downMaxMs));
+    }
+    if (!up) continue;
+    const bool due = !announced || pixc::reportDue(t, last, pixc::kPowerIntervalMs);
+    announced = true;
+    if (!due) continue;
+    const uint32_t s = pixc::powerSampleSeconds(t, last);
+    if (s == 0) continue;
+    reportedAs += amps * serverSeconds(s);
+    samples++;
+  }
+  trueAs = amps * (last / 1000.0);
+  return reportedAs;
+}
+
+static void testPowerReconnect() {
+  // Sessions of 20-30 s with outages up to 5 s: the audit's weak-Wi-Fi light.
+  {
+    double truth = 0; int samples = 0;
+    const double got = simulatePower(7, 20000, 30000, 5000, 1.5, 3.0, truth, samples);
+    std::printf("  flapping 20-30 s: %d samples, reported/true energy %.4f\n", samples, got / truth);
+    CHECK(samples > 3 * 60 * 2);                 // it really did reconnect several times a minute
+    CHECK(std::fabs(got - truth) < 1e-6 * truth);
+    // What the fixed 60 s used to say for the same run: at least twice the truth.
+    CHECK(samples * 60.0 * 1.5 > 2.0 * truth);
+  }
+  // Sessions shorter than the server's 5 s floor: a span too short to report rolls forward
+  // instead of being raised to 5 s.
+  {
+    double truth = 0; int samples = 0;
+    const double got = simulatePower(11, 300, 4000, 3000, 0.8, 2.0, truth, samples);
+    CHECK(samples > 0);
+    CHECK(std::fabs(got - truth) < 1e-6 * truth);
+  }
+  // A steady session: one sample a minute, each exactly 60 s, plus the first since boot.
+  {
+    double truth = 0; int samples = 0;
+    const double got = simulatePower(3, 2000000000u, 2000000000u, 10, 2.0, 1.0, truth, samples);
+    CHECK(samples >= 59 && samples <= 61);
+    CHECK(std::fabs(got - truth) < 1e-6 * truth);
+  }
+  // The steps themselves.
+  uint32_t last = 0;
+  CHECK(pixc::powerSampleSeconds(4999, last) == 0 && last == 0);      // under the floor: not sent
+  CHECK(pixc::powerSampleSeconds(7400, last) == 7 && last == 7000);   // the 0.4 s carries over
+  CHECK(pixc::powerSampleSeconds(67399, last) == 60 && last == 67000);
+  CHECK(pixc::powerSampleSeconds(67000 + 20u * 60000u, last) == 600); // a 20-minute outage: capped
+  CHECK(last == 67000 + 20u * 60000u);                                // and the rest dropped
+  last = 0xFFFFFFFFu - 30000u;                                         // across the millis() wrap
+  CHECK(pixc::powerSampleSeconds(last + 61000u, last) == 61);
 }
 
 static void testFactoryData() {
@@ -352,6 +429,7 @@ int main() {
   testBootCount();
   testFactoryData();
   testReportCadence();
+  testPowerReconnect();
   testJsonEscape();
   testBackoff();
   testRedaction();

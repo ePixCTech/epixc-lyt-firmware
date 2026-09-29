@@ -479,7 +479,10 @@ class PixcConnectBlink : public Usermod {
     unsigned long _start = 0;
     unsigned long _lastState = 0;
     unsigned long _lastHealth = 0;
-    unsigned long _lastPower = 0;
+    // End of the span the last power sample covered. 0 is boot: the first sample covers the time
+    // since power-on. Advanced only by publishPower() (pixc::powerSampleSeconds), never reset on a
+    // reconnect, so the reported seconds add up to the time the light has been running.
+    uint32_t _lastPower = 0;
     bool _statePending = false;      // set by onStateChange, drained in loop()
     // Last seen realtimeMode, so a stream starting or stopping publishes immediately instead of
     // waiting for the 5 s timer. WLED does not call onStateChange for realtime lock: the segment
@@ -630,12 +633,15 @@ class PixcConnectBlink : public Usermod {
     // the voltage implied by led_chip, so a wrong voltage is a config change instead of
     // a fleet reflash.
     //
-    // The payload carries `interval_s`, the spacing it is sent at (pixc::formatPowerPayload): the
-    // server multiplies each sample by it, and counts a sample without it as 30 s, the spacing of
-    // the firmware before it.
-    void publishPower() {
+    // The payload carries `interval_s`, the seconds this sample stands for, measured from the last
+    // one (pixc::powerSampleSeconds): the server multiplies each sample by it, so a reconnect that
+    // sends a sample early says so instead of claiming a full interval (audit M1). A span too short
+    // for the server's 5 s floor is not sent; it rolls into the next sample.
+    void publishPower(unsigned long now) {
+      const uint32_t secs = pixc::powerSampleSeconds(now, _lastPower);
+      if (secs == 0) return;
       char buf[96];
-      pixc::formatPowerPayload(buf, sizeof(buf), BusManager::currentMilliamps() / 1000.0f);
+      pixc::formatPowerPayload(buf, sizeof(buf), BusManager::currentMilliamps() / 1000.0f, secs);
       publishKind("power", buf);
     }
 
@@ -1453,10 +1459,9 @@ class PixcConnectBlink : public Usermod {
         _announced = true;
         publishAnnounce();
         publishState();
-        publishPower();
+        publishPower(now);   // covers the time since the last sample (or boot), not a fresh 60 s
         _lastState = now;
         _lastHealth = now;
-        _lastPower = now;
       }
       // A bus-width change has finished re-initialising. Say so.
       //
@@ -1499,10 +1504,7 @@ class PixcConnectBlink : public Usermod {
         _lastHealth = now;
         publishHealth();
       }
-      if (pixc::reportDue(now, _lastPower, kPowerIntervalMs)) {
-        _lastPower = now;
-        publishPower();
-      }
+      if (pixc::reportDue(now, _lastPower, kPowerIntervalMs)) publishPower(now);
     }
 
     // WLED fires this on every state change, from led.cpp. Only a flag is set: this

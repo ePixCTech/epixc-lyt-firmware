@@ -211,13 +211,37 @@ inline bool reportDue(uint32_t now, uint32_t last, uint32_t intervalMs) {
   return static_cast<uint32_t>(now - last) >= intervalMs;
 }
 
-// The `power` report: `{"amps":…,"estimated":true,"interval_s":60}`. `interval_s` is the spacing
-// this firmware reports at, and the server multiplies each sample by it to get energy; a report
-// without it is from firmware that reported every 30 s, and is counted as 30. Returns snprintf's
-// result: the length written, or the length needed when `n` is too small.
-inline int formatPowerPayload(char* buf, size_t n, float amps) {
+// The seconds the next power sample stands for, measured, or 0 when no sample is due yet.
+//
+// The server multiplies each sample by its `interval_s` to get energy, so a sample has to say how
+// long it really covers. The fixed 60 it used to say was wrong on every MQTT reconnect: the usermod
+// sends a sample straight after each (re)connect, and a light whose session flapped every 20 s sent
+// three samples a minute, each counted as 60 s, so its kWh read up to three times high (audit M1).
+// Measured from the last sample (or from boot, for the first one, which is when the strip started
+// drawing), the samples tile the timeline instead: their seconds add up to the time elapsed.
+//
+// `last` is when the previous sample's span ended. It advances by whole seconds, so the fraction a
+// sample does not report is carried into the next one rather than lost on every report. A span
+// shorter than kPowerMinSampleS is not sent (0) and is not consumed: it rolls into the next sample,
+// because the server raises anything below its floor to 5 s. A span longer than kPowerMaxSampleS
+// (the broker was unreachable for more than ten minutes) is reported as the cap and the rest is
+// dropped - the server clamps there too, and the current now says nothing about ten minutes ago.
+constexpr uint32_t kPowerMinSampleS = 5;     // the backend's floor (services/mqtt sample_seconds)
+constexpr uint32_t kPowerMaxSampleS = 600;   // and its ceiling
+inline uint32_t powerSampleSeconds(uint32_t now, uint32_t& last) {
+  const uint32_t secs = static_cast<uint32_t>(now - last) / 1000u;
+  if (secs < kPowerMinSampleS) return 0;
+  if (secs > kPowerMaxSampleS) { last = now; return kPowerMaxSampleS; }
+  last += secs * 1000u;
+  return secs;
+}
+
+// The `power` report: `{"amps":…,"estimated":true,"interval_s":N}`, N from powerSampleSeconds().
+// A report without `interval_s` is from firmware that reported every 30 s, and is counted as 30.
+// Returns snprintf's result: the length written, or the length needed when `n` is too small.
+inline int formatPowerPayload(char* buf, size_t n, float amps, uint32_t intervalS) {
   return snprintf(buf, n, "{\"amps\":%.3f,\"estimated\":true,\"interval_s\":%u}",
-                  static_cast<double>(amps), static_cast<unsigned>(kPowerIntervalMs / 1000u));
+                  static_cast<double>(amps), static_cast<unsigned>(intervalS));
 }
 
 // ---------------------------------------------------------------------------------------------
