@@ -9,8 +9,11 @@ anyone edited it, so the state moves into the repositories and the note becomes 
 Art-Net, sACN, E1.31, DDP, DMX and Bluetooth were *"none implemented anywhere in the stack"* while
 `e131.begin` and `ddp.begin` ran unconditionally on every shipped unit. A buyer told the controller
 has no unauthenticated LAN listeners cannot make an informed decision about putting it on a shared
-network. That row is a `must: present` here now: the day someone removes the listener the row goes
-red and has to be rewritten, and the day someone adds one back the same thing happens.
+network. That row is pinned here, and it has flipped since: pairing v2 compiled E1.31/Art-Net out
+under `PIXC_LAN_AUTH` and gated DDP behind a lease. The first version of the check read only the
+text, so it went on reporting the old sentence verified after the code had made it false (audit
+M2); the rows now read the preprocessor guard and the build flags as well, and go red if either
+moves.
 
 **The OTA row is why the two-part shape exists at all.** *"Signed updates"* is neither true nor
 false: the device verifies an ECDSA P-256 signature and refuses anything unsigned, and
@@ -31,22 +34,54 @@ REPO = "epixc-lyt-firmware"
 
 CLAIMS = [
     {
-        "id": "sacn-e131-artnet-listening",
+        # This row said the opposite until 2026-09-29, and passed. Its evidence was the regex
+        # `e131\.begin\(`, which kept matching after both calls moved inside `#ifndef PIXC_LAN_AUTH`:
+        # the text was still in the file, just not in any ePixC image. A claim about what a unit
+        # listens on is a claim about the BUILD, so the evidence now reads the preprocessor too
+        # (audit M2). The engine only matches text, so the three items are the build in text form:
+        #   1. no `e131.begin(` whose nearest enclosing conditional is anything but
+        #      `#ifndef PIXC_LAN_AUTH` (one nested inside another block goes red - the safe way);
+        #   2. the guarded call is still there, so (1) is not passing because it moved;
+        #   3. every ePixC env compiles the flag: it is set, not commented out, and no env
+        #      unflags it (PixC_V1_dev and _citest extend PixC_V1).
+        "id": "sacn-e131-artnet-closed",
         "section": "Protocols",
-        "ticket": "161, D167",
-        "row": "**sACN / E1.31 and Art-Net are listening on every shipped unit**, on one socket, "
-               "with no enable flag in front of them.",
+        "ticket": "161, D167, audit M2",
+        "row": "**sACN / E1.31 and Art-Net are closed on every ePixC build** — the listener is "
+               "compiled only without `PIXC_LAN_AUTH`, and every shipped env sets it. Ports 5568 "
+               "and 6454 are not opened.",
         "evidence": [
-            {"file": "wled00/wled.cpp", "must": "present", "pattern": r"e131\.begin\("},
+            {"file": "wled00/wled.cpp", "must": "absent",
+             "pattern": r"#(?!ifndef PIXC_LAN_AUTH\b)(?:ifdef|ifndef|if|elif|else|endif)\b"
+                        r"(?:(?!#(?:ifdef|ifndef|if|elif|else|endif)\b).)*?e131\.begin\("},
+            {"file": "wled00/wled.cpp", "must": "present",
+             "pattern": r"#ifndef PIXC_LAN_AUTH\b(?:(?!#(?:ifdef|ifndef|if|elif|else|endif)\b).)*?e131\.begin\("},
+            {"file": "platformio_override.ini", "must": "present",
+             "pattern": r"(?<![;#] )-D PIXC_LAN_AUTH\b"},
+            {"file": "platformio_override.ini", "must": "absent",
+             "pattern": r"build_unflags = (?:(?!build_flags|\[env).)*PIXC_LAN_AUTH|-U ?PIXC_LAN_AUTH\b"},
         ],
     },
     {
-        "id": "ddp-listening",
+        # Was "DDP is listening on every shipped unit, unconditionally". The socket is still open
+        # (ePixC Sync is built on it), but since pairing v2 a packet is drawn only if its source
+        # address holds a lease a signed request granted. Both halves are pinned. The lease trusts
+        # the UDP source address, so a LAN host that spoofs the leaseholder's IP can draw while
+        # the lease lasts: accepted, see the vault (Pairing and LAN security v2, audit L1).
+        "id": "ddp-lease-gated",
         "section": "Protocols",
-        "ticket": "161, D167",
-        "row": "**DDP is listening on every shipped unit**, port 4048, unconditionally.",
+        "ticket": "161, D167, audit M2",
+        "row": "**DDP (port 4048) is open, and its pixels are taken only from an address holding a "
+               "realtime lease** granted by a signed request; any other sender is dropped. The "
+               "lease is by source address, so it does not stop a host that spoofs the "
+               "leaseholder's IP.",
         "evidence": [
             {"file": "wled00/wled.cpp", "must": "present", "pattern": r"ddp\.begin\("},
+            {"file": "wled00/e131.cpp", "must": "present",
+             "pattern": r"#ifdef PIXC_LAN_AUTH\b(?:(?!#(?:ifdef|ifndef|if|elif|else|endif)\b).)*?"
+                        r"if \(!pixcRealtimeAllowed\("},
+            {"file": "platformio_override.ini", "must": "present",
+             "pattern": r"(?<![;#] )-D PIXC_LAN_AUTH\b"},
         ],
     },
     {
