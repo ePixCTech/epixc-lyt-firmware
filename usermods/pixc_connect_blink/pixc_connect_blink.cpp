@@ -726,9 +726,9 @@ class PixcConnectBlink : public Usermod {
     // Wi-Fi, heap and uptime every 30 s. The SSID is escaped (audit C2) and the buffer holds the
     // longest report there can be (pixc::kHealthPayloadMax, audit L7). The heap is internal RAM:
     // total free, the largest free block and the low-water mark since boot, because TLS needs one
-    // large contiguous block and total free alone cannot show fragmentation (audit L10). The
-    // backend stores the fields it knows and ignores the rest, so the two new ones are safe to send
-    // before it reads them.
+    // large contiguous block and total free alone cannot show fragmentation (audit L10). Also the
+    // inbound MQTT events dropped since boot (audit L8). The backend stores the fields it knows and
+    // ignores the rest, so the new ones are safe to send before it reads them.
     void publishHealth() {
       char buf[pixc::kHealthPayloadMax];
       const String ssid = WiFi.SSID();
@@ -744,6 +744,11 @@ class PixcConnectBlink : public Usermod {
       h.minFreeHeap = heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL);
       h.uptimeS = millis() / 1000;
       h.fwVersion = fwVersion();
+#ifdef PIXC_MQTT_ESP_IDF
+      h.mqttDropped = mqtt ? mqtt->dropped() : 0;
+#else
+      h.mqttDropped = 0;
+#endif
       pixc::formatHealthPayload(buf, sizeof(buf), h);
       publishKind("health", buf);
     }

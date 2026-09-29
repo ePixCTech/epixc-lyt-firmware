@@ -77,6 +77,10 @@ class PixcMqttClient {
   uint16_t publish(const char* topic, uint8_t qos, bool retain, const char* payload, size_t length);
   uint16_t subscribe(const char* topic, uint8_t qos);
 
+  /// Inbound events dropped since boot. A dropped QoS 1 message is not redelivered (esp-mqtt has
+  /// already acknowledged it), so the health report carries this.
+  uint32_t dropped() const { return _dropped; }
+
  private:
   static esp_err_t eventHandler(esp_mqtt_event_handle_t event);
   void handle(esp_mqtt_event_handle_t event);
@@ -94,8 +98,9 @@ class PixcMqttClient {
   bool _reconnectDue = false;
   bool _bootJitterDone = false;
   uint32_t _nextAttemptAt = 0;
-  /// Events dropped because the queue was full (debug visibility only).
-  uint32_t _dropped = 0;
+  /// Events dropped because the queue stayed full or memory ran out. Written on the esp-mqtt task,
+  /// read on the loop (an aligned 32-bit read).
+  volatile uint32_t _dropped = 0;
   /// Whether the esp-mqtt task is running. A stopped client is still allocated, and will sit there
   /// doing nothing until it is started again — which is not what `connect()` used to notice.
   bool _started = false;

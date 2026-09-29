@@ -238,7 +238,7 @@ static void testHealthPayload() {
   ssid[32] = 0;
   std::string fw(80, 'v');
   pixc::Health h{INT_MIN, INT_MIN, ssid, "255.255.255.255", UINT32_MAX, UINT32_MAX, UINT32_MAX,
-                 UINT32_MAX, fw.c_str()};
+                 UINT32_MAX, fw.c_str(), UINT32_MAX};
   char buf[pixc::kHealthPayloadMax];
   const int n = pixc::formatHealthPayload(buf, sizeof(buf), h);
   std::printf("  health report: worst case %d bytes, buffer %zu\n", n, sizeof(buf));
@@ -250,7 +250,7 @@ static void testHealthPayload() {
   CHECK(doc["fw_version"].as<std::string>().size() == pixc::kFwVersionMax);
   // A '"' or '\\' in the SSID keeps it valid (audit C2), and the new heap fields are there.
   pixc::Health t{-61, 78, "Bob's \"5G\" \\ net", "192.168.1.20", 180000, 90000, 60000, 3600,
-                 "17.0.1-pixc1"};
+                 "17.0.1-pixc1", 3};
   CHECK(pixc::formatHealthPayload(buf, sizeof(buf), t) > 0);
   DynamicJsonDocument d2(1024);
   CHECK(!deserializeJson(d2, buf));
@@ -260,6 +260,7 @@ static void testHealthPayload() {
   CHECK(d2["heap_min"] == 60000);
   CHECK(d2["uptime"] == 3600);
   CHECK(d2["rssi"] == -61 && d2["signal"] == 78);
+  CHECK(d2["mqtt_dropped"] == 3);
 }
 
 // ---------------------------------------------------------------------------------------------
