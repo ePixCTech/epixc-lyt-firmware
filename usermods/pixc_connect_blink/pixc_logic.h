@@ -419,5 +419,76 @@ inline const char* otaRefusal(bool found, uint32_t newBuild, uint32_t newSecurit
   return nullptr;
 }
 
+// ---------------------------------------------------------------------------------------------
+// OTA failure words (audit L5)
+// ---------------------------------------------------------------------------------------------
+//
+// The light reports a failed update in a few English words (`error` on ota/progress, at most 47
+// characters). The backend turns them into a stable code the app words for the reader -
+// OtaErrorCode.of in services/api and ota_error_code in services/mqtt, matching whole words in the
+// order below - so the words decide what the customer is told. "signature fetch" (a network
+// failure fetching the .sig) read as OTA_SIGNATURE_INVALID, "this update is not genuine", for a
+// dropped connection. otaErrorCode() is a copy of that table so the host tests can pin every word
+// this firmware sends to the code it lands on; change it only with the backend's.
+namespace ota_fail {
+constexpr const char* kLowMemory     = "low memory";                  // OTA_BUSY
+constexpr const char* kNoSpace       = "no space";                    // OTA_NO_SPACE
+constexpr const char* kRead          = "read";                        // OTA_DOWNLOAD_FAILED
+constexpr const char* kStalled       = "stalled";                     // OTA_DOWNLOAD_FAILED
+constexpr const char* kFlashWrite    = "flash write";                 // OTA_FLASH_FAILED
+constexpr const char* kNoDigest      = "command has no digest";       // OTA_FAILED (a server fault)
+constexpr const char* kShaMismatch   = "sha256 mismatch";             // OTA_CORRUPT_DOWNLOAD
+// No "sig" or "signature" in either: that word is the backend's first test, and neither of these
+// says anything about whether the image is genuine.
+constexpr const char* kSigDownload   = "verify file: connect or read failed";   // OTA_DOWNLOAD_FAILED
+constexpr const char* kNoSigUrl      = "no verify file url";          // OTA_FAILED (a server fault)
+constexpr const char* kSigMismatch   = "signature mismatch";          // OTA_SIGNATURE_INVALID
+// A build that cannot verify anything. OTA_FAILED today; the backend has no code for it yet.
+constexpr const char* kNoSigningKey  = "no signing key in firmware";
+constexpr const char* kBadSigningKey = "bad signing key";
+// Formatted: "http %d" and "tls/connect" (OTA_DOWNLOAD_FAILED), "finalize %u" (OTA_FAILED).
+}  // namespace ota_fail
+
+namespace detail {
+// " w1 w2 " of the lower-cased alphanumeric words of `raw`, as the backend builds it.
+inline void paddedWords(const char* raw, char* out, size_t cap) {
+  size_t o = 0;
+  bool inWord = false;
+  if (cap < 3) { if (cap) out[0] = 0; return; }
+  out[o++] = ' ';
+  for (const char* p = raw; *p && o + 2 < cap; p++) {
+    const char c = lower(*p);
+    const bool alnum = (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9');
+    if (alnum) { out[o++] = c; inWord = true; }
+    else if (inWord) { out[o++] = ' '; inWord = false; }
+  }
+  if (inWord) out[o++] = ' ';
+  out[o] = 0;
+}
+inline bool hasWord(const char* padded, const char* w) {
+  char pat[24];
+  snprintf(pat, sizeof(pat), " %s ", w);
+  return strstr(padded, pat) != nullptr;
+}
+}  // namespace detail
+
+// The code the backend gives the words `raw` (OtaErrorCode.of), or nullptr for none.
+inline const char* otaErrorCode(const char* raw) {
+  if (raw == nullptr) return nullptr;
+  char e[96];
+  detail::paddedWords(raw, e, sizeof(e));
+  if (e[0] == 0 || strcmp(e, " ") == 0) return nullptr;
+  using detail::hasWord;
+  if (hasWord(e, "signature") || hasWord(e, "sig")) return "OTA_SIGNATURE_INVALID";
+  if (hasWord(e, "sha256") || hasWord(e, "checksum")) return "OTA_CORRUPT_DOWNLOAD";
+  if (hasWord(e, "downgrade") || hasWord(e, "older")) return "OTA_DOWNGRADE_REFUSED";
+  if (hasWord(e, "no space") || hasWord(e, "too large")) return "OTA_NO_SPACE";
+  if (hasWord(e, "flash")) return "OTA_FLASH_FAILED";
+  if (hasWord(e, "low memory") || hasWord(e, "busy")) return "OTA_BUSY";
+  static const char* const net[] = {"stalled", "read", "http", "connect", "timeout", "tls", "dns"};
+  for (const char* w : net) if (hasWord(e, w)) return "OTA_DOWNLOAD_FAILED";
+  return "OTA_FAILED";
+}
+
 }  // namespace pixc
 // AI: end

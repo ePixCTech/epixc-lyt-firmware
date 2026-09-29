@@ -268,23 +268,23 @@ void hex32(const uint8_t* d, char* out /* >=65 */) {
 // LENGTH (DER contains NUL bytes), over TLS against the pinned roots. Fetched *after* the image so
 // it cannot be swapped between the check and the flash. Returns a failure reason, or nullptr.
 const char* verifySignature(const char* sigUrl, const uint8_t* digest) {
-  if (sizeof(PIXC_OTA_PUBKEY_PEM) <= 1) return "no signing key in firmware";
-  if (sigUrl == nullptr || sigUrl[0] == 0) return "signature fetch";
+  if (sizeof(PIXC_OTA_PUBKEY_PEM) <= 1) return pixc::ota_fail::kNoSigningKey;
+  if (sigUrl == nullptr || sigUrl[0] == 0) return pixc::ota_fail::kNoSigUrl;
 
   uint8_t sig[80];
   const int got = pixcHttpsGetBinary(sigUrl, sig, sizeof(sig), 10000);
-  if (got <= 0) return "signature fetch";
+  if (got <= 0) return pixc::ota_fail::kSigDownload;   // a network failure, not a bad signature
 
   mbedtls_pk_context pk;
   mbedtls_pk_init(&pk);
   // The length includes the terminating NUL: mbedtls treats a PEM as a NUL-counted buffer.
   int rc = mbedtls_pk_parse_public_key(&pk, (const unsigned char*)PIXC_OTA_PUBKEY_PEM,
                                        sizeof(PIXC_OTA_PUBKEY_PEM));
-  if (rc != 0) { mbedtls_pk_free(&pk); return "bad signing key"; }
+  if (rc != 0) { mbedtls_pk_free(&pk); return pixc::ota_fail::kBadSigningKey; }
 
   rc = mbedtls_pk_verify(&pk, MBEDTLS_MD_SHA256, digest, 32, sig, (size_t)got);
   mbedtls_pk_free(&pk);
-  return rc == 0 ? nullptr : "signature mismatch";
+  return rc == 0 ? nullptr : pixc::ota_fail::kSigMismatch;
 }
 
   // Download the firmware image over TLS and flash it to the inactive OTA partition, verifying
@@ -329,7 +329,7 @@ const char* verifySignature(const char* sigUrl, const uint8_t* digest) {
   // the right server at all. They answer different questions, and this one is reachability.
 
 void doOta(const Job& j) {
-  if (ESP.getFreeHeap() < 50000) { otaProgress(j, "failed", 0, "low memory"); return; }
+  if (ESP.getFreeHeap() < 50000) { otaProgress(j, "failed", 0, pixc::ota_fail::kLowMemory); return; }
 
   DEBUG_PRINTF("[ePixC] OTA start v%s <- %s\n", j.version, j.url);
   otaProgress(j, "downloading", 0);
@@ -346,7 +346,7 @@ void doOta(const Job& j) {
   }
 
   if (!Update.begin(total > 0 ? (size_t)total : UPDATE_SIZE_UNKNOWN)) {
-    otaProgress(j, "failed", 0, "no space"); pixcHttpsClose(stream); return;
+    otaProgress(j, "failed", 0, pixc::ota_fail::kNoSpace); pixcHttpsClose(stream); return;
   }
 
   mbedtls_sha256_context sha;
@@ -363,9 +363,9 @@ void doOta(const Job& j) {
 
   while (true) {
     const int n = pixcHttpsRead(stream, buf, sizeof(buf));
-    if (n < 0) { ok = false; failMsg = "read"; break; }
+    if (n < 0) { ok = false; failMsg = pixc::ota_fail::kRead; break; }
     if (n == 0) break;                              // end of body, clean or otherwise
-    if (Update.write(buf, n) != (size_t)n) { ok = false; failMsg = "flash write"; break; }
+    if (Update.write(buf, n) != (size_t)n) { ok = false; failMsg = pixc::ota_fail::kFlashWrite; break; }
     mbedtls_sha256_update(&sha, buf, n);
     written += n;
     if (!desc.found()) {
@@ -386,7 +386,7 @@ void doOta(const Job& j) {
 
   // A connection cut mid-image ends the loop exactly like a clean finish. The SHA-256 below would
   // catch it anyway, but "stalled" is a far more useful thing to put in front of support.
-  if (ok && !pixcHttpsComplete(stream)) { ok = false; failMsg = "stalled"; }
+  if (ok && !pixcHttpsComplete(stream)) { ok = false; failMsg = pixc::ota_fail::kStalled; }
   pixcHttpsClose(stream);
 
   uint8_t digest[32];
@@ -398,10 +398,10 @@ void doOta(const Job& j) {
   if (ok) {
     if (strlen(j.sha256) != 64) {
       ok = false;
-      failMsg = "no sha256 in command";
+      failMsg = pixc::ota_fail::kNoDigest;
     } else {
       char got[65]; hex32(digest, got);
-      if (strcasecmp(j.sha256, got) != 0) { ok = false; failMsg = "sha256 mismatch"; }
+      if (strcasecmp(j.sha256, got) != 0) { ok = false; failMsg = pixc::ota_fail::kShaMismatch; }
     }
   }
 

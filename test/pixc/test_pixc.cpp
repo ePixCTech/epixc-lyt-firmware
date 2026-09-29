@@ -511,6 +511,54 @@ static void testDescScanner() {
   CHECK(pixc::otaRefusal(true, 6, 2, 5, 1) == nullptr);
 }
 
+// ---------------------------------------------------------------------------------------------
+// L5: every OTA failure word lands on the backend code that tells the customer the truth.
+// ---------------------------------------------------------------------------------------------
+static void otaCode(const char* raw, const char* want) {
+  const char* got = pixc::otaErrorCode(raw);
+  const bool ok = got != nullptr && std::strcmp(got, want) == 0;
+  CHECK(ok);
+  if (!ok) std::fprintf(stderr, "  \"%s\" -> %s, want %s\n", raw, got ? got : "null", want);
+}
+
+static void testOtaFailureCodes() {
+  namespace f = pixc::ota_fail;
+  // The one the audit found: fetching the .sig failed, which says nothing about the image.
+  otaCode(f::kSigDownload, "OTA_DOWNLOAD_FAILED");
+  otaCode(f::kNoSigUrl, "OTA_FAILED");
+  otaCode(f::kSigMismatch, "OTA_SIGNATURE_INVALID");
+  otaCode(f::kLowMemory, "OTA_BUSY");
+  otaCode(f::kNoSpace, "OTA_NO_SPACE");
+  otaCode(f::kRead, "OTA_DOWNLOAD_FAILED");
+  otaCode(f::kStalled, "OTA_DOWNLOAD_FAILED");
+  otaCode(f::kFlashWrite, "OTA_FLASH_FAILED");
+  otaCode(f::kNoDigest, "OTA_FAILED");
+  otaCode(f::kShaMismatch, "OTA_CORRUPT_DOWNLOAD");
+  otaCode(f::kNoSigningKey, "OTA_FAILED");        // no dedicated backend code yet
+  otaCode(f::kBadSigningKey, "OTA_FAILED");
+  otaCode("http 404", "OTA_DOWNLOAD_FAILED");
+  otaCode("tls/connect", "OTA_DOWNLOAD_FAILED");
+  otaCode("finalize 9", "OTA_FAILED");
+  otaCode(pixc::otaRefusal(false, 0, 0, 0, 0), "OTA_FAILED");              // no build descriptor
+  otaCode(pixc::otaRefusal(true, 9, 1, 5, 2), "OTA_DOWNGRADE_REFUSED");      // security downgrade
+  otaCode(pixc::otaRefusal(true, 4, 1, 5, 1), "OTA_DOWNGRADE_REFUSED");
+  // Every word fits the 48-byte error field of the progress report.
+  for (const char* w : {f::kLowMemory, f::kNoSpace, f::kRead, f::kStalled, f::kFlashWrite, f::kNoDigest,
+                        f::kShaMismatch, f::kSigDownload, f::kNoSigUrl, f::kSigMismatch, f::kNoSigningKey,
+                        f::kBadSigningKey})
+    CHECK(std::strlen(w) < 48);
+  // The copy of the backend's table, pinned on its own test inputs (OtaErrorCode.of): whole words,
+  // so "already" is not "read" and a weak "signal" is not a "sig".
+  otaCode("already up to date", "OTA_FAILED");
+  otaCode("weak signal", "OTA_FAILED");
+  otaCode("HTTP 500", "OTA_DOWNLOAD_FAILED");
+  otaCode("bad sig", "OTA_SIGNATURE_INVALID");
+  otaCode("image too large", "OTA_NO_SPACE");
+  CHECK(pixc::otaErrorCode("") == nullptr);
+  CHECK(pixc::otaErrorCode("  ") == nullptr);
+  CHECK(pixc::otaErrorCode(nullptr) == nullptr);
+}
+
 static void testPinGuardV2Mode() {
   // Pairing v2: no global ceiling, two free failures, then backoff for that address only.
   pixc::PinGuard g(false, 2);
@@ -532,6 +580,7 @@ int main() {
   testLanAuthVectors();
   testClassifyTopic();
   testDescScanner();
+  testOtaFailureCodes();
   testResetGesture();
   testFactoryData();
   testReportCadence();
