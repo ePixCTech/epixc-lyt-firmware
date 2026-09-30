@@ -575,10 +575,10 @@ void handleNotifications()
   // any packet starting A-Z) and the JSON API (any packet starting '{'). The last two reached
   // handleSet()/deserializeState() - reboot, preset writes, full state - with no PIN from any host
   // on the LAN, including by broadcast. UDP has no field to carry a credential, so they are not
-  // gated, they are gone. The app and ePixC Sync use none of them (HTTP JSON with a PIN, and DDP).
+  // gated, they are gone. The app and ePixC Sync use none of them (signed HTTP JSON, and DDP).
   // The one UDP control input left on this socket is WLED's sync notifier above, off by default
-  // (receiveGroups = 0, wled.h). What stays open on the LAN is written down in util.cpp,
-  // pixcLanAuthorised(), "WHAT THIS DOES NOT COVER".
+  // (receiveGroups = 0, wled.h). What stays open on the LAN is written down in util.cpp, in the
+  // note on the signed LAN API, "WHAT IT DOES NOT COVER".
   // =============================================================================================
   return;
 #else

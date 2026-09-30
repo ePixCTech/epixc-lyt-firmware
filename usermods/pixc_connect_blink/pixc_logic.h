@@ -14,6 +14,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 
 namespace pixc {
@@ -190,20 +191,182 @@ inline size_t jsonEscape(const char* in, char* out, size_t cap) {
 }
 
 // ---------------------------------------------------------------------------------------------
+// The health report (audit L7, L10)
+// ---------------------------------------------------------------------------------------------
+
+// What the usermod reads for a health report. The heap is internal RAM only: PSRAM is plentiful and
+// TLS cannot use it, so its total says nothing useful.
+struct Health {
+  int rssi;
+  int signal;               // 0-100
+  const char* ssid;         // raw, up to 32 bytes; escaped here
+  const char* ip;           // dotted quad
+  uint32_t freeHeap;        // heap_caps_get_free_size(MALLOC_CAP_INTERNAL)
+  uint32_t largestBlock;    // heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL): fragmentation
+  uint32_t minFreeHeap;     // heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL): low-water mark
+  uint32_t uptimeS;
+  const char* fwVersion;    // at most kFwVersionMax characters are sent
+  uint32_t mqttDropped;     // inbound MQTT events dropped since boot (audit L8)
+};
+
+#define PIXC_HEALTH_FMT                                                                          \
+  "{\"rssi\":%d,\"signal\":%d,\"ssid\":\"%s\",\"ip\":\"%.15s\",\"free_heap\":%u,"               \
+  "\"heap_largest\":%u,\"heap_min\":%u,\"uptime\":%u,\"fw_version\":\"%.63s\",\"mqtt_dropped\":%u}"
+
+// The longest report there can be, from the format: its fixed text plus each field at its widest.
+// The buffer is this size, so a report is never cut (a cut one is invalid JSON, and the backend
+// drops the whole message). The first buffer was 320 bytes against a worst case near 340.
+constexpr size_t kSsidEscapedMax = 32 * 6;                    // 32 control bytes, each \u00XX
+constexpr size_t kFwVersionMax = 63;                          // WLED_VERSION_MAX_LEN + suffix, less NUL
+constexpr size_t kHealthSpecifierChars = 2 + 2 + 2 + 5 + 2 + 2 + 2 + 2 + 5 + 2;   // "%d", "%.15s", ...
+constexpr size_t kHealthPayloadMax = (sizeof(PIXC_HEALTH_FMT) - 1 - kHealthSpecifierChars)
+    + 11 + 11                                                 // rssi, signal: INT_MIN
+    + kSsidEscapedMax + 15                                    // ssid, ip
+    + 5 * 10                                                  // five uint32
+    + kFwVersionMax
+    + 1;                                                      // NUL
+static_assert(kHealthPayloadMax <= 512, "the health report lives on the stack of the LED loop");
+
+// Formats the report into `buf` (kHealthPayloadMax bytes). Returns snprintf's result.
+inline int formatHealthPayload(char* buf, size_t n, const Health& h) {
+  char ssid[kSsidEscapedMax + 1];
+  jsonEscape(h.ssid, ssid, sizeof(ssid));
+  return snprintf(buf, n, PIXC_HEALTH_FMT, h.rssi, h.signal, ssid, h.ip ? h.ip : "",
+                  static_cast<unsigned>(h.freeHeap), static_cast<unsigned>(h.largestBlock),
+                  static_cast<unsigned>(h.minFreeHeap), static_cast<unsigned>(h.uptimeS),
+                  h.fwVersion ? h.fwVersion : "", static_cast<unsigned>(h.mqttDropped));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Report cadence
+// ---------------------------------------------------------------------------------------------
+
+// How often each periodic report is published once the device is connected. `state` is also sent
+// within kStateChangeMinMs of a change; these are the heartbeats.
+//
+// Power is every 60 s (D349, decided 2026-09-27): it is one Postgres row per report, and at
+// 100,000 lights 30 s filled ~220 GB of raw power in the 7-day window. The server integrates
+// energy by each sample's own spacing, so a fleet part-way through the rollout (some lights at
+// 30 s, some at 60 s) reports correct kWh. Health stays at 30 s: it is not stored per sample.
+constexpr uint32_t kStateIntervalMs  = 5000;
+constexpr uint32_t kHealthIntervalMs = 30000;
+constexpr uint32_t kPowerIntervalMs  = 60000;
+
+// True when a report last sent at `last` is due again at `now`. Unsigned subtraction, so the
+// millis() wrap at ~49.7 days does not stall or burst the reports.
+inline bool reportDue(uint32_t now, uint32_t last, uint32_t intervalMs) {
+  return static_cast<uint32_t>(now - last) >= intervalMs;
+}
+
+// The seconds the next power sample stands for, measured, or 0 when no sample is due yet.
+//
+// The server multiplies each sample by its `interval_s` to get energy, so a sample has to say how
+// long it really covers. The fixed 60 it used to say was wrong on every MQTT reconnect: the usermod
+// sends a sample straight after each (re)connect, and a light whose session flapped every 20 s sent
+// three samples a minute, each counted as 60 s, so its kWh read up to three times high (audit M1).
+// Measured from the last sample (or from boot, for the first one, which is when the strip started
+// drawing), the samples tile the timeline instead: their seconds add up to the time elapsed.
+//
+// `last` is when the previous sample's span ended. It advances by whole seconds, so the fraction a
+// sample does not report is carried into the next one rather than lost on every report. A span
+// shorter than kPowerMinSampleS is not sent (0) and is not consumed: it rolls into the next sample,
+// because the server raises anything below its floor to 5 s. A span longer than kPowerMaxSampleS
+// (the broker was unreachable for more than ten minutes) is reported as the cap and the rest is
+// dropped - the server clamps there too, and the current now says nothing about ten minutes ago.
+constexpr uint32_t kPowerMinSampleS = 5;     // the backend's floor (services/mqtt sample_seconds)
+constexpr uint32_t kPowerMaxSampleS = 600;   // and its ceiling
+inline uint32_t powerSampleSeconds(uint32_t now, uint32_t& last) {
+  const uint32_t secs = static_cast<uint32_t>(now - last) / 1000u;
+  if (secs < kPowerMinSampleS) return 0;
+  if (secs > kPowerMaxSampleS) { last = now; return kPowerMaxSampleS; }
+  last += secs * 1000u;
+  return secs;
+}
+
+// The `power` report: `{"amps":…,"estimated":true,"interval_s":N}`, N from powerSampleSeconds().
+// A report without `interval_s` is from firmware that reported every 30 s, and is counted as 30.
+// Returns snprintf's result: the length written, or the length needed when `n` is too small.
+inline int formatPowerPayload(char* buf, size_t n, float amps, uint32_t intervalS) {
+  return snprintf(buf, n, "{\"amps\":%.3f,\"estimated\":true,\"interval_s\":%u}",
+                  static_cast<double>(amps), static_cast<unsigned>(intervalS));
+}
+
+// ---------------------------------------------------------------------------------------------
 // Factory reset gesture and factory data
 // ---------------------------------------------------------------------------------------------
 
-// Five power-ups in a row, each cut before it has run 10 s, request a factory reset (Pairing and
-// LAN security v2, "Factory reset"). `prev` is the stored count; any boot that is not a power-up
-// (crash, watchdog, software reboot) clears it, so only a person at the switch can do it.
-struct BootCount { uint8_t stored; bool reset; };
+// Five short power-ons in a row request a factory reset (Pairing and LAN security v2, "Factory
+// reset"): switch the light on for about 2-5 seconds and off again, five times, then on. That last
+// power-on flashes amber three times and wipes.
+//
+// A boot counts only if it stayed up between kGestureMinOnMs and kGestureMaxOnMs, and only five of
+// those IN A ROW count. Anything else breaks the chain and clears it: a flicker boot that dies
+// before 1.5 s, a normal on that runs past 6 s, and any boot that is not a power-up (crash,
+// watchdog, software reboot, brownout), so a crash loop or a sagging supply never wipes a unit.
+// Whether a boot qualified is known only once it has died inside the window, so the reset runs on
+// the power-on after the fifth. The first version counted every power-up and cleared only at
+// 10 s, so five storm or load-shedding blips under 10 s apart formatted every light on the circuit
+// at once (audit M3); now all five on-times have to land in a 4.5 s window.
+//
+// Off-time cannot be measured: nothing on the ESP32-S3 keeps time through a power cut (RTC memory
+// and the RTC timer lose power with the rest of the chip), so the "within a minute" of the gesture
+// is bounded by its on-times only - at most 5 x 6 s of running - and a stale part of a chain cannot
+// survive into a later storm, because the next normal on clears it.
+//
+// State lives in NVS (pixc_rst): `n`, the qualifying boots before this one, and `pend`, set once
+// this boot passes 1.5 s and cleared at 6 s. A boot that died with `pend` set stayed up 1.5-6 s.
+// At most three one-byte writes per boot and two on a normal on (1.5 s and 6 s): NVS wear is not a
+// concern at boot rates.
 constexpr uint8_t kPowerCyclesToReset = 5;
-inline BootCount nextBootCount(uint8_t prev, bool powerUp) {
-  if (!powerUp) return {0, false};
-  const uint8_t n = prev >= kPowerCyclesToReset ? kPowerCyclesToReset : static_cast<uint8_t>(prev + 1);
-  if (n >= kPowerCyclesToReset) return {0, true};
-  return {n, false};
-}
+constexpr uint32_t kGestureMinOnMs = 1500;
+constexpr uint32_t kGestureMaxOnMs = 6000;
+
+struct ResetGesture {
+  uint8_t n = 0;        // stored: qualifying boots in the chain, before this one
+  bool pend = false;    // stored: this boot has passed kGestureMinOnMs but not kGestureMaxOnMs
+  uint8_t stage = 0;    // RAM: 0 before 1.5 s, 1 between, 2 done
+  bool reset = false;   // RAM: request the factory reset now
+
+  // Once at boot, with the stored values loaded. Sets `reset` when the previous boot was the fifth
+  // qualifying one in a row. Returns true when the stored values changed.
+  bool boot(bool powerUp) {
+    const uint8_t was = n; const bool wasPend = pend;
+    // n is at most 4 when pend is set (the fifth resets instead), so a larger stored value is
+    // corrupt, and corrupt clears rather than counts.
+    n = (powerUp && pend && n < kPowerCyclesToReset) ? static_cast<uint8_t>(n + 1) : 0;
+    pend = false;                                          // armed again only at 1.5 s
+    stage = 0;
+    reset = n >= kPowerCyclesToReset;
+    if (reset) { n = 0; stage = 2; }
+    return n != was || pend != wasPend;
+  }
+
+  // Every loop, with the uptime. Returns true when the stored values changed.
+  bool tick(uint32_t uptimeMs) {
+    if (stage == 0 && uptimeMs >= kGestureMaxOnMs) {       // first look came late: a long boot
+      stage = 2;
+      return clear();
+    }
+    if (stage == 0 && uptimeMs >= kGestureMinOnMs) {
+      stage = 1;
+      pend = true;
+      return true;
+    }
+    if (stage == 1 && uptimeMs >= kGestureMaxOnMs) {
+      stage = 2;
+      return clear();
+    }
+    return false;
+  }
+
+ private:
+  bool clear() {
+    const bool changed = n != 0 || pend;
+    n = 0;
+    pend = false;
+    return changed;
+  }
+};
 
 // The factory hotspot password: 8-63 printable ASCII for WPA2. The factory tool writes 10
 // characters from [a-z2-9]; anything outside WPA2's rules is treated as absent.
@@ -301,6 +464,81 @@ inline const char* otaRefusal(bool found, uint32_t newBuild, uint32_t newSecurit
   if (newSecurity < securityFloor) return "security downgrade";
   if (newBuild < runningBuild) return "downgrade";
   return nullptr;
+}
+
+// ---------------------------------------------------------------------------------------------
+// OTA failure words (audit L5)
+// ---------------------------------------------------------------------------------------------
+//
+// The light reports a failed update in a few English words (`error` on ota/progress, at most 47
+// characters). The backend turns them into a stable code the app words for the reader -
+// OtaErrorCode.of in services/api and ota_error_code in services/mqtt, matching whole words in the
+// order below - so the words decide what the customer is told. "signature fetch" (a network
+// failure fetching the .sig) read as OTA_SIGNATURE_INVALID, "this update is not genuine", for a
+// dropped connection. otaErrorCode() is a copy of that table so the host tests can pin every word
+// this firmware sends to the code it lands on; change it only with the backend's.
+namespace ota_fail {
+constexpr const char* kLowMemory     = "low memory";                  // OTA_BUSY
+constexpr const char* kNoSpace       = "no space";                    // OTA_NO_SPACE
+constexpr const char* kRead          = "read";                        // OTA_DOWNLOAD_FAILED
+constexpr const char* kStalled       = "stalled";                     // OTA_DOWNLOAD_FAILED
+constexpr const char* kFlashWrite    = "flash write";                 // OTA_FLASH_FAILED
+constexpr const char* kNoDigest      = "command has no digest";       // OTA_FAILED (a server fault)
+constexpr const char* kShaMismatch   = "sha256 mismatch";             // OTA_CORRUPT_DOWNLOAD
+// No "sig" or "signature" in either: that word is the backend's first test, and neither of these
+// says anything about whether the image is genuine.
+constexpr const char* kSigDownload   = "verify file: connect or read failed";   // OTA_DOWNLOAD_FAILED
+constexpr const char* kNoSigUrl      = "no verify file url";          // OTA_FAILED (a server fault)
+constexpr const char* kSigMismatch   = "signature mismatch";          // OTA_SIGNATURE_INVALID
+// A build that cannot verify anything: OTA_UNSIGNED_BUILD, so a fleet that cannot update at all is
+// told apart from one bad download (backend audit M4, 2026-09-30).
+constexpr const char* kNoSigningKey  = "no signing key in firmware";  // OTA_UNSIGNED_BUILD
+constexpr const char* kBadSigningKey = "bad signing key";             // OTA_UNSIGNED_BUILD
+// Formatted: "http %d" and "tls/connect" (OTA_DOWNLOAD_FAILED), "finalize %u" (OTA_FAILED).
+}  // namespace ota_fail
+
+namespace detail {
+// " w1 w2 " of the lower-cased alphanumeric words of `raw`, as the backend builds it.
+inline void paddedWords(const char* raw, char* out, size_t cap) {
+  size_t o = 0;
+  bool inWord = false;
+  if (cap < 3) { if (cap) out[0] = 0; return; }
+  out[o++] = ' ';
+  for (const char* p = raw; *p && o + 2 < cap; p++) {
+    const char c = lower(*p);
+    const bool alnum = (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9');
+    if (alnum) { out[o++] = c; inWord = true; }
+    else if (inWord) { out[o++] = ' '; inWord = false; }
+  }
+  if (inWord) out[o++] = ' ';
+  out[o] = 0;
+}
+inline bool hasWord(const char* padded, const char* w) {
+  char pat[24];
+  snprintf(pat, sizeof(pat), " %s ", w);
+  return strstr(padded, pat) != nullptr;
+}
+}  // namespace detail
+
+// The code the backend gives the words `raw` (OtaErrorCode.of), or nullptr for none.
+inline const char* otaErrorCode(const char* raw) {
+  if (raw == nullptr) return nullptr;
+  char e[96];
+  detail::paddedWords(raw, e, sizeof(e));
+  if (e[0] == 0 || strcmp(e, " ") == 0) return nullptr;
+  using detail::hasWord;
+  // First, as in the backend's OtaErrorCode.of and the mqtt ingest: "signing" is not "sig", so the
+  // order is not load-bearing, but first reads clearest.
+  if (hasWord(e, "signing key")) return "OTA_UNSIGNED_BUILD";
+  if (hasWord(e, "signature") || hasWord(e, "sig")) return "OTA_SIGNATURE_INVALID";
+  if (hasWord(e, "sha256") || hasWord(e, "checksum")) return "OTA_CORRUPT_DOWNLOAD";
+  if (hasWord(e, "downgrade") || hasWord(e, "older")) return "OTA_DOWNGRADE_REFUSED";
+  if (hasWord(e, "no space") || hasWord(e, "too large")) return "OTA_NO_SPACE";
+  if (hasWord(e, "flash")) return "OTA_FLASH_FAILED";
+  if (hasWord(e, "low memory") || hasWord(e, "busy")) return "OTA_BUSY";
+  static const char* const net[] = {"stalled", "read", "http", "connect", "timeout", "tls", "dns"};
+  for (const char* w : net) if (hasWord(e, w)) return "OTA_DOWNLOAD_FAILED";
+  return "OTA_FAILED";
 }
 
 }  // namespace pixc

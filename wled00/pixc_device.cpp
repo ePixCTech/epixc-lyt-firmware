@@ -13,13 +13,13 @@
 #include <nvs_flash.h>
 
 namespace {
-constexpr const char* kNsReset = "pixc_rst";      // the power-cycle counter
+constexpr const char* kNsReset = "pixc_rst";      // the power-cycle gesture (pixc::ResetGesture)
 constexpr const char* kNsFactory = "pixc_fac";    // written by tools/factory_provision.py
-constexpr uint32_t kPowerCycleClearMs = 10000;    // a boot this long is not part of a reset gesture
 
 bool resetPending = false;
 uint32_t rebootAt = 0;
-bool counterCleared = false;
+pixc::ResetGesture gesture;
+bool gestureLoaded = false;
 const char* resetWhy = "";
 char bootId[9] = "";
 
@@ -64,35 +64,39 @@ void pixcFactoryWipeNow() {
   for (;;) {}
 }
 
+void storeGesture() {
+  Preferences p;
+  if (!p.begin(kNsReset, false)) return;
+  p.putUChar("n", gesture.n);
+  p.putBool("pend", gesture.pend);
+  p.end();
+}
+
 void pixcBootCounterOnBoot() {
-  // Only a power-up counts. RTC memory does not survive a power cut, which is the very event being
-  // counted, so the count lives in NVS (one small write per boot). A crash, watchdog or software
-  // reboot clears it, so a crash loop can never wipe a unit.
+  // Only a power-up counts, and only one that stayed up 1.5-6 s (pixc::ResetGesture). RTC memory does
+  // not survive a power cut on the ESP32-S3 - the cut is the very event being counted - so the
+  // state lives in NVS: one or two one-byte writes per boot. A crash, watchdog or software reboot
+  // clears it, so a crash loop can never wipe a unit.
   const esp_reset_reason_t r = esp_reset_reason();
   // A brownout is NOT counted: a weak supply that browns out under inrush five times in a row must
   // not wipe the unit. Bench: confirm a wall-switch cycle reports POWERON on this board.
   const bool powerUp = (r == ESP_RST_POWERON);
   Preferences p;
   if (!p.begin(kNsReset, false)) return;
-  const pixc::BootCount next = pixc::nextBootCount(p.getUChar("n", 0), powerUp);
-  p.putUChar("n", next.stored);
+  gesture.n = p.getUChar("n", 0);
+  gesture.pend = p.getBool("pend", false);
   p.end();
-  DEBUG_PRINTF("[ePixC] power-up count %u\n", (unsigned)next.stored);
-  if (next.reset) pixcRequestFactoryReset("power-cycle");
+  gestureLoaded = true;
+  if (gesture.boot(powerUp)) storeGesture();
+  DEBUG_PRINTF("[ePixC] reset gesture: %u short power-ons before this one\n", (unsigned)gesture.n);
+  if (gesture.reset) pixcRequestFactoryReset("power-cycle");   // the fifth short one was last boot
 }
 
 void pixcRebootAfter(uint32_t ms) { rebootAt = millis() + (ms ? ms : 1); }
 
 void pixcDeviceLoop() {
   if (rebootAt != 0 && (long)(millis() - rebootAt) >= 0) { rebootAt = 0; doReboot = true; }
-  if (!counterCleared && millis() > kPowerCycleClearMs) {
-    counterCleared = true;
-    Preferences p;
-    if (p.begin(kNsReset, false)) {
-      if (p.getUChar("n", 0) != 0) p.putUChar("n", 0);
-      p.end();
-    }
-  }
+  if (gestureLoaded && gesture.tick(millis())) storeGesture();
   if (resetPending) {
     flashAmberThreeTimes();
     pixcFactoryWipeNow();

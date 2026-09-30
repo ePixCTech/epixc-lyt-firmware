@@ -150,9 +150,15 @@ bool PixcMqttClient::enqueue(uint8_t kind, esp_mqtt_event_handle_t event) {
   ev->buf[topicLen] = 0;
   if (dataLen) memcpy(ev->buf + topicLen + 1, event->data, dataLen);
   ev->buf[topicLen + 1 + dataLen] = 0;
-  // Connection state changes wait briefly for room; a data chunk that finds the queue full is
-  // dropped (WLED's reassembly discards a message whose first chunk never arrived).
-  const TickType_t wait = kind == kEvData ? 0 : pdMS_TO_TICKS(50);
+  // Connection state changes wait briefly for room, and so does a data chunk (audit L8).
+  //
+  // A dropped chunk is a lost message, and for a QoS 1 command it is lost for good: esp-mqtt sends
+  // the PUBACK for an inbound publish itself, whatever this handler does with the data, so the
+  // broker considers it delivered and never sends it again. The burst that fills the queue is the
+  // reconnect replay of queued /api commands, and the loop drains kDrainPerLoop events a pass, so
+  // 20 ms (several passes) is enough room for it; while this waits, esp-mqtt reads nothing more.
+  // What is still dropped is counted, and the health report carries the count (`mqtt_dropped`).
+  const TickType_t wait = pdMS_TO_TICKS(kind == kEvData ? 20 : 50);
   if (xQueueSend(_events, &ev, wait) != pdTRUE) { free(ev); _dropped++; return false; }
   return true;
 }

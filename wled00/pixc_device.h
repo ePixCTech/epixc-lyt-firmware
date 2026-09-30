@@ -6,9 +6,9 @@
 // the factory hotspot password, and this boot's random id. Compiled with PIXC_LAN_AUTH.
 //
 // One wipe for both triggers - the cloud (`<base>/reset` with {"reset":true}, admin, checked by the
-// server) and five short power-ups in a row - so they cannot drift apart. There is no LAN reset.
-// The old usermod reset removed cfg.json and wsec.json only, leaving presets, every other file and
-// the Wi-Fi credentials the ESP32 keeps in NVS (audit S12).
+// server) and five short power-ons in a row, each 1.5-6 s - so they cannot drift apart. There is
+// no LAN reset. The old usermod reset removed cfg.json and wsec.json only, leaving presets, every
+// other file and the Wi-Fi credentials the ESP32 keeps in NVS (audit S12).
 
 #include <stddef.h>
 #include <stdint.h>
@@ -27,10 +27,10 @@ bool pixcFactoryResetPending();
 // Reboot `ms` from now, from the loop (so a reply can leave first).
 void pixcRebootAfter(uint32_t ms);
 
-// Call once, early in setup: counts short power-ups in NVS, and requests a reset on the fifth.
+// Call once, early in setup: loads the power-cycle gesture from NVS, counts the previous boot if
+// it stayed up 1.5-6 s, and requests the reset when that made five in a row (pixc::ResetGesture).
 void pixcBootCounterOnBoot();
-// Call every loop: clears the counter once this boot has lasted kPowerCycleClearMs, and runs a
-// pending reset.
+// Call every loop: arms this boot at 1.5 s, clears the chain at 6 s, and runs a pending reset.
 void pixcDeviceLoop();
 
 // The per-unit hotspot password from factory NVS (`pixc_fac/ap_psk`), or the dev fallback

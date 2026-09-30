@@ -60,6 +60,9 @@ void pixcSignResponse(AsyncWebServerResponse* response, const PixcReplySigner& s
 void pixcSendSigned(AsyncWebServerRequest* request, const PixcReplySigner& signer, int code,
                     const char* contentType, const char* body);
 
+// Create the key lock. Call once from setup, before the server starts (initServer does).
+void pixcLanBegin();
+
 // /json/id and /json/pixc/pair. Call before the generic /json handlers are registered: those
 // match every /json/... prefix.
 void pixcRegisterRoutes(AsyncWebServer& server);

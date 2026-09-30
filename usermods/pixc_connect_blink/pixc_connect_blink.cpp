@@ -10,6 +10,8 @@
 // esp_reset_reason(). Reached through Arduino's headers on ESP32 anyway, but named here because
 // this file uses it directly and an implicit include is a trap when the framework moves.
 #include <esp_system.h>
+// heap_caps_*: the health report's internal-RAM figures (free, largest block, low-water mark).
+#include <esp_heap_caps.h>
 // esp_ota_get_state_partition() / esp_ota_mark_app_valid_cancel_rollback(): the app half of
 // bootloader rollback. See confirmImageIfPending().
 #include <esp_ota_ops.h>
@@ -268,23 +270,23 @@ void hex32(const uint8_t* d, char* out /* >=65 */) {
 // LENGTH (DER contains NUL bytes), over TLS against the pinned roots. Fetched *after* the image so
 // it cannot be swapped between the check and the flash. Returns a failure reason, or nullptr.
 const char* verifySignature(const char* sigUrl, const uint8_t* digest) {
-  if (sizeof(PIXC_OTA_PUBKEY_PEM) <= 1) return "no signing key in firmware";
-  if (sigUrl == nullptr || sigUrl[0] == 0) return "signature fetch";
+  if (sizeof(PIXC_OTA_PUBKEY_PEM) <= 1) return pixc::ota_fail::kNoSigningKey;
+  if (sigUrl == nullptr || sigUrl[0] == 0) return pixc::ota_fail::kNoSigUrl;
 
   uint8_t sig[80];
   const int got = pixcHttpsGetBinary(sigUrl, sig, sizeof(sig), 10000);
-  if (got <= 0) return "signature fetch";
+  if (got <= 0) return pixc::ota_fail::kSigDownload;   // a network failure, not a bad signature
 
   mbedtls_pk_context pk;
   mbedtls_pk_init(&pk);
   // The length includes the terminating NUL: mbedtls treats a PEM as a NUL-counted buffer.
   int rc = mbedtls_pk_parse_public_key(&pk, (const unsigned char*)PIXC_OTA_PUBKEY_PEM,
                                        sizeof(PIXC_OTA_PUBKEY_PEM));
-  if (rc != 0) { mbedtls_pk_free(&pk); return "bad signing key"; }
+  if (rc != 0) { mbedtls_pk_free(&pk); return pixc::ota_fail::kBadSigningKey; }
 
   rc = mbedtls_pk_verify(&pk, MBEDTLS_MD_SHA256, digest, 32, sig, (size_t)got);
   mbedtls_pk_free(&pk);
-  return rc == 0 ? nullptr : "signature mismatch";
+  return rc == 0 ? nullptr : pixc::ota_fail::kSigMismatch;
 }
 
   // Download the firmware image over TLS and flash it to the inactive OTA partition, verifying
@@ -329,7 +331,7 @@ const char* verifySignature(const char* sigUrl, const uint8_t* digest) {
   // the right server at all. They answer different questions, and this one is reachability.
 
 void doOta(const Job& j) {
-  if (ESP.getFreeHeap() < 50000) { otaProgress(j, "failed", 0, "low memory"); return; }
+  if (ESP.getFreeHeap() < 50000) { otaProgress(j, "failed", 0, pixc::ota_fail::kLowMemory); return; }
 
   DEBUG_PRINTF("[ePixC] OTA start v%s <- %s\n", j.version, j.url);
   otaProgress(j, "downloading", 0);
@@ -346,7 +348,7 @@ void doOta(const Job& j) {
   }
 
   if (!Update.begin(total > 0 ? (size_t)total : UPDATE_SIZE_UNKNOWN)) {
-    otaProgress(j, "failed", 0, "no space"); pixcHttpsClose(stream); return;
+    otaProgress(j, "failed", 0, pixc::ota_fail::kNoSpace); pixcHttpsClose(stream); return;
   }
 
   mbedtls_sha256_context sha;
@@ -363,9 +365,9 @@ void doOta(const Job& j) {
 
   while (true) {
     const int n = pixcHttpsRead(stream, buf, sizeof(buf));
-    if (n < 0) { ok = false; failMsg = "read"; break; }
+    if (n < 0) { ok = false; failMsg = pixc::ota_fail::kRead; break; }
     if (n == 0) break;                              // end of body, clean or otherwise
-    if (Update.write(buf, n) != (size_t)n) { ok = false; failMsg = "flash write"; break; }
+    if (Update.write(buf, n) != (size_t)n) { ok = false; failMsg = pixc::ota_fail::kFlashWrite; break; }
     mbedtls_sha256_update(&sha, buf, n);
     written += n;
     if (!desc.found()) {
@@ -386,7 +388,7 @@ void doOta(const Job& j) {
 
   // A connection cut mid-image ends the loop exactly like a clean finish. The SHA-256 below would
   // catch it anyway, but "stalled" is a far more useful thing to put in front of support.
-  if (ok && !pixcHttpsComplete(stream)) { ok = false; failMsg = "stalled"; }
+  if (ok && !pixcHttpsComplete(stream)) { ok = false; failMsg = pixc::ota_fail::kStalled; }
   pixcHttpsClose(stream);
 
   uint8_t digest[32];
@@ -398,10 +400,10 @@ void doOta(const Job& j) {
   if (ok) {
     if (strlen(j.sha256) != 64) {
       ok = false;
-      failMsg = "no sha256 in command";
+      failMsg = pixc::ota_fail::kNoDigest;
     } else {
       char got[65]; hex32(digest, got);
-      if (strcasecmp(j.sha256, got) != 0) { ok = false; failMsg = "sha256 mismatch"; }
+      if (strcasecmp(j.sha256, got) != 0) { ok = false; failMsg = pixc::ota_fail::kShaMismatch; }
     }
   }
 
@@ -479,7 +481,10 @@ class PixcConnectBlink : public Usermod {
     unsigned long _start = 0;
     unsigned long _lastState = 0;
     unsigned long _lastHealth = 0;
-    unsigned long _lastPower = 0;
+    // End of the span the last power sample covered. 0 is boot: the first sample covers the time
+    // since power-on. Advanced only by publishPower() (pixc::powerSampleSeconds), never reset on a
+    // reconnect, so the reported seconds add up to the time the light has been running.
+    uint32_t _lastPower = 0;
     bool _statePending = false;      // set by onStateChange, drained in loop()
     // Last seen realtimeMode, so a stream starting or stopping publishes immediately instead of
     // waiting for the 5 s timer. WLED does not call onStateChange for realtime lock: the segment
@@ -587,9 +592,11 @@ class PixcConnectBlink : public Usermod {
       return v;
     }
 
-    static constexpr unsigned long kStateIntervalMs  = 5000;
-    static constexpr unsigned long kHealthIntervalMs = 30000;
-    static constexpr unsigned long kPowerIntervalMs  = 30000;
+    // Report cadence (state 5 s, health 30 s, power 60 s): pixc_logic.h, where the host tests
+    // check it.
+    static constexpr unsigned long kStateIntervalMs  = pixc::kStateIntervalMs;
+    static constexpr unsigned long kHealthIntervalMs = pixc::kHealthIntervalMs;
+    static constexpr unsigned long kPowerIntervalMs  = pixc::kPowerIntervalMs;
     // Provisioning retry: 5 s doubling to 5 min, jittered (pixc::backoffWithJitter).
     static constexpr uint32_t kProvisionBaseMs = 5000;
     static constexpr uint32_t kProvisionMaxMs = 300000;
@@ -627,10 +634,16 @@ class PixcConnectBlink : public Usermod {
     // hardcoded 5.0 made reported power wrong by up to 4.8x. The server multiplies by
     // the voltage implied by led_chip, so a wrong voltage is a config change instead of
     // a fleet reflash.
-    void publishPower() {
+    //
+    // The payload carries `interval_s`, the seconds this sample stands for, measured from the last
+    // one (pixc::powerSampleSeconds): the server multiplies each sample by it, so a reconnect that
+    // sends a sample early says so instead of claiming a full interval (audit M1). A span too short
+    // for the server's 5 s floor is not sent; it rolls into the next sample.
+    void publishPower(unsigned long now) {
+      const uint32_t secs = pixc::powerSampleSeconds(now, _lastPower);
+      if (secs == 0) return;
       char buf[96];
-      snprintf(buf, sizeof(buf), "{\"amps\":%.3f,\"estimated\":true}",
-               BusManager::currentMilliamps() / 1000.0f);
+      pixc::formatPowerPayload(buf, sizeof(buf), BusManager::currentMilliamps() / 1000.0f, secs);
       publishKind("power", buf);
     }
 
@@ -710,19 +723,33 @@ class PixcConnectBlink : public Usermod {
       }
     }
 
+    // Wi-Fi, heap and uptime every 30 s. The SSID is escaped (audit C2) and the buffer holds the
+    // longest report there can be (pixc::kHealthPayloadMax, audit L7). The heap is internal RAM:
+    // total free, the largest free block and the low-water mark since boot, because TLS needs one
+    // large contiguous block and total free alone cannot show fragmentation (audit L10). Also the
+    // inbound MQTT events dropped since boot (audit L8). The backend stores the fields it knows and
+    // ignores the rest, so the new ones are safe to send before it reads them.
     void publishHealth() {
-      char buf[320];
-      // Escaped: an SSID is 32 arbitrary bytes, and a `"` or `\` in one made this invalid JSON, so
-      // the backend dropped the whole health message (audit C2). 32 bytes escape to at most 192.
-      char ssid[200];
-      pixc::jsonEscape(WiFi.SSID().c_str(), ssid, sizeof(ssid));
-      String ip = WiFi.localIP().toString();
-      int signal = constrain(2 * (WiFi.RSSI() + 100), 0, 100);
-      snprintf(buf, sizeof(buf),
-        "{\"rssi\":%d,\"signal\":%d,\"ssid\":\"%s\",\"ip\":\"%s\",\"free_heap\":%u,\"uptime\":%lu,\"fw_version\":\"%s\"}",
-        (int)WiFi.RSSI(), signal, ssid, ip.c_str(),
-        (unsigned)ESP.getFreeHeap(),
-        (unsigned long)(millis() / 1000), fwVersion());
+      char buf[pixc::kHealthPayloadMax];
+      const String ssid = WiFi.SSID();
+      const String ip = WiFi.localIP().toString();
+      const int rssi = WiFi.RSSI();
+      pixc::Health h;
+      h.rssi = rssi;
+      h.signal = constrain(2 * (rssi + 100), 0, 100);
+      h.ssid = ssid.c_str();
+      h.ip = ip.c_str();
+      h.freeHeap = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+      h.largestBlock = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+      h.minFreeHeap = heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL);
+      h.uptimeS = millis() / 1000;
+      h.fwVersion = fwVersion();
+#ifdef PIXC_MQTT_ESP_IDF
+      h.mqttDropped = mqtt ? mqtt->dropped() : 0;
+#else
+      h.mqttDropped = 0;
+#endif
+      pixc::formatHealthPayload(buf, sizeof(buf), h);
       publishKind("health", buf);
     }
 
@@ -1095,7 +1122,7 @@ class PixcConnectBlink : public Usermod {
 
   public:
     void setup() override {
-      // Five short power-ups in a row are the no-app, no-cloud factory reset (wled00/pixc_device).
+      // Five 1.5-6 s power-ons in a row, then one more: the offline factory reset (pixc::ResetGesture).
       pixcBootCounterOnBoot();
       // The anti-rollback floor: read here, raised to this image's security version only once the
       // image is confirmed (raiseSecurityFloor()) - raising it while on probation would leave a
@@ -1422,7 +1449,7 @@ class PixcConnectBlink : public Usermod {
 
     void loop() override {
       const unsigned long now = millis();
-      pixcDeviceLoop();   // clears the power-up counter at 10 s; runs a pending factory reset
+      pixcDeviceLoop();   // the power-cycle gesture's 1.5 s and 6 s marks; runs a pending factory reset
 #ifdef PIXC_LAN_AUTH
       pixcLanLoop();      // applies a pairing validated by /json/pixc/pair
 #endif
@@ -1448,10 +1475,9 @@ class PixcConnectBlink : public Usermod {
         _announced = true;
         publishAnnounce();
         publishState();
-        publishPower();
+        publishPower(now);   // covers the time since the last sample (or boot), not a fresh 60 s
         _lastState = now;
         _lastHealth = now;
-        _lastPower = now;
       }
       // A bus-width change has finished re-initialising. Say so.
       //
@@ -1486,18 +1512,15 @@ class PixcConnectBlink : public Usermod {
         _lastState = now;
         publishState();
       }
-      if (now - _lastState >= kStateIntervalMs) {
+      if (pixc::reportDue(now, _lastState, kStateIntervalMs)) {
         _lastState = now;
         publishState();
       }
-      if (now - _lastHealth >= kHealthIntervalMs) {
+      if (pixc::reportDue(now, _lastHealth, kHealthIntervalMs)) {
         _lastHealth = now;
         publishHealth();
       }
-      if (now - _lastPower >= kPowerIntervalMs) {
-        _lastPower = now;
-        publishPower();
-      }
+      if (pixc::reportDue(now, _lastPower, kPowerIntervalMs)) publishPower(now);
     }
 
     // WLED fires this on every state change, from led.cpp. Only a flag is set: this
