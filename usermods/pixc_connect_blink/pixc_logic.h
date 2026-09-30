@@ -490,9 +490,10 @@ constexpr const char* kShaMismatch   = "sha256 mismatch";             // OTA_COR
 constexpr const char* kSigDownload   = "verify file: connect or read failed";   // OTA_DOWNLOAD_FAILED
 constexpr const char* kNoSigUrl      = "no verify file url";          // OTA_FAILED (a server fault)
 constexpr const char* kSigMismatch   = "signature mismatch";          // OTA_SIGNATURE_INVALID
-// A build that cannot verify anything. OTA_FAILED today; the backend has no code for it yet.
-constexpr const char* kNoSigningKey  = "no signing key in firmware";
-constexpr const char* kBadSigningKey = "bad signing key";
+// A build that cannot verify anything: OTA_UNSIGNED_BUILD, so a fleet that cannot update at all is
+// told apart from one bad download (backend audit M4, 2026-09-30).
+constexpr const char* kNoSigningKey  = "no signing key in firmware";  // OTA_UNSIGNED_BUILD
+constexpr const char* kBadSigningKey = "bad signing key";             // OTA_UNSIGNED_BUILD
 // Formatted: "http %d" and "tls/connect" (OTA_DOWNLOAD_FAILED), "finalize %u" (OTA_FAILED).
 }  // namespace ota_fail
 
@@ -526,6 +527,9 @@ inline const char* otaErrorCode(const char* raw) {
   detail::paddedWords(raw, e, sizeof(e));
   if (e[0] == 0 || strcmp(e, " ") == 0) return nullptr;
   using detail::hasWord;
+  // First, as in the backend's OtaErrorCode.of and the mqtt ingest: "signing" is not "sig", so the
+  // order is not load-bearing, but first reads clearest.
+  if (hasWord(e, "signing key")) return "OTA_UNSIGNED_BUILD";
   if (hasWord(e, "signature") || hasWord(e, "sig")) return "OTA_SIGNATURE_INVALID";
   if (hasWord(e, "sha256") || hasWord(e, "checksum")) return "OTA_CORRUPT_DOWNLOAD";
   if (hasWord(e, "downgrade") || hasWord(e, "older")) return "OTA_DOWNGRADE_REFUSED";

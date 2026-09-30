@@ -574,8 +574,8 @@ static void testOtaFailureCodes() {
   otaCode(f::kFlashWrite, "OTA_FLASH_FAILED");
   otaCode(f::kNoDigest, "OTA_FAILED");
   otaCode(f::kShaMismatch, "OTA_CORRUPT_DOWNLOAD");
-  otaCode(f::kNoSigningKey, "OTA_FAILED");        // no dedicated backend code yet
-  otaCode(f::kBadSigningKey, "OTA_FAILED");
+  otaCode(f::kNoSigningKey, "OTA_UNSIGNED_BUILD");
+  otaCode(f::kBadSigningKey, "OTA_UNSIGNED_BUILD");
   otaCode("http 404", "OTA_DOWNLOAD_FAILED");
   otaCode("tls/connect", "OTA_DOWNLOAD_FAILED");
   otaCode("finalize 9", "OTA_FAILED");
