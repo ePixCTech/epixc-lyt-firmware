@@ -14,7 +14,7 @@ void handleSettingsSet(AsyncWebServerRequest *request, byte subPage)
   }
 
   //0: menu 1: wifi 2: leds 3: ui 4: sync 5: time 6: sec 7: DMX 8: usermods 9: N/A 10: 2D
-  if (subPage < 1 || subPage > 10 || !correctPIN) return;
+  if (subPage < 1 || subPage > 10 || !PIXC_UNLOCKED(request)) return;
 
   //WIFI SETTINGS
   if (subPage == SUBPAGE_WIFI)
@@ -628,7 +628,19 @@ void handleSettingsSet(AsyncWebServerRequest *request, byte subPage)
     if (request->hasArg(F("RS"))) //complete factory reset
     {
       WLED_FS.format();
-      serveMessage(request, 200, F("All Settings erased."), F("Connect to WLED-AP to setup again"),255);
+      // Not in any ePixC image: the settings pages need WLED_ENABLE_HTML, which no ePixC env sets.
+      // If a bench build turns the web UI on, this is shown at the exact moment the config is
+      // erased, so it must not name a hotspot that does not exist. Since pairing v2
+      // (PIXC_LAN_AUTH) the hotspot is "ePixC-XXXX" from the MAC, with the password on the
+      // light's label (initAP() in wled.cpp); it is not DEFAULT_AP_SSID ("ePixC-AP", the name
+      // until 2026-09-25).
+#ifdef PIXC_LAN_AUTH
+      serveMessage(request, 200, F("All settings are erased."),
+                   F("Connect to the setup Wi-Fi on the label of the light, then set it up again."), 255);
+#else
+      serveMessage(request, 200, F("All Settings erased."),
+                   String(F("Connect to ")) + DEFAULT_AP_SSID + F(" to setup again"), 255);
+#endif
       doReboot = true; // may reboot immediately on dual-core system (race condition) which is desireable in this case
     }
 

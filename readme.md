@@ -1,3 +1,63 @@
+# ePixC LYT firmware — a modified version of WLED
+
+**This is a Derivative Work of WLED and it has been modified.** EUPL v1.2 Article 5 requires that
+notice to be prominent, and to carry the date, so it is the first thing in this file rather than a
+line somewhere below.
+
+| | |
+|---|---|
+| **Upstream** | [WLED](https://github.com/wled-dev/WLED) by Christian Schwinne and contributors |
+| **Licence** | EUPL v1.2 or later — see [`LICENSE`](LICENSE). ePixC's changes are under the same licence, as Article 5 requires |
+| **Modified by** | ePixC (ePixCTech), from 2026-04 onward; this notice added 2026-08-27 |
+
+## What ePixC changed
+
+ePixC's code is in `usermods/pixc_connect_blink/`, in the `wled00/pixc_*` files and in the
+`PixC_V1` build environment. Where ePixC changed an upstream file, the change is mostly behind a
+`PIXC_` flag (usually `PIXC_LAN_AUTH`), so the diff against upstream stays readable. Updated
+2026-10-20; until then this list named only the usermod and the build environment.
+
+- **`pixc_connect_blink`**: the usermod that talks to the ePixC cloud. The light fetches its own
+  broker login over HTTPS (provisioning), reports state, health and hourly energy over MQTT, and
+  takes OTA updates with an ECDSA P-256 signature check that refuses any image it cannot verify.
+  It downloads updates only from `https://api.epixc.in/firmware/`.
+- **`pixc_https`**: an ESP-IDF `esp_http_client` wrapper with the ISRG roots pinned (X1, X2,
+  Root YE and Root YR) and no plaintext fallback, because the framework WLED pins has no
+  `WiFiClientSecure`.
+- **`wled00/pixc_lan*`, `wled00/pixc_device*`**: pairing and the signed LAN API. The setup
+  hotspot is `ePixC-XXXX` with a password for each unit from factory NVS (printed on the label).
+  `/json/pixc/pair` answers on the hotspot only, every other `/json` request must be signed with
+  the light's LAN key, and DDP is taken only from an address that holds a realtime lease.
+- **`wled00/pixc_mqtt_client*`**: an esp-mqtt client with AsyncMqttClient's interface, for MQTT
+  over WebSocket on 443 (`wss://api.epixc.in/mqtt`) or MQTT over TLS on 8883.
+- **Upstream files ePixC changed** (`wled.cpp`, `wled_server.cpp`, `json.cpp`, `mqtt.cpp`,
+  `presets.cpp`, `udp.cpp`, `e131.cpp`, `cfg.cpp`, `util.cpp` and a few more): no CORS, no `/win`,
+  no web UI, the UDP control inputs closed, and LAN, MQTT and preset writes filtered.
+- **`tools/factory_provision.py`**: writes the factory NVS image with the hotspot password and
+  prints the label.
+- **`test/pixc/`**: host tests of the ePixC logic (`test/pixc/run.sh`).
+- **`platformio_override.ini`**: the `PixC_V1` target for the ESP32-S3 board ePixC ships, with
+  WLED's web UI, Alexa, DMX input, E1.31 and Art-Net, ESP-NOW, the GIF *Image* effect and other
+  unused features turned off.
+- **`.github/workflows/epixc-firmware.yaml`**: ePixC's own CI. It runs on an `lyt-v*` tag or by
+  hand. Upstream's workflows stay in place and are manual-only or limited to upstream's repository.
+
+Upstream's own README follows, unchanged. It describes WLED, not the ePixC build: several features
+it lists (Alexa, the web UI, DMX, E1.31 and Art-Net, ESP-NOW sync) are off in `PixC_V1`.
+
+## Why this repository is public
+
+WLED is under the EUPL, which is a copyleft licence: Article 1 counts selling a device as
+Distribution, Article 5 requires a Derivative Work to go out under the same licence, and Article 3
+requires the source of a distributed binary to be available. So this repository is public because
+that is what shipping a controller with this firmware on it obliges — not as a courtesy, and not
+optionally.
+
+Nothing else in the ePixC stack is affected. The app, the backend, the website and the cloud
+services are separate works that link none of this code.
+
+---
+
 <p align="center">
   <img src="/images/wled_logo_akemi.png">
   <a href="https://github.com/wled-dev/WLED/releases"><img src="https://img.shields.io/github/release/wled-dev/WLED.svg?style=flat-square"></a>

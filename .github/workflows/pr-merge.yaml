@@ -1,8 +1,8 @@
     name: Notify Discord on PR Merge
     on:
+      # ePixC, 2026-10-20: manual only. Founder: "I dont want to run github actions all times".
+      # Upstream ran this on every merged pull request (Discord notice).
       workflow_dispatch:
-      pull_request_target:
-        types: [closed]
 
     jobs:
       notify:

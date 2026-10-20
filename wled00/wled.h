@@ -155,7 +155,16 @@
 
 #include "src/dependencies/e131/ESPAsyncE131.h"
 #ifndef WLED_DISABLE_MQTT
-#include <AsyncMqttClient.h>
+  #ifdef PIXC_MQTT_ESP_IDF
+    // AsyncMqttClient cannot do TLS on the ESP32 — `setSecure()` is compiled out unless
+    // ASYNC_TCP_SSL_ENABLED, and AsyncTCP for this chip has no SSL to enable. ePixC's broker is
+    // TLS-only. `PixcMqttClient` presents the same surface over ESP-IDF's esp-mqtt, so everything
+    // below this line is unchanged and there is still exactly one connection.
+    #include "pixc_mqtt_client.h"
+    using AsyncMqttClient = PixcMqttClient;
+  #else
+    #include <AsyncMqttClient.h>
+  #endif
 #endif
 
 #define ARDUINOJSON_DECODE_UNICODE 0
@@ -218,6 +227,10 @@ using PSRAMDynamicJsonDocument = BasicJsonDocument<PSRAM_Allocator>;
 
 #ifndef WLED_AP_SSID
   #define WLED_AP_SSID DEFAULT_AP_SSID
+#endif
+
+#ifndef WLED_AP_BASE
+  #define WLED_AP_BASE DEFAULT_AP_BASE
 #endif
 
 #ifndef WLED_AP_PASS
@@ -353,9 +366,9 @@ typedef class WiFiOptions {
     }
 } __attribute__ ((aligned(1), packed)) wifi_options_t;
   #ifdef ARDUINO_ARCH_ESP32
-WLED_GLOBAL wifi_options_t wifiOpt _INIT_N(({0, 1, false, AP_BEHAVIOR_BOOT_NO_CONN, true, false}));
+WLED_GLOBAL wifi_options_t wifiOpt _INIT_N(({0, 1, false, AP_BEHAVIOR_ALWAYS, true, false}));
   #else
-WLED_GLOBAL wifi_options_t wifiOpt _INIT_N(({0, 1, false, AP_BEHAVIOR_BOOT_NO_CONN, false, false}));
+WLED_GLOBAL wifi_options_t wifiOpt _INIT_N(({0, 1, false, AP_BEHAVIOR_ALWAYS, false, false}));
   #endif
 #define selectedWiFi wifiOpt.selectedWiFi
 #define apChannel    wifiOpt.apChannel
@@ -367,7 +380,7 @@ WLED_GLOBAL wifi_options_t wifiOpt _INIT_N(({0, 1, false, AP_BEHAVIOR_BOOT_NO_CO
 WLED_GLOBAL int8_t selectedWiFi  _INIT(0);
 WLED_GLOBAL byte apChannel       _INIT(6);                        // 2.4GHz WiFi AP channel (1-13)
 WLED_GLOBAL byte apHide          _INIT(0);                        // hidden AP SSID
-WLED_GLOBAL byte apBehavior      _INIT(AP_BEHAVIOR_BOOT_NO_CONN); // access point opens when no connection after boot by default
+WLED_GLOBAL byte apBehavior      _INIT(AP_BEHAVIOR_ALWAYS); // access point opens when no connection after boot by default
   #ifdef ARDUINO_ARCH_ESP32
 WLED_GLOBAL bool noWifiSleep _INIT(true);                         // disabling modem sleep modes will increase heat output and power usage, but may help with connection issues
   #else
@@ -433,8 +446,15 @@ WLED_GLOBAL byte cacheInvalidate       _INIT(0);       // used to invalidate bro
 
 // Sync CONFIG
 WLED_GLOBAL NodesMap Nodes;
+#ifdef PIXC_LAN_AUTH
+// ePixC: no WLED node discovery. The broadcast announces name, IP and build to the whole LAN, and the
+// supplemental port it uses (udpPort2) is not opened at all with the LAN gate (wled.cpp).
+WLED_GLOBAL bool nodeListEnabled _INIT(false);
+WLED_GLOBAL bool nodeBroadcastEnabled _INIT(false);
+#else
 WLED_GLOBAL bool nodeListEnabled _INIT(true);
 WLED_GLOBAL bool nodeBroadcastEnabled _INIT(true);
+#endif
 
 #ifndef WLED_DISABLE_INFRARED
 WLED_GLOBAL int8_t irPin        _INIT(IRPIN);
@@ -502,7 +522,7 @@ WLED_GLOBAL bool mqttEnabled _INIT(false);
 WLED_GLOBAL char mqttStatusTopic[MQTT_MAX_TOPIC_LEN + 8] _INIT("");         // this must be global because of async handlers
 WLED_GLOBAL char mqttDeviceTopic[MQTT_MAX_TOPIC_LEN + 1] _INIT("");         // main MQTT topic (individual per device, default is wled/mac)
 WLED_GLOBAL char mqttGroupTopic[MQTT_MAX_TOPIC_LEN + 1]  _INIT("wled/all"); // second MQTT topic (for example to group devices)
-WLED_GLOBAL char mqttServer[MQTT_MAX_SERVER_LEN + 1]     _INIT("");         // both domains and IPs should work (no SSL)
+WLED_GLOBAL char mqttServer[MQTT_MAX_SERVER_LEN + 1]     _INIT("");         // domains and IPs both work; PIXC_MQTT_ESP_IDF: 443 = WebSocket over TLS at /mqtt, 8883 = TLS
 WLED_GLOBAL char mqttUser[41] _INIT("");                   // optional: username for MQTT auth
 WLED_GLOBAL char mqttPass[65] _INIT("");                   // optional: password for MQTT auth
 WLED_GLOBAL char mqttClientID[41] _INIT("");               // override the client ID
@@ -583,8 +603,22 @@ WLED_GLOBAL bool aOtaEnabled    _INIT(false);     // ArduinoOTA allows easy upda
 #endif
 WLED_GLOBAL bool otaSameSubnet  _INIT(true);      // prevent OTA updates from other subnets (e.g. internet) if no PIN is set
 WLED_GLOBAL char settingsPIN[5] _INIT(WLED_PIN);  // PIN for settings pages
+#ifdef PIXC_LAN_AUTH
+// LOCKED FROM BOOT. Upstream starts unlocked when no PIN is set, which makes a factory-fresh unit
+// - the one state every sold device passes through - the least protected it will ever be. Since
+// pairing v2 the LAN gate is the signed API (`pixcAuthorise()`, pixc_lan.cpp) and there is no PIN
+// or pairing window: an unkeyed light answers only /json/id and the hotspot-only /json/pixc/pair.
+WLED_GLOBAL bool correctPIN     _INIT(false);
+#else
 WLED_GLOBAL bool correctPIN     _INIT(!strlen(settingsPIN));
+#endif
 WLED_GLOBAL unsigned long lastEditTime _INIT(0);
+#ifdef PIXC_LAN_AUTH
+// Pairing v2 keys, written at pairing (/json/pixc/pair) and kept in wsec.json. Never returned by
+// any interface. The LAN key is also rotated by the cloud (um.PixcConnect.settingsPin).
+WLED_GLOBAL char pixcLanKey[33]    _INIT("");   // K_lan, 32 lowercase hex: signs LAN requests/replies
+WLED_GLOBAL char pixcDeviceKey[65] _INIT("");   // K_dev, 64 lowercase hex: fetches the broker login
+#endif
 
 WLED_GLOBAL uint16_t userVar0 _INIT(0), userVar1 _INIT(0); //available for use in usermod
 
@@ -670,7 +704,14 @@ WLED_GLOBAL unsigned long notificationSentTime _INIT(0);
 WLED_GLOBAL byte notificationSentCallMode _INIT(CALL_MODE_INIT);
 WLED_GLOBAL uint8_t notificationCount _INIT(0);
 WLED_GLOBAL uint8_t syncGroups    _INIT(0x01);                // sync send groups this instance syncs to (bit mapped)
+#ifdef PIXC_LAN_AUTH
+// ePixC: WLED's UDP sync notifier (port 21324) carries no credential, so a receive group by default
+// would let any LAN host set on/bri/colour/effect past the PIN gate (audit S2). Off unless the owner
+// opts in through the PIN-gated /json/cfg (if.sync.recv.grp). No part of ePixC sends these packets.
+WLED_GLOBAL uint8_t receiveGroups _INIT(0x00);
+#else
 WLED_GLOBAL uint8_t receiveGroups _INIT(0x01);                // sync receive groups this instance belongs to (bit mapped)
+#endif
 #ifdef WLED_SAVE_RAM
 // this will save us 8 bytes of RAM while increasing code by ~400 bytes
 typedef class Receive {
@@ -1035,7 +1076,7 @@ WLED_GLOBAL volatile uint8_t jsonBufferLock _INIT(0);
       apSSID, \
       sizeof(apSSID)-1, \
       PSTR("%s-%s"), \
-      WLED_BRAND, \
+      WLED_AP_BASE, \
       escapedMac.c_str()+6 \
     ); \
   } while(0)

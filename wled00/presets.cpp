@@ -1,4 +1,7 @@
 #include "wled.h"
+#ifdef PIXC_LAN_AUTH
+#include "pixc_lan.h"
+#endif
 
 /*
  * Methods to handle saving and loading presets to/from the filesystem
@@ -183,6 +186,11 @@ void handlePresets()
   // only reset errorflag if previous error was preset-related
   if ((errorFlag == ERR_NONE) || (errorFlag == ERR_FS_PLOAD)) errorFlag = presetErrFlag;
 
+#ifdef PIXC_LAN_AUTH
+  // ePixC (security audit 2026-10-20): a stored preset runs no "win" (WLED's HTTP-style API) and
+  // cannot reboot the light, so a boot preset cannot be a reboot loop (pixc_lan_logic.h).
+  pixcSanitizeState(fdo, true);
+#endif
   //HTTP API commands
   const char* httpwin = fdo["win"];
   if (httpwin) {

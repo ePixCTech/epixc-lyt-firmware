@@ -3396,7 +3396,7 @@ function showVersionUpgradePrompt(info, oldVersion, newVersion) {
 		<p style="color:var(--c-f);">${description}</p>
 		<p style="color:var(--c-f);">${question}</p>
 		<p style="color:var(--c-f);font-size:0.9em;">
-			<a href="https://kno.wled.ge/about/privacy-policy/" target="_blank" style="color:var(--c-6);">Learn more about what data is collected and why</a>
+			<a href="https://epixc.in/about/privacy-policy/" target="_blank" style="color:var(--c-6);">Learn more about what data is collected and why</a>
 		</p>
 		<div style="margin-top:15px;margin-bottom:15px;">
 			<label style="display:flex;align-items:center;gap:8px;color:var(--c-f);cursor:pointer;">

@@ -1,12 +1,9 @@
 name: Usermod CI
 
 on:
-  pull_request:
-    paths:
-      - usermods/**
-  push:
-    paths:
-      - usermods/**
+  # ePixC, 2026-10-20: manual only. Founder: "I dont want to run github actions all times".
+  # Upstream ran this on every push and pull request touching usermods/**.
+  workflow_dispatch:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true

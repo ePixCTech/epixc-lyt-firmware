@@ -1,0 +1,125 @@
+{
+  "scheme": "pairing v2 LAN request signing (vault: 05-Firmware/Pairing and LAN security v2)",
+  "hmac": "HMAC-SHA256, key = the 16 bytes the 32 hex characters of the LAN key encode",
+  "requests": [
+    {
+      "name": "GET with no body hashes the empty string",
+      "lan_key": "000102030405060708090a0b0c0d0e0f",
+      "method": "GET",
+      "path_and_query": "/json/state",
+      "boot_id": "5eed1e55",
+      "ctr": 1,
+      "client_id": "8b1f2c3d4e5f6a7b",
+      "body_utf8": "",
+      "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "message": "req\nGET\n/json/state\n5eed1e55\n1\n8b1f2c3d4e5f6a7b\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "mac_b64": "C1SCV/RrXLyvz1dmq0nUAJYiysrkbCoOTiM1r90/jyk=",
+      "header": "v2 8b1f2c3d4e5f6a7b:5eed1e55:1:C1SCV/RrXLyvz1dmq0nUAJYiysrkbCoOTiM1r90/jyk="
+    },
+    {
+      "name": "POST a state change",
+      "lan_key": "000102030405060708090a0b0c0d0e0f",
+      "method": "POST",
+      "path_and_query": "/json/state",
+      "boot_id": "5eed1e55",
+      "ctr": 2,
+      "client_id": "8b1f2c3d4e5f6a7b",
+      "body_utf8": "{\"on\":true,\"bri\":128}",
+      "body_sha256": "334bd6379b9fd8e264efedcb3eb054afbc107d4b247572fd00d60709d85ff4f3",
+      "message": "req\nPOST\n/json/state\n5eed1e55\n2\n8b1f2c3d4e5f6a7b\n334bd6379b9fd8e264efedcb3eb054afbc107d4b247572fd00d60709d85ff4f3",
+      "mac_b64": "um3vMWWAFSEz5UuHP/NgE6OgofL4w7CF2FZ87hEjL4g=",
+      "header": "v2 8b1f2c3d4e5f6a7b:5eed1e55:2:um3vMWWAFSEz5UuHP/NgE6OgofL4w7CF2FZ87hEjL4g="
+    },
+    {
+      "name": "the query string is signed as sent",
+      "lan_key": "000102030405060708090a0b0c0d0e0f",
+      "method": "GET",
+      "path_and_query": "/json/state?v=1",
+      "boot_id": "5eed1e55",
+      "ctr": 3,
+      "client_id": "8b1f2c3d4e5f6a7b",
+      "body_utf8": "",
+      "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "message": "req\nGET\n/json/state?v=1\n5eed1e55\n3\n8b1f2c3d4e5f6a7b\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "mac_b64": "oF9NzKyTod5xYsdnswDkJdU9oNY1k1oD2S5EGvfNISA=",
+      "header": "v2 8b1f2c3d4e5f6a7b:5eed1e55:3:oF9NzKyTod5xYsdnswDkJdU9oNY1k1oD2S5EGvfNISA="
+    },
+    {
+      "name": "a realtime lease",
+      "lan_key": "000102030405060708090a0b0c0d0e0f",
+      "method": "POST",
+      "path_and_query": "/json",
+      "boot_id": "5eed1e55",
+      "ctr": 4,
+      "client_id": "8b1f2c3d4e5f6a7b",
+      "body_utf8": "{\"pixc\":{\"rt_lease\":60}}",
+      "body_sha256": "bde5d1af89ecab534ab2edaac57040622dd4d495c08a5c7634c623ddc2d50e40",
+      "message": "req\nPOST\n/json\n5eed1e55\n4\n8b1f2c3d4e5f6a7b\nbde5d1af89ecab534ab2edaac57040622dd4d495c08a5c7634c623ddc2d50e40",
+      "mac_b64": "EPXNMVWxf+GIXBj+skaXjQeLPerz6BUqEAG0O22Y/ms=",
+      "header": "v2 8b1f2c3d4e5f6a7b:5eed1e55:4:EPXNMVWxf+GIXBj+skaXjQeLPerz6BUqEAG0O22Y/ms="
+    },
+    {
+      "name": "a UTF-8 body is hashed as its bytes",
+      "lan_key": "000102030405060708090a0b0c0d0e0f",
+      "method": "POST",
+      "path_and_query": "/json/state",
+      "boot_id": "5eed1e55",
+      "ctr": 5,
+      "client_id": "8b1f2c3d4e5f6a7b",
+      "body_utf8": "{\"seg\":[{\"n\":\"வரவேற்பறை\"}]}",
+      "body_sha256": "b5bfa3f239c51da3a2687e2b3357b1aa16ec0fc6ef652d91b2e440e92afd5585",
+      "message": "req\nPOST\n/json/state\n5eed1e55\n5\n8b1f2c3d4e5f6a7b\nb5bfa3f239c51da3a2687e2b3357b1aa16ec0fc6ef652d91b2e440e92afd5585",
+      "mac_b64": "yjC67ObfKsMU942h1fQwKRG0QYUW1/5pPrsFlz+r5go=",
+      "header": "v2 8b1f2c3d4e5f6a7b:5eed1e55:5:yjC67ObfKsMU942h1fQwKRG0QYUW1/5pPrsFlz+r5go="
+    },
+    {
+      "name": "the same request under another key signs differently",
+      "lan_key": "f0e0d0c0b0a090807060504030201000",
+      "method": "POST",
+      "path_and_query": "/json/state",
+      "boot_id": "5eed1e55",
+      "ctr": 2,
+      "client_id": "8b1f2c3d4e5f6a7b",
+      "body_utf8": "{\"on\":true,\"bri\":128}",
+      "body_sha256": "334bd6379b9fd8e264efedcb3eb054afbc107d4b247572fd00d60709d85ff4f3",
+      "message": "req\nPOST\n/json/state\n5eed1e55\n2\n8b1f2c3d4e5f6a7b\n334bd6379b9fd8e264efedcb3eb054afbc107d4b247572fd00d60709d85ff4f3",
+      "mac_b64": "LcqwRdUnJ8qMPpH+B6wMuyC/Jd+n8kdc3iFjLLU9EWA=",
+      "header": "v2 8b1f2c3d4e5f6a7b:5eed1e55:2:LcqwRdUnJ8qMPpH+B6wMuyC/Jd+n8kdc3iFjLLU9EWA=",
+      "note": "compare with 'POST a state change': a light holding LAN_KEY refuses this"
+    }
+  ],
+  "replies": [
+    {
+      "name": "a state reply",
+      "lan_key": "000102030405060708090a0b0c0d0e0f",
+      "boot_id": "5eed1e55",
+      "ctr": 2,
+      "client_id": "8b1f2c3d4e5f6a7b",
+      "body_utf8": "{\"success\":true}",
+      "body_sha256": "c955e57777ec0d73639dca6748560d00aa5eb8e12f13ebb2ed9656add3908f97",
+      "message": "resp\n5eed1e55\n2\n8b1f2c3d4e5f6a7b\nc955e57777ec0d73639dca6748560d00aa5eb8e12f13ebb2ed9656add3908f97",
+      "sig_b64": "Cx4jrzXX6RDAIvqayS7T+YSI+DNqFrcdeEgAxyu5jdQ=",
+      "header": "v2 Cx4jrzXX6RDAIvqayS7T+YSI+DNqFrcdeEgAxyu5jdQ="
+    },
+    {
+      "name": "an empty reply hashes the empty string",
+      "lan_key": "000102030405060708090a0b0c0d0e0f",
+      "boot_id": "5eed1e55",
+      "ctr": 1,
+      "client_id": "8b1f2c3d4e5f6a7b",
+      "body_utf8": "",
+      "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "message": "resp\n5eed1e55\n1\n8b1f2c3d4e5f6a7b\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "sig_b64": "9yIYG8uy6w4vqMGL/DapI5RiYx8wEtvVBFDFuGQl4vs=",
+      "header": "v2 9yIYG8uy6w4vqMGL/DapI5RiYx8wEtvVBFDFuGQl4vs="
+    }
+  ],
+  "json_id": {
+    "note": "GET /json/id, unauthenticated: what a client reads before its first request",
+    "example": {
+      "mac": "aabbccddeeff",
+      "boot_id": "5eed1e55",
+      "v": 2
+    }
+  }
+}

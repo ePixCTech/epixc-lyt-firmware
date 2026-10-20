@@ -44,7 +44,15 @@ constexpr size_t  WLED_MAX_USERMOD_PALETTES     = WLED_USERMOD_PALETTE_ID_BASE -
 
 //Defaults
 #define DEFAULT_CLIENT_SSID "Your_Network"
-#define DEFAULT_AP_SSID     WLED_BRAND "-AP"
+// The brand half of the softAP name, kept separate so it is written once. The unique-SSID
+// build in wled.h appends a MAC suffix to this base instead of repeating the name.
+// ePixC builds (PIXC_LAN_AUTH, every ePixC env) do not open a hotspot with DEFAULT_AP_SSID or
+// DEFAULT_AP_PASS: since pairing v2 initAP() in wled.cpp names it "ePixC-XXXX" from the MAC
+// (pixc::hotspotName) and takes the password from factory NVS, which is on the light's label.
+// The two upstream defaults below stay only as the boot value of apSSID/apPass, which initAP()
+// replaces before the hotspot opens.
+#define DEFAULT_AP_BASE     "ePixC"
+#define DEFAULT_AP_SSID     DEFAULT_AP_BASE "-AP"
 #define DEFAULT_AP_PASS     "wled1234"
 #define DEFAULT_OTA_PASS    "wledota"
 #define DEFAULT_MDNS_NAME   "x"

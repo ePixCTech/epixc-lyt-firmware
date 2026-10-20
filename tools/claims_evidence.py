@@ -1,0 +1,384 @@
+#!/usr/bin/env python3
+"""Every row of the vault's Claims Checklist that the firmware settles, and its evidence.
+
+[[44-claims-check-against-code]]. The full reasoning is in `epixc-web/scripts/claims_evidence.py`;
+the short version is that the Claims Checklist went stale four times in a week and never on a day
+anyone edited it, so the state moves into the repositories and the note becomes generated.
+
+**This repository holds the rows that were wrong in the dangerous direction.** The checklist said
+Art-Net, sACN, E1.31, DDP, DMX and Bluetooth were *"none implemented anywhere in the stack"* while
+`e131.begin` and `ddp.begin` ran unconditionally on every shipped unit. A buyer told the controller
+has no unauthenticated LAN listeners cannot make an informed decision about putting it on a shared
+network. That row is pinned here, and it has flipped since: pairing v2 compiled E1.31/Art-Net out
+under `PIXC_LAN_AUTH` and gated DDP behind a lease. The first version of the check read only the
+text, so it went on reporting the old sentence verified after the code had made it false (audit
+M2); the rows now read the preprocessor guard and the build flags as well, and go red if either
+moves.
+
+**The OTA row is why the two-part shape exists at all.** *"Signed updates"* is neither true nor
+false: the device verifies an ECDSA P-256 signature and refuses anything unsigned, and
+`PIXC_OTA_PUBKEY_PEM` is empty so every build refuses every update. A human reading a one-line
+status flipped it the wrong way twice. Two symbols on one row cannot be flipped wholesale — and
+note that the row fails when the *key lands*, which is correct. That is not a regression; it is the
+check insisting the sentence be rewritten on the day the truth changes, which is the one day it has
+never been rewritten before.
+
+    python3 tools/claims_evidence.py          # what CI runs
+    python3 tools/claims_evidence.py --json   # for the vault generator
+
+The engine below is byte-identical in epixc-web, epixc-backend and epixc-firmware. The vault
+generator hashes the region in all three and refuses to render if they differ.
+"""
+
+REPO = "epixc-lyt-firmware"
+
+CLAIMS = [
+    {
+        # This row said the opposite until 2026-09-29, and passed. Its evidence was the regex
+        # `e131\.begin\(`, which kept matching after both calls moved inside `#ifndef PIXC_LAN_AUTH`:
+        # the text was still in the file, just not in any ePixC image. A claim about what a unit
+        # listens on is a claim about the BUILD, so the evidence now reads the preprocessor too
+        # (audit M2). The engine only matches text, so the three items are the build in text form:
+        #   1. no `e131.begin(` whose nearest enclosing conditional is anything but
+        #      `#ifndef PIXC_LAN_AUTH` (one nested inside another block goes red - the safe way);
+        #   2. the guarded call is still there, so (1) is not passing because it moved;
+        #   3. every ePixC env compiles the flag: it is set, not commented out, and no env
+        #      unflags it (PixC_V1_dev and _citest extend PixC_V1).
+        "id": "sacn-e131-artnet-closed",
+        "section": "Protocols",
+        "ticket": "161, D167, audit M2",
+        "row": "**sACN / E1.31 and Art-Net are closed on every ePixC build** — the listener is "
+               "compiled only without `PIXC_LAN_AUTH`, and every shipped env sets it. Ports 5568 "
+               "and 6454 are not opened.",
+        "evidence": [
+            {"file": "wled00/wled.cpp", "must": "absent",
+             "pattern": r"#(?!ifndef PIXC_LAN_AUTH\b)(?:ifdef|ifndef|if|elif|else|endif)\b"
+                        r"(?:(?!#(?:ifdef|ifndef|if|elif|else|endif)\b).)*?e131\.begin\("},
+            {"file": "wled00/wled.cpp", "must": "present",
+             "pattern": r"#ifndef PIXC_LAN_AUTH\b(?:(?!#(?:ifdef|ifndef|if|elif|else|endif)\b).)*?e131\.begin\("},
+            {"file": "platformio_override.ini", "must": "present",
+             "pattern": r"(?<![;#] )-D PIXC_LAN_AUTH\b"},
+            {"file": "platformio_override.ini", "must": "absent",
+             "pattern": r"build_unflags = (?:(?!build_flags|\[env).)*PIXC_LAN_AUTH|-U ?PIXC_LAN_AUTH\b"},
+        ],
+    },
+    {
+        # Was "DDP is listening on every shipped unit, unconditionally". The socket is still open
+        # (ePixC Sync is built on it), but since pairing v2 a packet is drawn only if its source
+        # address holds a lease a signed request granted. Both halves are pinned. The lease trusts
+        # the UDP source address, so a LAN host that spoofs the leaseholder's IP can draw while
+        # the lease lasts: accepted, see the vault (Pairing and LAN security v2, audit L1).
+        "id": "ddp-lease-gated",
+        "section": "Protocols",
+        "ticket": "161, D167, audit M2",
+        "row": "**DDP (port 4048) is open, and its pixels are taken only from an address holding a "
+               "realtime lease** granted by a signed request; any other sender is dropped. The "
+               "lease is by source address, so it does not stop a host that spoofs the "
+               "leaseholder's IP.",
+        "evidence": [
+            {"file": "wled00/wled.cpp", "must": "present", "pattern": r"ddp\.begin\("},
+            {"file": "wled00/e131.cpp", "must": "present",
+             "pattern": r"#ifdef PIXC_LAN_AUTH\b(?:(?!#(?:ifdef|ifndef|if|elif|else|endif)\b).)*?"
+                        r"if \(!pixcRealtimeAllowed\("},
+            {"file": "platformio_override.ini", "must": "present",
+             "pattern": r"(?<![;#] )-D PIXC_LAN_AUTH\b"},
+        ],
+    },
+    {
+        # Pinned because the FAQ's security answer depends on it, in another repository.
+        #
+        # Until 2026-09-05 that answer told a customer to "treat a controller as an unauthenticated
+        # device". Gating the LAN API made the sentence false, and NOTHING would have noticed - the
+        # firmware has no idea the website exists. It was caught by a person reading, which is the
+        # weakest mechanism this project has. See Writing Checks, rule 3.
+        #
+        # A claim row is the one thing that catches this class automatically: the Alexa row went red
+        # by itself the moment `va.put("alexa", true)` disappeared (D296), because it rested on a
+        # symbol rather than on somebody's memory. So the new disclosure gets the same treatment.
+        #
+        # Both directions, deliberately. `pixcLanAuthorised` present says the gate exists; the
+        # `-D PIXC_LAN_AUTH` flag present says it is COMPILED, which is the half D297 proved a green
+        # build says nothing about. Either one alone can be true while the device is wide open.
+        "id": "lan-api-needs-the-device-pin",
+        "section": "Protocols",
+        "ticket": "33, D295, D297, D300, pairing v2",
+        # Pairing v2 (2026-09-25; vault: 05-Firmware/Pairing and LAN security v2). The id is kept
+        # so the vault's Claims Checklist row does not lose its history; the claim is stronger.
+        "row": "**The controller's own JSON API refuses an unsigned caller** — every `/json` "
+               "request except `/json/id` and the hotspot-only `/json/pixc/pair` must be signed "
+               "with the light's LAN key, and the key itself is never sent. The legacy `/win` "
+               "query API is gone. DDP pixels are taken only from an address a signed request "
+               "leased them to.",
+        "evidence": [
+            {"file": "wled00/pixc_lan.cpp", "must": "present",
+             "pattern": r"bool pixcAuthorise\(AsyncWebServerRequest\* request"},
+            {"file": "wled00/wled_server.cpp", "must": "present", "pattern": r"pixcAuthorise\("},
+            {"file": "wled00/pixc_lan.cpp", "must": "present", "pattern": r"bool pixcRealtimeAllowed\(uint32_t ip\)"},
+            # See the flattening note in the history of this row: a disabled flag must not pass.
+            {"file": "platformio_override.ini", "must": "present",
+             "pattern": r"(?<![;#] )-D PIXC_LAN_AUTH\b"},
+        ],
+    },
+    {
+        # Was "DMX input is compiled in and inactive" until 2026-10-20, and passed after it stopped
+        # being true: its only evidence was upstream's flag in platformio.ini, and the hardening
+        # audit took the flag out of PixC_V1 with build_unflags that day. The id is kept so the
+        # vault row keeps its history. Both halves are pinned now: upstream still sets it (so the
+        # unflag is doing something), and PixC_V1 removes it (dev and citest extend PixC_V1).
+        "id": "dmx-input-compiled-inactive",
+        "section": "Protocols",
+        "ticket": "161, hardening audit 2026-10-20",
+        "row": "**DMX input is not in any ePixC image.** Upstream's `[esp32_idf_V4]` sets "
+               "`WLED_ENABLE_DMX_INPUT`, and `PixC_V1` removes it with `build_unflags`. No ePixC "
+               "board has a DMX transceiver.",
+        "evidence": [
+            {"file": "platformio.ini", "must": "present", "pattern": r"-D WLED_ENABLE_DMX_INPUT"},
+            {"file": "platformio_override.ini", "must": "present",
+             "pattern": r"build_unflags = \$\{common\.build_unflags\} -D WLED_ENABLE_DMX_INPUT"},
+        ],
+    },
+    {
+        "id": "dmx-output-absent",
+        "section": "Protocols",
+        "ticket": "161",
+        "row": "**DMX output is genuinely absent** — `WLED_ENABLE_DMX` is never set.",
+        # The negative lookahead is load-bearing: `WLED_ENABLE_DMX_INPUT` contains
+        # `WLED_ENABLE_DMX` as a substring, so the naive pattern reports the flag as present and
+        # this row fails on a truthful build. The check would then be corrected by loosening it,
+        # which is how a guard ends up passing for the wrong reason.
+        "evidence": [
+            {"file": "platformio.ini", "must": "absent", "pattern": r"WLED_ENABLE_DMX(?!_INPUT)"},
+        ],
+    },
+    {
+        "id": "ble-absent",
+        "section": "Protocols",
+        "ticket": "161",
+        "row": "**Bluetooth / BLE is genuinely absent** — no NimBLE, no `BLEDevice`, nothing.",
+        "evidence": [
+            {"file": "platformio.ini", "must": "absent", "pattern": r"NimBLE|BLEDevice|ESP32_BLE"},
+        ],
+    },
+    {
+        # Rewritten 2026-10-20 (content audit). It said "no customer receives a signed update,
+        # because PIXC_OTA_PUBKEY_PEM is still empty"; the production key went in with 14ea4da0
+        # (2026-10-07) and the row went red, as the comment here said it would on the day `174`
+        # made the key. The id is kept so the vault row keeps its history. Whether an update has
+        # been published is not in this repository: the vault's Claims Checklist says that part.
+        "id": "ota-verifies-but-has-no-key",
+        "section": "Product capability",
+        "ticket": "16, 174, D34/D35/D165/D184",
+        "row": "**The device verifies an ECDSA P-256 signature and refuses anything unsigned, and "
+               "the production public key is compiled in**, so an image that ePixC signs can "
+               "install. A build with no key does not compile unless it is marked as a dev build.",
+        "evidence": [
+            {"file": "usermods/pixc_connect_blink/pixc_connect_blink.cpp", "must": "present",
+             "pattern": r"verifySignature\("},
+            {"file": "usermods/pixc_connect_blink/pixc_ota_pubkey.h", "must": "present",
+             "pattern": r'#define PIXC_OTA_PUBKEY_PEM \\ "-----BEGIN PUBLIC KEY-----'},
+            {"file": "usermods/pixc_connect_blink/pixc_ota_pubkey.h", "must": "present",
+             "pattern": r"#ifndef EPIXC_OTA_UNSIGNED_DEV_BUILD (?:(?!#endif).)*?"
+                        r"static_assert\(sizeof\(PIXC_OTA_PUBKEY_PEM\) > 1"},
+        ],
+    },
+    {
+        "id": "provisioning-is-https-only",
+        "section": "Product capability",
+        "ticket": "33",
+        "row": "**Provisioning speaks HTTPS with the ISRG roots compiled in (X1, X2, Root YE and "
+               "Root YR) and has no plaintext fallback** — unvalidated on hardware, so it is "
+               "built and not yet demonstrated.",
+        # Since D411 the roots reach esp-tls through the attach hook, not `cert_pem`: pinned here
+        # that every request is configured with it and that it sets the pinned roots as the only
+        # CA chain - "esp_http_client" alone would stay green with no CA at all.
+        "evidence": [
+            {"file": "usermods/pixc_connect_blink/pixc_https.cpp", "must": "present",
+             "pattern": r"esp_http_client"},
+            {"file": "usermods/pixc_connect_blink/pixc_https.cpp", "must": "present",
+             "pattern": r"cfg\.crt_bundle_attach = pixcTlsAttach;"},
+            {"file": "usermods/pixc_connect_blink/pixc_https.cpp", "must": "present",
+             "pattern": r"mbedtls_ssl_conf_ca_chain\(conf, roots, nullptr\)"},
+            {"file": "usermods/pixc_connect_blink/pixc_roots.h", "must": "present",
+             "pattern": r"ISRG Root X2, Root YE and Root YR"},
+        ],
+    },
+    {
+        "id": "handshake-on-a-real-unit",
+        "section": "Product capability",
+        "ticket": "33, 75",
+        "row": "The provisioning handshake has completed against `api.epixc.in` on a real unit.",
+        # "and api.epixc.in does not resolve yet" was true until the box went live on 2026-10-19.
+        "unverifiable": "no file decides this. It needs a board on a network; the bench "
+                        "checklist (task #63) owns it.",
+    },
+]
+
+# ─── ENGINE BEGIN — byte-identical in every repository. The vault generator hashes this
+# region in each copy and refuses to render if they differ, so the duplication is policed
+# rather than trusted. Editing it means editing every copy in the same commit. ───────────
+import hashlib
+import json
+import pathlib
+import re
+import sys
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+
+
+def flattened(path):
+    """The file's text with every run of whitespace collapsed to one space.
+
+    Not a convenience. Four separate guards in this project have reported the wrong answer
+    because they read a line at a time and the thing they were looking for was wrapped
+    across two: the website brand check reported the brand it protects, the claims corpus
+    could not see a wrapped claim, and both were fixed the same way. A `must: absent`
+    pattern that a line break can hide from is a guard that passes by accident.
+    """
+    return re.sub(r"\s+", " ", path.read_text(errors="replace"))
+
+
+def check_one(item):
+    """(ok, detail, capture) for a single evidence item."""
+    path = ROOT / item["file"]
+    if not path.exists():
+        return False, "the file named as evidence does not exist", None
+    text = flattened(path)
+
+    if "capture" in item:
+        hits = re.findall(item["capture"], text)
+        # Exactly one, and this is not pedantry — it is the first thing this check caught, in
+        # itself. `priceInr:\s*(\d+)` matched the free plan's 0 before it reached ePixC+'s 199,
+        # and the row rendered "₹0/month" and reported itself VERIFIED. An evidence pointer that
+        # resolves to the wrong symbol is worse than no pointer, because it carries the authority
+        # of having been checked. So an ambiguous capture is a failure, not a first match.
+        if not hits:
+            return False, "the constant this row reads is no longer there", None
+        if len(hits) > 1:
+            return False, (f"ambiguous — this pattern matches {len(hits)} places, so which "
+                           f"constant the row reads is decided by file order"), None
+        return True, None, (item.get("name", item["file"]), hits[0])
+
+    found = re.search(item["pattern"], text) is not None
+    want = item["must"] == "present"
+    if found is want:
+        return True, None, None
+    return False, ("the symbol this row rests on is gone" if want
+                   else "the thing this row says is absent is present"), None
+
+
+def evaluate():
+    """Every claim, with what the evidence says right now."""
+    out = []
+    for c in CLAIMS:
+        has_evidence = bool(c.get("evidence"))
+        if has_evidence == bool(c.get("unverifiable")):
+            out.append({**c, "state": "malformed", "detail":
+                        "a claim carries evidence or a stated reason it cannot, never both "
+                        "and never neither"})
+            continue
+        if not has_evidence:
+            out.append({**c, "state": "unverifiable", "captures": {}})
+            continue
+        captures, failures = {}, []
+        for item in c["evidence"]:
+            ok, detail, cap = check_one(item)
+            if cap:
+                captures[cap[0]] = cap[1]
+            if not ok:
+                failures.append(f"{item['file']}: {detail}")
+        out.append({**c, "captures": captures,
+                    "state": "failed" if failures else "verified",
+                    "detail": "; ".join(failures) or None})
+    return out
+
+
+def rendered(result):
+    """The row's sentence with any captured values substituted in.
+
+    This is the half that makes the whole thing worth building. A row that prints a figure
+    is a fifth copy of that figure; a row that names the constant and has the value put in
+    at render time cannot disagree with the code, because it never held a number of its own.
+    """
+    try:
+        return result["row"].format(**result.get("captures", {}))
+    except KeyError as e:
+        return f"{result['row']}  [no capture named {e}]"
+
+
+def engine_digest():
+    """SHA-256 of this file's engine region, for the vault generator's drift check."""
+    text = pathlib.Path(__file__).read_text()
+    body = text.split("# ─── ENGINE BEGIN")[1].split("# ─── ENGINE END")[0]
+    return hashlib.sha256(body.encode()).hexdigest()[:16]
+
+
+# The digest the region above is REQUIRED to have, checked by this script in its own repository's
+# CI. Written 2026-08-29 after the drift it exists to catch had already happened.
+#
+# The cross-repository check lives in the vault (99-Wayfinder/claims/render.py), which is the only
+# place that can see all three copies at once - and it is hand-run. So when epixc-web's copy drifted
+# by three characters, nothing failed: each repository's CI went on passing, the vault generator
+# refused to render, and the public Claims Checklist silently froze on stale pricing rows for three
+# days. A check that only one person running one script by hand can perform is a check that reports
+# nothing on the day it matters.
+#
+# Pinning the digest moves the FIRST detection into every repository's own CI, where a diff that
+# touches this region fails the build that carries it, without any repository needing to see
+# another. It cannot replace the vault's check - a pin says "this copy is what it was", not "the
+# three copies agree" - so both exist, and the pin is the fast one.
+#
+# It lives BELOW engine_digest() on purpose. The hashed region ends at the FIRST occurrence of the
+# end marker, which is the string literal inside engine_digest itself, so this constant is inside
+# the shared region but outside the hash. Putting it above would make the pin cover itself, and no
+# value would ever be correct.
+#
+# EDITING THE ENGINE: change it in all three copies in one commit, run any copy to read the new
+# digest out of the failure message, and update this line in all three. If that feels like friction,
+# it is the friction the header at the top of the region already asks for.
+ENGINE_PIN = "a784e1bf69b43713"
+
+
+def engine_pin_ok():
+    """None if this copy matches the pin, or the sentence explaining what to do about it."""
+    actual = engine_digest()
+    if actual == ENGINE_PIN:
+        return None
+    return (f"the engine region has drifted: this copy hashes {actual}, the pin says {ENGINE_PIN}.\n"
+            "Either an edit to the shared region was not made in all three repositories, or it was\n"
+            "and the pin was not updated. Do not change the pin to make this pass without checking\n"
+            "the other copies first - a pin updated alone hides exactly the drift it is here for.")
+
+
+def main():
+    drift = engine_pin_ok()
+    if drift is not None:
+        print(f"{REPO}: {drift}", file=sys.stderr)
+        return 1
+
+    results = evaluate()
+    if "--json" in sys.argv:
+        print(json.dumps({"repo": REPO, "engine": engine_digest(),
+                          "claims": [{**r, "rendered": rendered(r)} for r in results]}, indent=1))
+        return 0
+
+    bad = [r for r in results if r["state"] in ("failed", "malformed")]
+    counts = {s: sum(1 for r in results if r["state"] == s)
+              for s in ("verified", "unverifiable", "failed", "malformed")}
+    print(f"{REPO}: {counts['verified']} verified, {counts['unverifiable']} unverifiable, "
+          f"{counts['failed']} failed, {counts['malformed']} malformed "
+          f"(engine {engine_digest()})")
+    for r in results:
+        mark = {"verified": "ok  ", "unverifiable": "—   ", "failed": "FAIL", "malformed": "BAD "}
+        print(f"  {mark[r['state']]} {r['id']}: {rendered(r)}")
+        if r.get("detail"):
+            print(f"       {r['detail']}")
+    if bad:
+        print("\nA row above no longer matches the code it points at. Either the claim stopped\n"
+              "being true — fix the claim — or the evidence moved, in which case repoint it.\n"
+              "Do not delete the row to make this pass.")
+    return 1 if bad else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+# ─── ENGINE END ──────────────────────────────────────────────────────────────────────────

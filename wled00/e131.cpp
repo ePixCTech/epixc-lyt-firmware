@@ -1,4 +1,7 @@
 #include "wled.h"
+#ifdef PIXC_LAN_AUTH
+#include "pixc_lan.h"
+#endif
 
 #define MAX_3_CH_LEDS_PER_UNIVERSE 170
 #define MAX_4_CH_LEDS_PER_UNIVERSE 128
@@ -135,6 +138,12 @@ void handleE131Packet(e131_packet_t* p, IPAddress clientIP, byte protocol, size_
       if (p->priority < highPriority.get()) return;
     }
   } else { //DDP
+#ifdef PIXC_LAN_AUTH
+    // Pairing v2: DDP only from an address holding a realtime lease (an authenticated
+    // POST /json {"pixc":{"rt_lease":N}}, renewed by ePixC Sync every 20 s). Anything else is
+    // dropped before it touches the pixel buffer, so a stranger on the LAN cannot take the strip.
+    if (!pixcRealtimeAllowed(static_cast<uint32_t>(clientIP))) return;
+#endif
     realtimeIP = clientIP;
     handleDDPPacket(p, packetLen);
     return;

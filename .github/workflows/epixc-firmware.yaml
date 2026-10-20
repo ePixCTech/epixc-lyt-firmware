@@ -1,0 +1,749 @@
+# ePixC firmware CI. THIS FILE IS OURS, NOT UPSTREAM'S.
+#
+# 2026-08-27: touched deliberately to register this workflow with GitHub Actions. The repository's
+# first push created master with 6,872 commits and Actions registered none of the nine workflow
+# files in this directory — `gh api .../actions/workflows` returned only the two Dependabot entries
+# GitHub generates itself. A following empty commit did not help, which fits: registration appears
+# to key off a push that actually touches the workflow file, and the push that added these files
+# was the one that got skipped. The four repositories pushed the same day with 23 to 109 commits
+# registered normally.
+#
+# Outcome, recorded 2026-08-27: touching this file registered it. `gh api .../actions/workflows`
+# went from 2 entries to 3, and it became dispatchable. The other eight files in this directory —
+# upstream WLED's build.yml, nightly.yml, pr-merge.yaml, release.yml, stale.yml, test.yaml,
+# usermods.yml and wled-ci.yml — are still unregistered, deliberately left that way: they are
+# upstream's CI, they would burn Actions minutes on a private fork, and none of them gates
+# anything ePixC relies on. If one is ever wanted, touching it is what registers it.
+#
+# If this directory ever gets re-added in another giant push, expect the same silence, and expect it
+# to be silent rather than red — which is the failure mode this file exists to prevent.
+#
+# 2026-08-28: and then it was red instead, on every run, which is the same problem wearing the
+# opposite colour. The OTA signing-key step said "the release build fails here" while there is one
+# job that runs on every push, so the workflow failed in twenty-five seconds every time for a
+# reason unrelated to whether the firmware compiles — and the size gate below, the one check whose
+# failure mode is a fleet that can never be updated again, never got to run. **A CI that is red for
+# a known reason is a CI nobody reads.**
+#
+# The key is now required only when a run could produce something shippable: a manual dispatch with
+# `shippable: true`, or any run where the secret happens to exist. Otherwise this builds
+# PixC_V1_dev, which compiles without a key and whose binary, release name and artifact all say
+# UNSIGNED_DEV. The device it is flashed onto still refuses every OTA. See ticket 174.
+#
+# === STILL BROKEN, and narrowed on 2026-08-28: `push` DOES NOT TRIGGER THIS ===
+#
+# Two pushes to master that each TOUCHED this file produced no run at all — not a failed run, no
+# run. `workflow_dispatch` works; the API has never recorded a single `push` event for this
+# repository. Everything checkable from a `repo`-scoped token was checked and is correct:
+#
+#   repos/.../actions/permissions   {"enabled":true,"allowed_actions":"all"}
+#   repos/.../actions/workflows     this file is listed, state "active"
+#   repos/.../rulesets              []
+#   repos/.../actions/permissions/workflow  default_workflow_permissions "write"
+#   repo metadata                   fork:false, archived:false, disabled:false, default_branch:master
+#   the `on:` block ON THE PUSHED COMMIT   push.branches includes master
+#
+# So it is not the trigger, not the branch, not a ruleset, not a fork, not the file's registration.
+# The one thing left is the ORGANISATION's Actions policy, and reading it needs `admin:org`:
+#
+#   $ gh api orgs/ePixCTech/actions/permissions
+#   403 "You must be an org admin or have the actions policies fine-grained permission."
+#
+# === 2026-08-29: THE ORG POLICY IS NOT THE CAUSE. That guess is now disproved. ===
+#
+# The line that used to be here sent the founder to the organisation's Actions settings. It was
+# reasoning by elimination - everything checkable was correct, so it must be the one thing that was
+# not checkable - and reasoning by elimination is only as good as the list of things eliminated.
+#
+# The cheap test nobody had run: ask whether ANY OTHER repository in this organisation gets
+# push-triggered runs.
+#
+#   $ for r in epixc-web epixc-app epixc-backend epixc-docs epixc-sync epixc-wireframes; do
+#       gh api "repos/ePixCTech/$r/actions/runs?event=push&per_page=1" --jq .total_count; done
+#     20  21  24  1  2  2
+#
+# Six do. So Actions runs on push across this organisation, and whatever is wrong is specific to
+# THIS repository. Also ruled out on the same pass: the repo is PUBLIC (so it is not a private-repo
+# minutes limit), fork:false, archived:false, disabled:false, the workflow is registered and
+# `state: active`, and none of the three pushed commits carries a `[skip ci]`-family token in its
+# message - which is the one documented way a correct workflow silently does not run.
+#
+# What is left, and it is one click each:
+#
+# >>> FOUNDER, both in https://github.com/organizations/ePixCTech/settings/actions:
+# >>>   1. If "Enable Actions for" is set to SELECTED REPOSITORIES rather than all, check whether
+# >>>      epixc-lyt-firmware is in the list. Six siblings running proves the policy allows pushes;
+# >>>      it does not prove this repository is included in it.
+# >>>   2. Check the repository's own Settings > Actions > General for a disabled state that the
+# >>>      REST API reports as enabled - the two have disagreed before on repos imported with very
+# >>>      large histories.
+# >>>
+# >>> If both look right, the next step is empirical rather than more reading: push a commit that
+# >>> touches this file and watch `gh api repos/.../actions/runs?event=push`. Registration keyed off
+# >>> a touching push once already (see 2026-08-27 above), and the same mechanism may gate the
+# >>> trigger as well as the listing.
+#
+# It has to live in .github/workflows/ because that is the only directory GitHub Actions scans.
+# It sat in .github/workflows-epixc/ from c7fe580d until now, to keep upstream merges clean, which
+# meant it never ran once — and neither did the OTA size gate below, the one check in this repo
+# whose failure mode is a fleet that can never be updated again.
+#
+# The filename is the merge-conflict defence instead. Upstream WLED's workflow files are
+# build.yml, nightly.yml, pr-merge.yaml, release.yml, stale.yml, test.yaml, usermods.yml and
+# wled-ci.yml; nothing upstream is or plausibly will be prefixed "epixc-". So an upstream merge
+# adds and changes files beside this one and never touches it.
+#
+# If a future merge does somehow conflict here: KEEP THIS FILE. It is not an ePixC edit of an
+# upstream workflow, it is a separate workflow that only ePixC has. Do not modify or disable the
+# stock WLED workflows to make room for it — they are upstream's and stay untouched.
+
+name: ePixC firmware
+
+on:
+  # Only on an ePixC firmware tag (lyt-v1.0.0, ...) or when started by hand: Actions tab, Run
+  # workflow, or `gh workflow run epixc-firmware.yaml --ref <branch>`. Not on every push or pull
+  # request (founder, 2026-10-20: "I dont want to run github actions all times. even pushing to WLED
+  # is triggering builds"). Upstream's own tags (v0.15.x, ...) live in this repo too, hence lyt-v.
+  # A lyt-v tag is a release, so it builds shippable and fails without the signing key. Upstream
+  # WLED's own workflows are manual-only or guarded to wled/WLED (a677b877, 5221e5d4, 2026-10-20),
+  # so this is the one workflow that runs for ePixC.
+  push:
+    tags: ['lyt-v*']
+  workflow_dispatch:
+    inputs:
+      shippable:
+        description: >-
+          Build a SHIPPABLE image. Requires the EPIXC_OTA_PUBKEY_PEM secret and fails without it.
+          Leave off for an ordinary compile + size check.
+        type: boolean
+        default: false
+
+# Deliberately no `paths:` filter. The size gate is the point of this workflow, and the inputs that
+# move image size are not confined to a listable set of directories — platformio.ini and
+# pio-scripts/ arrive through upstream merges, package.json sets the version in the artifact name,
+# usermods/audioreactive/ is compiled in. A path list that misses one of those does not fail; it
+# silently skips the gate, which is the failure this workflow exists to prevent. A wasted CI minute
+# is the cheaper mistake.
+#
+# Also deliberately no tag trigger: upstream WLED tags releases here (see release.yml, `tags: '*'`)
+# and an ePixC build has no business running on those.
+
+permissions:
+  contents: read
+
+concurrency:
+  group: epixc-firmware-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # Every stock WLED workflow in this repo sets this; the actions here are the same vintage.
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  # Host-side unit tests of the firmware's pure logic (test/pixc): MQTT topic routing, secret
+  # redaction, the PIN/auth limiter, backoff, anti-rollback descriptor scanning, and the pairing v2
+  # LAN signing checked against epixc-backend's shared vectors. Seconds, no toolchain beyond g++.
+  host-tests:
+    name: Host tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run test/pixc
+        run: bash test/pixc/run.sh
+
+  # The anti-rollback build number is the HEAD commit time (pio-scripts/pixc_build_id.py), so the
+  # same commit gets the same number here and on a laptop; no CI counter is involved.
+  build:
+    name: PixC_V1 ${{ matrix.target }} (ESP32-S3)
+    runs-on: ubuntu-latest
+    needs: host-tests
+    strategy:
+      fail-fast: false
+      matrix:
+        # dev:     PixC_V1_dev, the bench image, on every run.
+        # release: PixC_V1 when the signing key secret exists; until then PixC_V1_citest, the
+        #          same image with a throwaway key whose private half does not exist (CI ONLY,
+        #          never shippable, see pixc_ota_pubkey.h). Every release check runs on it.
+        target: [dev, release]
+    steps:
+      # Whether this run is allowed to produce something a device could install.
+      #
+      # It was every run until 2026-08-28, and that was the defect: the comment above says "the
+      # RELEASE build fails here", but there is one job and it runs on every push, so the whole
+      # workflow was red from the day it registered — for a reason that has nothing to do with
+      # whether the firmware compiles. **A CI that is red for a known reason is a CI nobody reads**,
+      # and the size gate it exists to run was the thing being drowned out.
+      #
+      # So the key is required only when the run could ship: a manual dispatch that asks for it.
+      # Everything else builds `PixC_V1_dev`, which sets -D EPIXC_OTA_UNSIGNED_DEV_BUILD and so
+      # compiles without a key — while the device still refuses every OTA and says so at boot. The
+      # size gate, which is the check whose failure mode is a fleet that can never be updated
+      # again, runs either way.
+      - name: Decide whether this run may ship
+        id: mode
+        env:
+          OTA_PUBKEY_PEM: ${{ secrets.EPIXC_OTA_PUBKEY_PEM }}
+        run: |
+          set -euo pipefail
+          shippable="${{ github.event.inputs.shippable }}"
+          case "${GITHUB_REF}" in refs/tags/lyt-v*) shippable=true ;; esac
+          target="${{ matrix.target }}"
+          if [ "${target}" = "dev" ]; then
+            echo "env=PixC_V1_dev" >> "$GITHUB_OUTPUT"
+            echo "sign=false"      >> "$GITHUB_OUTPUT"
+            echo "label=UNSIGNED-DEV" >> "$GITHUB_OUTPUT"
+          elif [ -n "${OTA_PUBKEY_PEM}" ]; then
+            echo "env=PixC_V1" >> "$GITHUB_OUTPUT"
+            echo "sign=true"   >> "$GITHUB_OUTPUT"
+            echo "label=signed" >> "$GITHUB_OUTPUT"
+          elif [ "${shippable}" = "true" ]; then
+            echo "::error::A shippable build was requested and the repository secret EPIXC_OTA_PUBKEY_PEM is not set. Without it the firmware is built with no signing key and would refuse every OTA update once installed. Create it from: openssl pkey -inform DER -in ota-sec1.der -pubout -outform PEM"
+            exit 1
+          else
+            echo "::notice::No OTA signing key configured (D184), so the release-shaped build is PixC_V1_citest: PixC_V1 plus a throwaway key nobody can sign for. CI ONLY - it is checked like a release and is NOT shippable."
+            echo "env=PixC_V1_citest" >> "$GITHUB_OUTPUT"
+            echo "sign=false"         >> "$GITHUB_OUTPUT"
+            echo "label=CI-TEST-KEY-NOT-SHIPPABLE" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v4
+
+      # pio-scripts/build_ui.py runs `npm ci` and `npm run build` as a pre-action and aborts the
+      # build if node is missing, so the web UI toolchain is a hard dependency of `pio run`, not an
+      # optional extra. Pin it to .nvmrc rather than taking whatever the runner image ships.
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: ".nvmrc"
+          cache: "npm"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Cache PlatformIO
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio/.cache
+            ~/.buildcache
+          key: pio-${{ runner.os }}-${{ steps.mode.outputs.env }}-${{ hashFiles('platformio.ini', 'platformio_override.ini') }}
+          restore-keys: pio-${{ runner.os }}-${{ steps.mode.outputs.env }}-
+
+      # requirements.txt pins platformio==6.1.17, which is the version this fork's build is known
+      # to work under. `pip install --upgrade platformio` floated to whatever was newest that day.
+      - name: Install PlatformIO
+        run: pip install -r requirements.txt
+
+      # build_output/ is where pio-scripts/output_bins.py drops the release copy, and it is
+      # gitignored, so a cached or reused workspace could leave an older binary sitting there for
+      # the gate to measure instead. Start empty.
+      - name: Clear previous build output
+        run: rm -rf build_output
+
+      # The CA roots in usermods/pixc_connect_blink/pixc_roots.h are the entire trust store of
+      # this firmware. Provisioning (usermods/pixc_connect_blink/pixc_https.cpp) and MQTT over TLS
+      # (wled00/pixc_mqtt_client.cpp) both hand `cert_pem` that one bundle and trust nothing else.
+      # Nothing checked it.
+      #
+      # A pinned root that lapses is not a build failure, it is a fleet that stops provisioning and
+      # stops reaching the broker. And the repair is an OTA whose *command* arrives over the very
+      # MQTT/TLS link these roots anchor, so the fix has to ship BEFORE the root dies; afterwards
+      # there is no channel left to ship it on.
+      #
+      # Which is why checking expiry alone is not enough. A root valid to 2035 passes an expiry
+      # check every day for nine years and then fails on one — the same silence, one step removed.
+      # The gate is on REMAINING validity:
+      #
+      #     under 1095 days (36 months)  ->  warn loudly
+      #     under  730 days (24 months)  ->  fail the build
+      #
+      # 24 months is not a round number, it is the fleet-reach number. An ePixC controller is
+      # mains-powered decor, not an always-on appliance: it takes an update only while it happens
+      # to be plugged in, on Wi-Fi, and connected to the broker. Reaching effectively all of the
+      # fleet means spanning a full seasonal cycle, and a unit that is only used in one season a
+      # year needs a SECOND cycle to have a realistic second chance if it missed the first. Two
+      # cycles is 24 months. Below that, "push an OTA" stops being a remedy and turns into a
+      # support-and-RMA exercise — a business event, and a build should not be the thing that
+      # discovers it. The 36-month warning exists so the replacement root goes into a planned
+      # release instead of an emergency one; it gives a full year of noise before the hard stop.
+      #
+      # It also asserts pinning DEPTH, which matters more than the dates do. These must be
+      # self-signed roots. Pinning an intermediate (Let's Encrypt R10/R11, Google WE1) is the same
+      # code with a fuse of a year or two instead of a decade, and pinning a leaf breaks at every
+      # 90-day renewal — each of them repairable only over the connection the pin just broke.
+      #
+      # This runs BEFORE the OTA-key step deliberately: that step reads a repository secret and so
+      # cannot pass on a pull request from a fork, and a PR that edits pixc_roots.h should still be
+      # checked.
+      # Ticket 44, founder decision 2026-08-27. The rows the vault's Claims Checklist got wrong
+      # in the dangerous direction are this repository's: it said Art-Net, sACN, E1.31, DDP, DMX
+      # and Bluetooth were "none implemented anywhere in the stack" while `e131.begin` and
+      # `ddp.begin` ran unconditionally on every shipped unit. Those rows are now pinned to the
+      # symbols, so removing a listener or adding one turns this red.
+      #
+      # Placed beside the CA-roots check and before the OTA-key step for the same reason that one
+      # is: it reads no repository secret, so it still runs on a pull request from a fork.
+      #
+      # Worth stating plainly: no workflow in this repository has ever run on a push (`183`), so
+      # until that is fixed this step's real home is the hand-run path — the vault's render.py
+      # executes the same script at the tester-build review.
+      - name: Claims still match the code they point at
+        run: python3 tools/claims_evidence.py
+
+      # Added 2026-08-28. This repository had no brand check at all, and the factory-reset page
+      # was still telling customers to connect to the pre-rename hotspot — the one string a
+      # customer reads at the exact moment they have erased their configuration and have nothing
+      # else to go on. The app had pinned the new spelling months earlier.
+      #
+      # Runs before the build, because it needs no toolchain and a wrong name is worth failing on
+      # in seconds rather than after a five-minute compile.
+      - name: Refuse the retired product name
+        run: python3 scripts/brand-check.py
+
+      - name: Check the pinned CA roots
+        run: |
+          python3 - <<'PY'
+          import datetime, os, re, subprocess, sys, tempfile
+
+          HEADER = "usermods/pixc_connect_blink/pixc_roots.h"
+
+          # Remaining-validity thresholds, in days. See the workflow comment for why these numbers.
+          FAIL_DAYS = 730    # 24 months
+          WARN_DAYS = 1095   # 36 months
+          MIN_ROOTS = 2
+
+          failed = []
+
+          def fail(msg):
+              print("::error::" + msg)
+              failed.append(msg)
+
+          def openssl(args, ok_codes=(0,)):
+              p = subprocess.run(["openssl"] + args, capture_output=True, text=True)
+              if p.returncode not in ok_codes:
+                  return None, (p.stderr.strip() or p.stdout.strip())
+              return p.stdout, None
+
+          def field(text, key):
+              for line in text.splitlines():
+                  if line.startswith(key + "="):
+                      return line.split("=", 1)[1].strip()
+              return ""
+
+          def parse_date(s):
+              return datetime.datetime.strptime(" ".join(s.split()), "%b %d %H:%M:%S %Y %Z").replace(
+                  tzinfo=datetime.timezone.utc)
+
+          src = open(HEADER).read()
+          begins = src.count("-----BEGIN CERTIFICATE-----")
+          ends = src.count("-----END CERTIFICATE-----")
+          pems = re.findall(r"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----", src, re.S)
+          if not (begins == ends == len(pems)):
+              fail("%s has %d BEGIN and %d END markers but %d complete certificates — a PEM block in the "
+                   "bundle is truncated, and mbedTLS would silently trust only the ones before it"
+                   % (HEADER, begins, ends, len(pems)))
+              sys.exit(1)
+          if len(pems) < MIN_ROOTS:
+              fail("%s pins %d root(s); at least %d are required. One root means a CA transition takes the "
+                   "whole fleet offline with no second trust anchor to fall back to." % (HEADER, len(pems), MIN_ROOTS))
+
+          now = datetime.datetime.now(datetime.timezone.utc)
+          seen = {}
+
+          for i, pem in enumerate(pems):
+              with tempfile.NamedTemporaryFile("w", suffix=".pem", delete=False) as fh:
+                  fh.write(pem + "\n")
+                  path = fh.name
+              try:
+                  out, err = openssl(["x509", "-in", path, "-noout",
+                                      "-subject", "-issuer", "-startdate", "-enddate",
+                                      "-fingerprint", "-sha256"])
+                  if out is None:
+                      fail("certificate #%d in %s does not parse as X.509: %s" % (i + 1, HEADER, err))
+                      continue
+
+                  subject = field(out, "subject")
+                  issuer = field(out, "issuer")
+                  fp = field(out, "sha256 Fingerprint")
+                  not_before = parse_date(field(out, "notBefore"))
+                  not_after = parse_date(field(out, "notAfter"))
+                  days = (not_after - now).days
+                  name = re.search(r"CN\s*=\s*([^,/]+)", subject)
+                  name = name.group(1).strip() if name else subject
+
+                  print("  %-14s notAfter %s  (%d days, %.1f years)"
+                        % (name, not_after.strftime("%Y-%m-%d"), days, days / 365.2425))
+                  print("  %-14s sha256:%s" % ("", fp))
+
+                  # Pinning DEPTH. A root is self-issued and self-signed; an intermediate or a leaf is not.
+                  # Pinning either of those is the same code with a vastly shorter fuse — Let's Encrypt
+                  # rotates intermediates on a few-year cadence and leaves every 90 days, and repairing a
+                  # broken pin needs an OTA over the connection the pin just broke.
+                  if subject != issuer:
+                      fail("%s is not a root: its issuer (%s) differs from its subject. Only self-signed "
+                           "roots may be pinned here — an intermediate rotates far more often than a root."
+                           % (name, issuer))
+                  else:
+                      _, verr = openssl(["verify", "-no_check_time", "-CAfile", path, path])
+                      if verr is not None:
+                          fail("%s claims to be self-issued but its signature does not verify against its "
+                               "own key: %s" % (name, verr))
+
+                  ext, _ = openssl(["x509", "-in", path, "-noout", "-ext", "basicConstraints"])
+                  if ext is None or "CA:TRUE" not in ext:
+                      fail("%s is not a CA certificate (basicConstraints CA:TRUE absent); it cannot anchor "
+                           "a chain." % name)
+
+                  if fp in seen:
+                      fail("%s is the same certificate as %s (sha256 %s). Two copies of one root is one "
+                           "root, and provides no transition headroom." % (name, seen[fp], fp))
+                  seen[fp] = name
+
+                  if not_before > now:
+                      fail("%s is not valid until %s — it is in the future, and every handshake against it "
+                           "fails today." % (name, not_before.strftime("%Y-%m-%d")))
+
+                  # Remaining validity, not just expiry. A root that expires in 2035 passes an expiry check
+                  # every single day until the day it does not; the point of the floor is to fail while an
+                  # OTA can still reach the fleet.
+                  if days < 0:
+                      fail("%s EXPIRED on %s (%d days ago). Devices in the field can no longer complete a "
+                           "handshake against it." % (name, not_after.strftime("%Y-%m-%d"), -days))
+                  elif days < FAIL_DAYS:
+                      fail("%s expires %s, in %d days — under the %d-day (24-month) floor. Replacing a "
+                           "pinned root needs an OTA, and that OTA is commanded over the MQTT/TLS link "
+                           "these roots anchor, so it has to land BEFORE the root dies. Twenty-four months "
+                           "is two full seasonal cycles: the time it takes a fleet of intermittently "
+                           "powered consumer controllers to come back online and take an update. Add the "
+                           "replacement root to the bundle now."
+                           % (name, not_after.strftime("%Y-%m-%d"), days, FAIL_DAYS))
+                  elif days < WARN_DAYS:
+                      print("::warning::%s expires %s, in %d days (%.1f years) — under the %d-day "
+                            "(36-month) warning line. Schedule the replacement root into a planned release; "
+                            "at %d days this build starts failing."
+                            % (name, not_after.strftime("%Y-%m-%d"), days, days / 365.2425, WARN_DAYS,
+                               FAIL_DAYS))
+              finally:
+                  os.unlink(path)
+
+          if failed:
+              sys.exit(1)
+          print("%d pinned roots, all self-signed CAs, all with more than %d days left." % (len(pems), FAIL_DAYS))
+          PY
+
+      # The public half of the ePixC firmware signing key, baked into the image.
+      #
+      # It is NOT committed: usermods/pixc_connect_blink/pixc_ota_pubkey.h ships with an empty
+      # default, and a static_assert in that header refuses to compile it. That is deliberate —
+      # an empty key means the device rejects every update, and until now the only place that
+      # showed up was a customer's device after an update had already been published.
+      #
+      # So the release build fails here, in about ten seconds, instead of there.
+      #
+      # >>> THE FOUNDER MUST CREATE THIS REPOSITORY SECRET, NAMED EXACTLY:
+      # >>>
+      # >>>     EPIXC_OTA_PUBKEY_PEM
+      # >>>
+      # >>> Value: the PEM public half of the ePixC signing key, whole, including the BEGIN and
+      # >>> END lines — the output of
+      # >>>
+      # >>>     openssl pkey -inform DER -in ota-sec1.der -pubout -outform PEM
+      # >>>
+      # >>> which is the same key material as ADMIN_SIGNING_PUBKEY_B64 in
+      # >>> epixc-backend/deploy/.env.example, in PEM rather than base64-DER. It must be the
+      # >>> public half of the SAME pair the admin service signs with, or every device will
+      # >>> reject every update this pipeline produces.
+      # >>>
+      # >>> The PRIVATE half never comes near GitHub. A public key in a repository secret is not
+      # >>> secret-keeping, it is just the only place a workflow can read a value from; publishing
+      # >>> it would cost nothing, since it is compiled into every shipped binary anyway.
+      #
+      # Secrets are not exposed to workflows triggered by a pull request from a fork, so this step
+      # fails there. That is the correct outcome for this repo — a fork cannot produce a shippable
+      # ePixC image — and the message below says so rather than looking like a broken build.
+      - name: Bake in the OTA signing public key
+        if: steps.mode.outputs.sign == 'true'
+        env:
+          OTA_PUBKEY_PEM: ${{ secrets.EPIXC_OTA_PUBKEY_PEM }}
+        run: |
+          set -euo pipefail
+          if [ -z "${OTA_PUBKEY_PEM}" ]; then
+            echo "::error::Repository secret EPIXC_OTA_PUBKEY_PEM is not set (or this is a fork PR, which cannot read secrets). Without it the firmware is built with no signing key and would refuse every OTA update once installed. Create the secret from: openssl pkey -inform DER -in ota-sec1.der -pubout -outform PEM"
+            exit 1
+          fi
+          printf '%s\n' "${OTA_PUBKEY_PEM}" > "${RUNNER_TEMP}/ota_pub.pem"
+
+          # Prove it is the curve both halves agree on before it is compiled in. A wrong curve
+          # parses fine on the device and then fails to verify anything the admin service signs.
+          if ! openssl pkey -pubin -in "${RUNNER_TEMP}/ota_pub.pem" -noout -text | grep -q 'NIST CURVE: P-256'; then
+            echo "::error::EPIXC_OTA_PUBKEY_PEM is not an ECDSA P-256 public key. The device verifies with mbedTLS and the admin service signs SHA256withECDSA over prime256v1; nothing else interoperates."
+            exit 1
+          fi
+
+          python3 - <<'PY'
+          import os
+
+          header = "usermods/pixc_connect_blink/pixc_ota_pubkey.h"
+          pem = open(os.path.join(os.environ["RUNNER_TEMP"], "ota_pub.pem")).read().strip()
+
+          # One C string literal per PEM line, trailing newline included: mbedtls_pk_parse_public
+          # _key is handed sizeof(), so the PEM has to be NUL-terminated and newline-terminated.
+          lines = [l.strip() for l in pem.splitlines() if l.strip()]
+          define = "#define PIXC_OTA_PUBKEY_PEM \\\n" + " \\\n".join(
+              '  "%s\\n"' % l for l in lines)
+
+          src = open(header).read()
+          empty = '#define PIXC_OTA_PUBKEY_PEM ""'
+          if src.count(empty) != 1:
+              raise SystemExit(
+                  "::error::%s no longer contains exactly one empty-key define; this step patches "
+                  "it by exact text and must not guess" % header)
+          open(header, "w").write(src.replace(empty, define))
+          print("baked in a %d-line P-256 public key" % len(lines))
+          PY
+
+          # Belt and braces: the build would fail on the static_assert anyway, but a patch step
+          # that silently no-ops is exactly the class of thing this whole change is about.
+          if grep -q '^#define PIXC_OTA_PUBKEY_PEM ""' usermods/pixc_connect_blink/pixc_ota_pubkey.h; then
+            echo "::error::the signing key was not written into the header; the build would produce an image that refuses every OTA"
+            exit 1
+          fi
+
+      - name: Build
+        run: pio run -e ${{ steps.mode.outputs.env }}
+
+      # A partition table is written by the flasher and CANNOT be changed over OTA, so a unit's
+      # layout is fixed for its life. If a build ever produces an image larger than the OTA slot,
+      # the fleet cannot be updated at all — and PlatformIO's own size check would only warn.
+      # Fail instead.
+      #
+      # The slot size is read from the partition binary this build just produced, not hardcoded, so
+      # the gate cannot drift from tools/WLED_ESP32_8MB_epixc.csv — and the CSV is checked against
+      # that binary too, in case board_build.partitions ever stops pointing at it and the board's
+      # own default_8MB.csv (larger app slots) silently takes over.
+      - name: Check the image fits the OTA slot
+        run: |
+          python3 - <<'PY'
+          import glob, hashlib, os, struct, sys
+
+          ENV = "${{ steps.mode.outputs.env }}"
+          CSV = "tools/WLED_ESP32_8MB_epixc.csv"
+          build_dir = os.path.join(".pio", "build", ENV)
+          app_bin = os.path.join(build_dir, "firmware.bin")
+          part_bin = os.path.join(build_dir, "partitions.bin")
+
+          def fail(msg):
+              print(f"::error::{msg}")
+              sys.exit(1)
+
+          for path in (app_bin, part_bin):
+              if not os.path.isfile(path):
+                  fail(f"{path} is missing — the build did not produce what this gate measures")
+
+          # Parse the flashed partition table. Entries are 32 bytes, magic 0xAA 0x50.
+          built = {}
+          blob = open(part_bin, "rb").read()
+          for i in range(0, len(blob), 32):
+              entry = blob[i:i + 32]
+              if entry[:2] != b"\xaa\x50":
+                  break
+              ptype, subtype = entry[2], entry[3]
+              _offset, size = struct.unpack("<II", entry[4:12])
+              name = entry[12:28].rstrip(b"\x00").decode()
+              if ptype == 0x00 and subtype in (0x10, 0x11):   # app / ota_0, ota_1
+                  built[name] = size
+          if not built:
+              fail("the built partition table declares no OTA app slots")
+
+          # The same numbers as read from the CSV in the repo, so the two cannot disagree unnoticed.
+          declared = {}
+          for line in open(CSV):
+              line = line.split("#", 1)[0].strip()
+              if not line:
+                  continue
+              cols = [c.strip() for c in line.split(",")]
+              if len(cols) >= 5 and cols[1] == "app":
+                  declared[cols[0]] = int(cols[4], 0)
+          if declared != built:
+              fail(f"{CSV} declares {declared} but the build flashed {built} — "
+                   "board_build.partitions is not pointing at the ePixC table")
+
+          slot = min(built.values())
+          size = os.path.getsize(app_bin)
+
+          # The uploaded artifact is what a device is actually asked to swallow. Prove it is the
+          # image just measured, not a leftover from another env or an earlier version. PixC_V1_dev
+          # now carries its own WLED_RELEASE_NAME (..._UNSIGNED_DEV) so the two no longer collide
+          # on one filename, which makes a stray bench binary here visible rather than confusable.
+          release = sorted(glob.glob("build_output/release/*.bin"))
+          if len(release) != 1:
+              fail(f"expected exactly one release binary, found {release}")
+          sha = lambda p: hashlib.sha256(open(p, "rb").read()).hexdigest()
+          if sha(release[0]) != sha(app_bin):
+              fail(f"{release[0]} is not the image this build produced")
+
+          print("partitions: " + ", ".join(f"{n} {s} bytes" for n, s in sorted(built.items())))
+          print(f"artifact:   {release[0]}")
+          print(f"image {size} bytes of {slot} ({size * 100 // slot}% of the slot)")
+          if size > slot:
+              fail("Image exceeds the OTA slot — devices in the field could not take this update.")
+          PY
+
+      # Bootloader rollback is the other half of a safe OTA: without it, an image that flashes
+      # successfully and then cannot reach the broker is a brick until someone drives to it.
+      #
+      # It is not a source-level decision. It is CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE in the
+      # sdkconfig of whichever prebuilt Arduino framework the build linked against, and this fork
+      # has TWO candidates installed at different times: the Tasmota fork of arduino-esp32 has it
+      # OFF, upstream espressif32 has it ON. `esp_ota_mark_app_valid_cancel_rollback()` links and
+      # returns ESP_OK either way, so the difference is invisible in the code and invisible at
+      # build time, and only shows as `rollback_armed: false` on a device's boot event — which is
+      # to say, in the field.
+      #
+      # The framework is read out of the map file this build just produced, so this cannot drift
+      # from what was actually linked.
+      # Ticket 33. The device provisions itself by asking an API which MQTT broker to trust, and
+      # that is the one bootstrap step with nothing protecting it — whoever answers first names
+      # the broker and collects the unit's credential.
+      #
+      # The transport used to be chosen at RUNTIME from `_apiPort == 443`, and `_apiPort` comes
+      # out of `POST /json/cfg`, which is gated on a settings PIN that shipped unset. So a
+      # guarantee of "no plaintext fallback" was revocable by anyone on the customer's Wi-Fi.
+      #
+      # This asserts the fix in the LINKED BINARY, not in the source. The previous version of this
+      # guarantee was a comment reasoning that no release build could reach the plaintext path;
+      # a symbol count of zero is a different kind of statement from an argument.
+      #
+      # `nm` on the elf rather than a grep of the map file: `build_output/map/` is written by a
+      # post-build script that does not always run, and a check whose input can be absent is a
+      # check that can pass by accident.
+      - name: Check the release image has no plaintext HTTP client
+        run: |
+          set -euo pipefail
+          ENV_NAME="${{ steps.mode.outputs.env }}"
+          ELF=".pio/build/${ENV_NAME}/firmware.elf"
+          test -f "$ELF" || { echo "::error::$ELF is missing — nothing to inspect"; exit 1; }
+
+          NM=$(ls "$HOME"/.platformio/packages/toolchain-xtensa-esp32s3/bin/*-nm | head -1)
+          COUNT=$("$NM" "$ELF" | grep -ci 'HTTPClient' || true)
+
+          # Both directions. The bench env compiles the plaintext path in deliberately, so there
+          # it must be PRESENT — without that half, a rename of the symbol would read as "no
+          # plaintext client" forever and the zero would stop meaning anything.
+          if [[ "$ENV_NAME" == *_dev ]]; then
+            if [[ "$COUNT" -eq 0 ]]; then
+              echo "::error::the bench image links no HTTPClient symbols — either the plaintext"
+              echo "::error::path is gone from the dev env too, or this check matches nothing now"
+              exit 1
+            fi
+            echo "bench image links the plaintext client ($COUNT symbols), as intended"
+          else
+            if [[ "$COUNT" -ne 0 ]]; then
+              echo "::error::the release image links a plaintext HTTP client ($COUNT symbols)."
+              echo "::error::Provisioning is HTTPS only — see ticket 33."
+              echo "::error::EPIXC_ALLOW_PLAINTEXT_PROVISION belongs to PixC_V1_dev alone."
+              exit 1
+            fi
+            echo "release image links no plaintext HTTP client"
+          fi
+
+      # The LAN gate is a BUILD FLAG, which is the whole reason this step exists. `PIXC_LAN_AUTH`
+      # can be dropped from platformio_override.ini in one keystroke, the firmware will compile
+      # cleanly, every test will pass, and the shipped device will answer any stranger on the
+      # customer's Wi-Fi again. Nothing in the source would look wrong, because the source would be
+      # correct - it is the flag that would be missing.
+      #
+      # D295 established the flag reaches the compiler by planting an undeclared symbol inside the
+      # guarded block. That proved it once, by hand, on one machine. This proves it on every build.
+      - name: Check the release image actually gates the LAN API
+        run: |
+          set -euo pipefail
+          ENV_NAME="${{ steps.mode.outputs.env }}"
+          ELF=".pio/build/${ENV_NAME}/firmware.elf"
+          test -f "$ELF" || { echo "::error::$ELF is missing — nothing to inspect"; exit 1; }
+
+          NM=$(ls "$HOME"/.platformio/packages/toolchain-xtensa-esp32s3/bin/*-nm | head -1)
+          GATE=$("$NM" "$ELF" | grep -c 'pixcAuthorise' || true)
+          ALEXA=$("$NM" "$ELF" | grep -ci 'espalexa' || true)
+
+          # The gate. `pixcAuthorise` (pairing v2, wled00/pixc_lan.cpp) has external linkage precisely so this is checkable —
+          # were it static it could be inlined away and its absence would prove nothing.
+          if [[ "$GATE" -eq 0 ]]; then
+            echo "::error::this image links no pixcAuthorise symbol, so the LAN JSON API,"
+            echo "::error::the legacy /win query API and every GET /json are OPEN to anybody on"
+            echo "::error::the network. -D PIXC_LAN_AUTH is missing from platformio_override.ini."
+            echo "::error::See Debt Register D295."
+            exit 1
+          fi
+          echo "the LAN API is gated (pixcAuthorise is linked)"
+
+          # Alexa, the one command path that could not be gated because the protocol carries no
+          # credential — so it was removed, and staying removed is the only guarantee available.
+          # Checked in the SAME step as the gate because they are one decision: the LAN surface is
+          # closed, or it is not, and a Hue bridge on port 80 reopens it without touching any of
+          # the code the gate protects.
+          if [[ "$ALEXA" -ne 0 ]]; then
+            echo "::error::this image links Espalexa ($ALEXA symbols). It answers SSDP on UDP 1900"
+            echo "::error::and serves an unauthenticated Hue API on port 80 — it has nowhere to"
+            echo "::error::carry the device PIN, so it cannot be gated, only removed. D296."
+            exit 1
+          fi
+          echo "no Espalexa in the image"
+
+      # Release-shaped images must carry none of the bench conveniences (audit B2, pairing v2):
+      # WLED_DEBUG (it printed MQTT payloads to the UART), the dev hotspot password, the bench API
+      # address, and plaintext MQTT. Checked in the binary, because each is one build flag deep.
+      - name: Check the release image carries no bench defaults
+        if: matrix.target == 'release'
+        run: |
+          set -euo pipefail
+          BIN=".pio/build/${{ steps.mode.outputs.env }}/firmware.bin"
+          ELF=".pio/build/${{ steps.mode.outputs.env }}/firmware.elf"
+          NM=$(ls "$HOME"/.platformio/packages/toolchain-xtensa-esp32s3/bin/*-nm | head -1)
+          bad=0
+          for s in "MQTT msg:" "epixcbench" "192.168.0.12"; do
+            if strings "$BIN" | grep -qF "$s"; then echo "::error::release image contains '$s'"; bad=1; fi
+          done
+          if [[ $("$NM" "$ELF" | grep -c ' verifyRollbackLater$' || true) -ne 1 ]]; then
+            echo "::error::verifyRollbackLater is not overridden: OTA images would be confirmed before the broker (D35)"; bad=1
+          fi
+          exit $bad
+
+      - name: Check bootloader rollback is compiled in
+        run: |
+          python3 - <<'PY'
+          import glob, os, re, sys
+
+          mapfile = "build_output/map/${{ steps.mode.outputs.env }}.map"
+          if not os.path.isfile(mapfile):
+              print(f"::error::{mapfile} is missing — cannot tell which framework was linked")
+              sys.exit(1)
+
+          pkgs = set(re.findall(r"packages/(framework-arduinoespressif32[^/\s]*)", open(mapfile, errors="ignore").read()))
+          if len(pkgs) != 1:
+              print(f"::error::expected exactly one Arduino framework package in the link, found {sorted(pkgs)}")
+              sys.exit(1)
+          pkg = pkgs.pop()
+
+          hits = glob.glob(os.path.expanduser(f"~/.platformio/packages/{pkg}/tools/**/esp32s3/sdkconfig"), recursive=True)
+          if len(hits) != 1:
+              print(f"::error::could not locate a single esp32s3 sdkconfig in {pkg}, found {hits}")
+              sys.exit(1)
+
+          cfg = open(hits[0]).read()
+          if "CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y" not in cfg:
+              print(f"::error::{pkg} was built with CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE off. "
+                    "A failed OTA would leave the device on the broken image with no automatic "
+                    "revert, and nothing in the firmware can compensate — the bootloader is prebuilt.")
+              sys.exit(1)
+          print(f"{pkg}: CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y")
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: epixc-firmware-${{ steps.mode.outputs.label }}
+          # The map goes with it: when the size gate does eventually fire, the map is what says why.
+          path: |
+            build_output/release/*.bin
+            build_output/map/${{ steps.mode.outputs.env }}.map

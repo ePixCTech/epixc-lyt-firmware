@@ -1,7 +1,7 @@
 name: 'Close stale issues and PRs'
 on:
-  schedule:
-    - cron: '0 12 * * *'
+  # ePixC, 2026-10-20: manual only. Founder: "I dont want to run github actions all times".
+  # Upstream ran this daily at 12:00 UTC.
   workflow_dispatch:
 
 jobs:
