@@ -544,6 +544,14 @@ class PixcConnectBlink : public Usermod {
     // onStateChange for realtime lock: the segment config never changes, only what is being drawn
     // over it, and since 2026-10-18 there is no periodic state to catch it later.
     uint8_t _lastRealtime = 0;
+    // Last seen realtimeOverride (WLED's live override, `lor`), for the same reason. The cloud sets
+    // it on `/api` as `{"lor":n}` (the app's "Control the light here" away from the home Wi-Fi,
+    // epixc-backend PUT .../live-override, 2026-10-23), and WLED's deserializeState() takes it
+    // without calling onStateChange, since nothing about the segments changed. A stream ending
+    // also clears a `lor` of 1 (udp.cpp exitRealtime) unannounced. Either way the state frame's
+    // `live_override` would stay wrong until the next unrelated change, and it is what tells the
+    // app that the override took.
+    uint8_t _lastOverride = 0;
     // Whether the boot event has gone out yet. One per power cycle, not per MQTT reconnect:
     // "this unit restarted" and "this unit lost the broker for a moment" are different facts and
     // support needs to tell them apart.
@@ -1735,9 +1743,14 @@ class PixcConnectBlink : public Usermod {
       // A state change reported by WLED — a LAN call, a physical button, a preset firing — is
       // the only time state goes out (since 2026-10-18; it was also every 5 s). A stream starting
       // or stopping is a state change WLED never reports, because the segment config is
-      // untouched — only what is drawn over it changes — so it is watched for here.
+      // untouched — only what is drawn over it changes — so it is watched for here, and so is the
+      // live override, which WLED does not report either.
       if (realtimeMode != _lastRealtime) {
         _lastRealtime = realtimeMode;
+        _statePending = true;
+      }
+      if (realtimeOverride != _lastOverride) {
+        _lastOverride = realtimeOverride;
         _statePending = true;
       }
       if (_statePending && now - _lastState >= kStateChangeMinMs) {
