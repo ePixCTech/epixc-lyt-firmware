@@ -163,6 +163,13 @@ This rule applies to any value that originates outside the repository (issue bod
 
 ## Why this repository's own CI has failed to run, three times
 
+**Since 2026-10-26 this repository has no workflows** (founder: "Remove github actions, the box
+builds"). ePixC's workflow and upstream's are deleted. A release is a hand-made `lyt-v<version>` tag
+on `main`, which the ePixC box tests and builds with `ci/test.sh` and `ci/build.sh`, holds to the
+image gates in `ci/checks/` (taken from the old workflow), and signs; the admin console deploys it.
+The conventions above stay as upstream's, for an upstream merge. The rest of this section is the
+record.
+
 Recorded 2026-08-27, because the pattern matters more than any one cause. The ePixC workflow
 carries the OTA image size gate, and its own header says the failure it guards is a fleet that can
 never be updated again. It has now failed to run for three unrelated reasons:

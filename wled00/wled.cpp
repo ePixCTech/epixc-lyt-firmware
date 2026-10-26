@@ -3,6 +3,7 @@
 #ifdef PIXC_LAN_AUTH
 #include "pixc_device.h"
 #include "pixc_lan.h"   // pixcConfigWriteDue (D465)
+#include "pixc_last_state.h"
 #include "../usermods/pixc_connect_blink/pixc_logic.h"
 #endif
 #include "wled_ethernet.h"
@@ -641,6 +642,13 @@ void WLED::beginStrip()
   offMode = false;   // init to on state to allow proper relay init
   handleOnOff(true); // init relay and force off
 
+#ifdef PIXC_LAN_AUTH
+  // ePixC: the light comes back as it was left, or Aurora when nothing was saved
+  // (pixc_last_state.h). With After a power cut on Last state, on/off and the brightness come back
+  // too, and the boot defaults below are skipped.
+  if (pixcRestoreLastState()) {
+  } else
+#endif
   if (turnOnAtBoot) {
     if (briS > 0) bri = briS;
     else if (bri == 0) bri = 128;

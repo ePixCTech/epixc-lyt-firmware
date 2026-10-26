@@ -30,6 +30,8 @@
 #include "pixc_logic.h"
 // Factory reset, power-cycle counter, factory hotspot password, boot id.
 #include "../../wled00/pixc_device.h"
+// After a power cut: the saved state and the restore mode.
+#include "../../wled00/pixc_last_state.h"
 #ifdef PIXC_LAN_AUTH
 #include "../../wled00/pixc_lan.h"
 #endif
@@ -578,8 +580,7 @@ class PixcConnectBlink : public Usermod {
 
     // Whether the framework this image linked against has bootloader rollback compiled in — a
     // BUILD fact, taken from the prebuilt Arduino framework's sdkconfig, which is the same value
-    // CI asserts (.github/workflows/epixc-firmware.yaml, "Check bootloader rollback is compiled
-    // in").
+    // the box's build asserts (ci/checks/bootloader-rollback.py).
     //
     // Reported alongside the runtime state rather than instead of it, because the two answer
     // different questions and were previously conflated: "can this fleet revert at all" is decided
@@ -1009,6 +1010,7 @@ class PixcConnectBlink : public Usermod {
     //
     // What the backend sends (epixc-backend DeviceService.buildCfg), and all that is applied:
     //   def.bri, def.on      power plan brightness cap and restore-on-power
+    //   pixc.restore         "last", "on" or "off": what comes back after a power cut (pixc_last_state.h)
     //   light.tr.dur         slow-fade, in 100 ms units
     //   pixc.led_channels    "RGB" / "RGBW" - see applyLedWidth() and pixc_led_bus.h
     //   pixc.reprovision     pull a new broker login (pairing v2)
@@ -1041,6 +1043,7 @@ class PixcConnectBlink : public Usermod {
           changed = true;
         }
       }
+      if (pixcSetRestoreMode(root["pixc"]["restore"] | (const char*)nullptr)) changed = true;
       if (applyLanKey(root["um"]["PixcConnect"]["settingsPin"] | (const char*)nullptr)) changed = true;
       // {"pixc":{"reprovision":true}}: pull a new broker login (the backend's "Reconnect to cloud").
       // The current one stays valid until the new one is confirmed, so a failed pull stays online.
@@ -1428,6 +1431,7 @@ class PixcConnectBlink : public Usermod {
       JsonObject top = root.createNestedObject("PixcConnect");
       top["apiHost"] = _apiHost;
       top["apiPort"] = _apiPort;
+      top["restore"] = pixcRestoreMode();
       // `settingsPin` is deliberately NOT written back. This same function answers
       // `GET /json/cfg`, and echoing the PIN here would publish the credential to exactly the
       // caller it exists to stop. WLED keeps settingsPIN in wsec.json for the same reason, and
@@ -1443,6 +1447,7 @@ class PixcConnectBlink : public Usermod {
     bool readFromConfig(JsonObject& root) override {
       JsonObject top = root["PixcConnect"];
       if (top.isNull()) return false;
+      pixcSetRestoreMode(top["restore"] | (const char*)nullptr);   // absent: unchanged (a LAN /json/cfg post reaches here too)
 #ifdef EPIXC_ALLOW_PLAINTEXT_PROVISION
       // Bench builds keep the host configurable, which is the entire reason the dev env exists:
       // the bench Mac's address rotates.
@@ -1658,13 +1663,15 @@ class PixcConnectBlink : public Usermod {
       // firmware ignored it, which is why an unsigned image was applied without complaint.
       fits &= strlcpy(job.sigUrl, doc["sig_url"] | "", sizeof(job.sigUrl)) < sizeof(job.sigUrl);
       if (job.url[0] == 0) return;
-      // The job id is echoed into JSON on ota/progress; the backend drops a progress whose id is
-      // not a UUID anyway, so anything else is refused here rather than escaped.
-      for (const char* c = job.jobId; *c; c++) {
-        if (!isxdigit((unsigned char)*c) && *c != '-') { job.jobId[0] = 0; break; }
-      }
+      // The job id is echoed into JSON on ota/progress, and the backend matches it as a UUID: a
+      // command without one has nobody to report to, so it is dropped.
+      if (!pixc::isUuid(job.jobId)) return;
       if (!fits) {
         publishOtaProgress(job.jobId, "failed", 0, pixc::ota_fail::kFieldTooLong);
+        return;
+      }
+      if ((job.sha256[0] != 0 && !pixc::isSha256Hex(job.sha256)) || (job.version[0] != 0 && !pixc::isVersion(job.version))) {
+        publishOtaProgress(job.jobId, "failed", 0, pixc::ota_fail::kBadField);
         return;
       }
       // Both downloads from the pinned host only (D466), checked before any download starts. A
@@ -1696,6 +1703,7 @@ class PixcConnectBlink : public Usermod {
       pixcLanLoop();      // applies a pairing validated by /json/pixc/pair
 #endif
       checkRollbackDeadline(now);
+      pixcLastStateLoop(_flashing);   // not the connect blink: it is not the light's state
       drainNetResults(now);
       if (_rebootAt != 0 && (long)(now - _rebootAt) >= 0) { _rebootAt = 0; doReboot = true; }
 
@@ -1778,6 +1786,7 @@ class PixcConnectBlink : public Usermod {
     // on it. loop() does the actual publish.
     void onStateChange(uint8_t) override {
       _statePending = true;
+      pixcLastStateChanged();
     }
 
     uint16_t getId() override { return USERMOD_ID_UNSPECIFIED; }

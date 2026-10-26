@@ -412,6 +412,34 @@ class DescScanner {
 // firmware host since 2026-10-18.
 constexpr const char* kOtaUrlPrefixProduction = "https://api.epixc.in/firmware/";
 
+// An OTA command's fields, by shape (the backend sends exactly these).
+inline bool isHexDigit(char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'); }
+// 8-4-4-4-12 hex digits.
+inline bool isUuid(const char* s) {
+  if (s == nullptr) return false;
+  for (int i = 0; i < 36; i++) {
+    const bool dash = i == 8 || i == 13 || i == 18 || i == 23;
+    if (dash ? s[i] != '-' : !isHexDigit(s[i])) return false;
+  }
+  return s[36] == 0;
+}
+inline bool isSha256Hex(const char* s) {
+  if (s == nullptr) return false;
+  for (int i = 0; i < 64; i++) if (!isHexDigit(s[i])) return false;
+  return s[64] == 0;
+}
+// 1 to 32 of [A-Za-z0-9.+-], starting with a letter or digit: 17.0.2, 17.0.2-rc1.
+inline bool isVersion(const char* s) {
+  if (s == nullptr || !((s[0] >= '0' && s[0] <= '9') || (s[0] >= 'a' && s[0] <= 'z') || (s[0] >= 'A' && s[0] <= 'Z'))) return false;
+  size_t n = 0;
+  for (; s[n]; n++) {
+    const char c = s[n];
+    const bool ok = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '.' || c == '+' || c == '-';
+    if (!ok || n >= 32) return false;
+  }
+  return n > 0;
+}
+
 // True when `url` is `prefix` followed by one or more path segments, each [A-Za-z0-9][A-Za-z0-9._-]*
 // (the backend's own segment rule), joined by single '/'. So the host, the port and the scheme are
 // exactly the prefix's, and nothing can follow: no "..", no "%" escape, no "?" query, no "#", no
@@ -474,6 +502,9 @@ constexpr const char* kFieldTooLong  = "command field too long";      // OTA_FAI
 // The image or signature URL is not under the pinned download prefix (otaUrlAllowed, D466).
 // Refused before anything is downloaded.
 constexpr const char* kHostNotAllowed = "download host not allowed";  // OTA_FAILED (a server fault)
+// A digest that is not 64 hex digits, or a version that is not a version: refused before the
+// download, not after it.
+constexpr const char* kBadField      = "command field malformed";     // OTA_FAILED (a server fault)
 constexpr const char* kShaMismatch   = "sha256 mismatch";             // OTA_CORRUPT_DOWNLOAD
 // No "sig" or "signature" in either: that word is the backend's first test, and neither of these
 // says anything about whether the image is genuine.
