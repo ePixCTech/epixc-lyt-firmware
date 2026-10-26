@@ -6,10 +6,8 @@ anyio==4.15.1
     # via starlette
 bottle==0.13.4
     # via platformio
-certifi==2026.7.22
+certifi==2026.10.19
     # via requests
-chardet==5.2.0
-    # via platformio
 charset-normalizer==3.5.1
     # via requests
 click==8.5.0
@@ -43,9 +41,7 @@ starlette==1.7.0
 tabulate==0.10.0
     # via platformio
 typing-extensions==4.16.0
-    # via
-    #   anyio
-    #   starlette
+    # via anyio
 urllib3==2.8.0
     # via requests
 uvicorn==0.54.0
