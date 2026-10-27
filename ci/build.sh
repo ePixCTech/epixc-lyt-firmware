@@ -52,6 +52,10 @@ rm -rf build_output
 # pio-scripts/build_ui.py runs `npm ci` and `npm run build` as a pre-action and aborts the build if
 # node is missing, so the web UI toolchain is a hard dependency of `pio run`.
 step "pio run -e $ENV_NAME";                       "$PIO" run -e "$ENV_NAME"
+# The first-flash images by name: a plain `pio run` makes the bootloader and the partition table only when
+# PlatformIO's cache already holds them, so a clean checkout (the box's) had neither.
+step "bootloader.bin and partitions.bin";         "$PIO" run -e "$ENV_NAME" \
+  -t ".pio/build/$ENV_NAME/bootloader.bin" -t ".pio/build/$ENV_NAME/partitions.bin"
 
 step "the image fits the OTA slot";                python3 ci/checks/ota-slot.py "$ENV_NAME"
 step "no plaintext HTTP client";                   bash ci/checks/no-plaintext-http.sh "$ENV_NAME"
