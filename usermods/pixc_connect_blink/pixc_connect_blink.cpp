@@ -102,9 +102,10 @@ static_assert(pixcSameText(PIXC_OTA_URL_PREFIX, pixc::kOtaUrlPrefixProduction),
 //       - publishes `announce` (once on connect), `state` and `health` to
 //         `epixc/v1/d/{mac}/{kind}` in the shapes epixc-mqtt expects.
 //
-//  2. On the first successful MQTT (cloud) connect after Wi-Fi is up — i.e.
-//     right after initial setup / pairing — flash the strip solid green for
-//     3 seconds, then restore the previous color / brightness / effect.
+//  2. The light's own looks while it is set up (founder, 2026-10-28). A light that powers on with no
+//     broker login (a new or reset one, or one just paired) shows a blue run until it reaches the
+//     ePixC cloud, then a green run for 3 seconds, then Aurora. A light already set up shows what
+//     it was left on; the factory reset's three amber flashes are pixc_device.cpp's.
 //
 // Requires MQTT compiled in (do NOT set WLED_DISABLE_MQTT).
 
@@ -524,10 +525,14 @@ bool submit(const Job& job) {
 
 class PixcConnectBlink : public Usermod {
   private:
-    bool _blinkDone = false;   // green blink only on the first connect
-    bool _flashing = false;
+    // The set-up looks (job 2 above): Setup is the blue run, Joined the green one, then Aurora.
+    enum class Look : uint8_t { None, Setup, Joined };
+    static constexpr unsigned long kJoinedRunMs = 3000;   // the app waits this long before its identify flash
+    Look _look = Look::None;
+    bool _painting = false;          // a look is being applied: onStateChange leaves it unsaved
+    unsigned long _lookAt = 0;
+    uint32_t _keptCol[3] = {0, 0, 0};   // the main segment's colours from before the blue run
     bool _announced = false;
-    unsigned long _start = 0;
     unsigned long _lastState = 0;
     unsigned long _lastHealth = 0;
     unsigned long _lastPower = 0;
@@ -592,10 +597,6 @@ class PixcConnectBlink : public Usermod {
     #else
     static constexpr bool kRollbackSupported = false;
     #endif
-    byte _savedCol[4] = {0, 0, 0, 0};
-    byte _savedBri = 0;
-    uint8_t _savedFx = 0;
-
     // ePixC API host (compiled in; a bench build may take another from pairing). The device
     // calls POST {apiHost}:{apiPort}/api/v1/provision {mac, device_key} to learn the MQTT
     // broker and its login, confirms it, then hands off to MQTT.
@@ -1138,6 +1139,35 @@ class PixcConnectBlink : public Usermod {
 
     bool haveBrokerLogin() const { return mqttServer[0] && mqttUser[0] && strlen(mqttPass) == 64; }
 
+    // A run of `col` over black on the main segment (WLED's Running: bands about 32 LEDs apart,
+    // moving about one band a second), lit even on a light that came up off. Not the light's state:
+    // it is neither saved nor sent (onStateChange).
+    void paintRun(uint32_t col) {
+      Segment& seg = strip.getMainSegment();
+      _painting = true;
+      seg.setMode(FX_MODE_RUNNING_LIGHTS);
+      seg.setPalette(0);
+      seg.setColor(0, col);
+      seg.setColor(1, BLACK);
+      seg.speed = 128;
+      seg.intensity = 32;
+      if (bri == 0) bri = briS ? briS : 128;
+      stateChanged = true;
+      stateUpdated(CALL_MODE_NO_NOTIFY);
+      _painting = false;
+    }
+
+    // Set up: the green run is over, so the light takes Aurora, its first look (pixc_last_state.h),
+    // with the colours it had before. This one is the light's state: saved and sent.
+    void endSetupLook() {
+      _look = Look::None;
+      Segment& seg = strip.getMainSegment();
+      for (uint8_t i = 0; i < 3; i++) seg.setColor(i, _keptCol[i]);
+      pixcFirstLook();
+      stateChanged = true;
+      stateUpdated(CALL_MODE_DIRECT_CHANGE);
+    }
+
     void stepProvisioning(unsigned long now) {
       if (_provisionInFlight || WiFi.status() != WL_CONNECTED || (long)(now - _nextProvisionAt) < 0) return;
       if (_prov == Prov::Idle && !_provWanted) return;
@@ -1375,6 +1405,13 @@ class PixcConnectBlink : public Usermod {
       apBehavior = AP_BEHAVIOR_NO_CONN;
       // Only with a confirmed broker login; otherwise the loop pulls one first (pairing v2).
       mqttEnabled = haveBrokerLogin();
+      // Not set up yet: the blue run until the cloud answers (onMqttConnect).
+      if (!mqttEnabled) {
+        const Segment& seg = strip.getMainSegment();
+        for (uint8_t i = 0; i < 3; i++) _keptCol[i] = seg.colors[i];
+        _look = Look::Setup;
+        paintRun(RGBW32(0, 0, 255, 0));
+      }
 
       // Is this boot on probation? Only true when the bootloader actually armed rollback, which
       // makes this a runtime fact rather than a claim about a prebuilt binary: the Tasmota
@@ -1606,17 +1643,11 @@ class PixcConnectBlink : public Usermod {
       _liveUntil = 0;
       energyDueWithin(millis(), kEnergyConnectSpreadMs);
 
-      if (!_blinkDone) {
-        _blinkDone = true;
-        memcpy(_savedCol, colPri, 4);
-        _savedBri = bri;
-        _savedFx = effectCurrent;
-        colPri[0] = 0; colPri[1] = 255; colPri[2] = 0; colPri[3] = 0;
-        effectCurrent = FX_MODE_STATIC;
-        bri = 255;
-        colorUpdated(CALL_MODE_DIRECT_CHANGE);
-        _start = millis();
-        _flashing = true;
+      // Set up and on ePixC: the green run, then Aurora (loop()). Once a boot, never on a reconnect.
+      if (_look == Look::Setup) {
+        _look = Look::Joined;
+        _lookAt = millis();
+        paintRun(RGBW32(0, 255, 0, 0));
       }
     }
 
@@ -1703,17 +1734,11 @@ class PixcConnectBlink : public Usermod {
       pixcLanLoop();      // applies a pairing validated by /json/pixc/pair
 #endif
       checkRollbackDeadline(now);
-      pixcLastStateLoop(_flashing);   // not the connect blink: it is not the light's state
+      pixcLastStateLoop(_look != Look::None);   // not a set-up look: it is not the light's state
       drainNetResults(now);
       if (_rebootAt != 0 && (long)(now - _rebootAt) >= 0) { _rebootAt = 0; doReboot = true; }
 
-      if (_flashing && (now - _start > 3000)) {
-        memcpy(colPri, _savedCol, 4);
-        bri = _savedBri;
-        effectCurrent = _savedFx;
-        colorUpdated(CALL_MODE_DIRECT_CHANGE);
-        _flashing = false;
-      }
+      if (_look == Look::Joined && now - _lookAt >= kJoinedRunMs) endSetupLook();
 
       // Pairing v2: pull and confirm the broker login on the network worker, with backoff.
       watchBroker(now);
@@ -1785,6 +1810,10 @@ class PixcConnectBlink : public Usermod {
     // runs inside the state-change path, and publishing from here would put MQTT I/O
     // on it. loop() does the actual publish.
     void onStateChange(uint8_t) override {
+      if (_painting) return;   // a set-up look
+      // Somebody changed the light during a set-up look (the app's identify flash, a scene): theirs
+      // stays, and no Aurora replaces it.
+      _look = Look::None;
       _statePending = true;
       pixcLastStateChanged();
     }

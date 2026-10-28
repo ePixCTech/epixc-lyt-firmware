@@ -1,6 +1,6 @@
 {
   "name": "wled",
-  "version": "17.0.1-pixc4",
+  "version": "17.0.1-pixc5",
   "description": "Tools for WLED project",
   "main": "tools/cdata.js",
   "directories": {

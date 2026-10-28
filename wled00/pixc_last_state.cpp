@@ -62,11 +62,11 @@ void save() {
   savedOnce = true;
 }
 
-// What a light with no saved state shows: Aurora, with the effect's own speed and palette.
-void firstLook() {
+}  // namespace
+
+void pixcFirstLook() {
   strip.getMainSegment().setMode(FX_MODE_AURORA, true);
 }
-}  // namespace
 
 bool pixcRestoreLastState() {
   bool applied = false;
@@ -93,7 +93,7 @@ bool pixcRestoreLastState() {
     releaseJSONBufferLock();
   }
   if (f) f.close();
-  if (!applied) firstLook();
+  if (!applied) pixcFirstLook();
   return full;
 }
 

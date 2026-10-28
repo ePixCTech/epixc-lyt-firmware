@@ -18,10 +18,14 @@
 // brightness came with it (restore is `last` and a state was saved), so the boot defaults are skipped.
 bool pixcRestoreLastState();
 
+// What a light with no saved state shows: Aurora, with the effect's own speed and palette. Also where
+// a light goes once it is set up (the usermod's green run ends here).
+void pixcFirstLook();
+
 // Any state change: saved once it has settled.
 void pixcLastStateChanged();
 
-// Every loop pass. `hold`: a temporary look is showing (the connect blink), which is not saved.
+// Every loop pass. `hold`: a set-up look is showing (the usermod's blue or green run), which is not saved.
 void pixcLastStateLoop(bool hold);
 
 // "last", "on" or "off". False for anything else, or when it is already the mode.
