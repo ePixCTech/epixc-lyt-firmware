@@ -66,6 +66,10 @@ void save() {
 
 void pixcFirstLook() {
   strip.getMainSegment().setMode(FX_MODE_AURORA, true);
+  // WLED's globals too: beginStrip()'s colorUpdated() pushes them back onto the main segment, and
+  // left alone they are effect 0 in WLED's default orange, so a new light (and one with no saved
+  // state, at every power-on) showed yellow before, or instead of, Aurora (first board, 2026-10-30).
+  setValuesFromMainSeg();
 }
 
 bool pixcRestoreLastState() {

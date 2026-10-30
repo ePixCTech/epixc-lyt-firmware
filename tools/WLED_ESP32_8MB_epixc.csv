@@ -25,10 +25,15 @@
 #   coredump 0x7F0000 .. 0x800000               64 KB   (8 MB total)
 # Both app offsets are 64 KB aligned, which the ESP32 bootloader requires.
 #
+# `spiffs` (LittleFS: cfg.json, wsec.json) is flagged `encrypted` since 17.0.1-pixc6 (Writer ticket
+# 08, ruling 7: now, while no unit has shipped, since this table cannot change over OTA). It takes
+# effect only on a unit whose flash encryption is on; on any other, IDF treats no partition as
+# encrypted, so the filesystem stays exactly as it was.
+#
 # Name,   Type, SubType, Offset,   Size,     Flags
 nvs,      data, nvs,     0x9000,   0x5000,
 otadata,  data, ota,     0xe000,   0x2000,
 app0,     app,  ota_0,   0x10000,  0x300000,
 app1,     app,  ota_1,   0x310000, 0x300000,
-spiffs,   data, spiffs,  0x610000, 0x1E0000,
+spiffs,   data, spiffs,  0x610000, 0x1E0000, encrypted
 coredump, data, coredump,,         64K

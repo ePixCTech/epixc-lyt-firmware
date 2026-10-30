@@ -282,10 +282,21 @@ bool PixcMqttClient::start() {
     cfg.lwt_qos = _willQos;
     cfg.lwt_retain = _willRetain ? 1 : 0;
   }
+  // Outlives esp_mqtt_client_init below, which copies it.
+  String uri;
   if (_port == kMqttWssPort) {
     // TLS ends at Caddy, which routes /mqtt to the broker; the same trust decision as below.
-    cfg.transport = MQTT_TRANSPORT_OVER_WSS;
-    cfg.path = "/mqtt";
+    //
+    // As a URI, not host + port + `path`: esp-mqtt (IDF 4.4.7) hands `path` to the WebSocket only
+    // from esp_mqtt_client_set_uri, so with `cfg.path` the light asked for "/", Caddy answered 401,
+    // and esp_transport_ws, which never reads the status, said "Sec-WebSocket-Accept not found".
+    // No light reached the broker this way (first board, 2026-10-30).
+    //
+    // No `cfg.transport`: the `wss` scheme picks it, and esp_mqtt_check_cfg_conflict rejects a URI
+    // and a transport together, so esp_mqtt_client_init returned NULL - with only a warning, which
+    // this build's log level drops. The first pixc6 build did exactly that, silently, every attempt.
+    uri = String("wss://") + _host + ":" + String(_port) + "/mqtt";
+    cfg.uri = uri.c_str();
     cfg.crt_bundle_attach = pixcTlsAttach;
   } else if (_port == kMqttsPort) {
     cfg.transport = MQTT_TRANSPORT_OVER_SSL;
@@ -304,7 +315,11 @@ bool PixcMqttClient::start() {
   }
 
   _client = esp_mqtt_client_init(&cfg);
-  if (_client == nullptr) return false;
+  if (_client == nullptr) {
+    // esp-mqtt says why only at warning level, which this build does not print.
+    DEBUG_PRINTLN(F("[ePixC] MQTT client refused its config"));
+    return false;
+  }
   if (esp_mqtt_client_start(_client) != ESP_OK) {
     esp_mqtt_client_destroy(_client);
     _client = nullptr;
