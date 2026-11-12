@@ -154,6 +154,26 @@ inline uint32_t backoffPlusMinus20(uint8_t attempt, uint32_t baseMs, uint32_t ma
   return static_cast<uint32_t>(lo + (rnd % span));
 }
 
+// Refused logins in a row (the broker answered "bad username or password") before the usermod
+// pulls a new login (watchBroker). Shared by the MQTT client, which retries them flat until then.
+constexpr uint8_t kLoginRefusalsBeforePull = 10;
+constexpr uint32_t kLoginRetryMs = 2000;   // plus up to 1 s of jitter
+
+// The MQTT client's next reconnect wait, and whether it is a backoff step (the client then counts
+// one more attempt). A refused login before the pull waits a flat 2-3 s and is no step, so ten of
+// them come in 20-30 s. On the 2 s to 5 min backoff they took 7 to 13 minutes, and the 10-minute
+// stale rule usually fired first (review 2026-11-10). Every other failure (TLS, transport, a broker
+// that is down) and every refusal from the pull on keeps the exponential backoff with jitter.
+struct ReconnectWait {
+  uint32_t ms;
+  bool backoffStep;
+};
+inline ReconnectWait mqttReconnectWait(uint8_t attempt, bool lastWasRefusal, uint8_t refusals,
+                                       uint32_t baseMs, uint32_t maxMs, uint32_t rnd) {
+  if (lastWasRefusal && refusals < kLoginRefusalsBeforePull) return {kLoginRetryMs + rnd % 1000, false};
+  return {backoffWithJitter(attempt, baseMs, maxMs, rnd), true};
+}
+
 // ---------------------------------------------------------------------------------------------
 // JSON string escaping
 // ---------------------------------------------------------------------------------------------

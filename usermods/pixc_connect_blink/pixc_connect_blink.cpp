@@ -644,11 +644,23 @@ class PixcConnectBlink : public Usermod {
     // and a shipping build are distinguishable only by reading the binary, and a dev image
     // flashed onto a customer unit would look exactly like a healthy one until the day an update
     // was published and that single device silently refused it.
+    //
+    // The bench image (PixC_V1_dev) is marked too. The production key is compiled into every build
+    // now, so it takes signed updates and is no longer "-UNSIGNED-DEV", but it still has WLED_DEBUG
+    // on the UART, plaintext provisioning and MQTT, and the bench hotspot password. The marker is
+    // EPIXC_ALLOW_PLAINTEXT_PROVISION, which ci/checks/no-plaintext-http.sh keeps to that env alone.
     static const char* fwVersion() {
 #ifdef EPIXC_CI_TEST_ONLY_OTA_KEY
       static char ci[WLED_VERSION_MAX_LEN + 16];
       if (ci[0] == '\0') snprintf(ci, sizeof(ci), "%s-CI-TEST-KEY", versionString);
       return ci;
+#endif
+#ifdef EPIXC_ALLOW_PLAINTEXT_PROVISION
+      if (!kOtaDisabled) {
+        static char dev[WLED_VERSION_MAX_LEN + 16];
+        if (dev[0] == '\0') snprintf(dev, sizeof(dev), "%s-DEV", versionString);
+        return dev;
+      }
 #endif
       if (!kOtaDisabled) return versionString;
       static char v[WLED_VERSION_MAX_LEN + 16];
@@ -1068,7 +1080,7 @@ class PixcConnectBlink : public Usermod {
     // services/mqtt RESET_PAYLOAD, QoS 1, never retained). Any other payload is ignored (audit
     // S12): the topic used to wipe on ANY payload, so a stray or retained message was a reset loop.
     // The wipe itself is shared with the LAN and power-cycle paths - wled00/pixc_device.cpp - and is
-    // complete: LittleFS formatted, Wi-Fi NVS erased.
+    // complete: LittleFS formatted, Wi-Fi NVS, the energy log and any crash dump erased.
     void factoryReset(const char* payload) {
       StaticJsonDocument<64> doc;
       if (deserializeJson(doc, payload)) return;
@@ -1287,19 +1299,27 @@ class PixcConnectBlink : public Usermod {
     }
 
     // Stored login but no broker for this long on a working Wi-Fi: assume the login is stale (a
-    // server-side reset, a rotated broker) and pull a new one.
+    // server-side reset, a rotated broker) and pull a new one. Each pull that brings no broker
+    // doubles the wait (10, 20, 40 ... up to 160 minutes, +-20 %) until the broker is reached, so
+    // a broker outage with the api up does not bring every light's /provision and /confirm (and a
+    // logins-file rewrite) to the api every ten minutes while the box is being repaired.
     static constexpr unsigned long kBrokerStaleMs = 10UL * 60 * 1000;
+    static constexpr unsigned long kBrokerStaleMaxMs = 160UL * 60 * 1000;
     unsigned long _brokerDownSince = 0;
+    uint8_t _stalePulls = 0;            // stale pulls since the broker was last reached
+    uint32_t _staleRnd = 0;             // this wait's jitter, drawn once when the wait starts
 #ifdef PIXC_MQTT_ESP_IDF
     // A broker that answers and refuses the password is not "unreachable": the login is wrong (a
     // confirm reply that never arrived, a server-side reset), and waiting ten minutes for the stale
     // rule only to have a power cycle restart that wait is how a light stayed off the cloud all
-    // evening (2026-10-04). Ten refusals in a row pull a new login now; repeat pulls for refusals
-    // wait 1, 2, 4 ... up to 30 minutes, so a broker that refuses every login is not hammered.
-    // Ten, not two (2026-10-19): Mosquitto learns a just-confirmed password from a logins file the
-    // ingest rewrites every 5 s, so the first few attempts after /provision/confirm are refused by
-    // design. At one attempt a second or slower that is 10 s or more, past the broker's ~6 s.
-    static constexpr uint8_t kRefusalsBeforePull = 10;
+    // evening (2026-10-04). Ten refusals in a row (pixc::kLoginRefusalsBeforePull) pull a new login
+    // now; repeat pulls for refusals wait 1, 2, 4 ... up to 30 minutes, so a broker that refuses
+    // every login is not hammered. Ten, not two (2026-10-19): the broker learns a just-confirmed
+    // password from a logins file, which the edge rewrites at once when the api calls
+    // RefreshBrokerLogins after /provision/confirm and every 5 s as a fallback, so the first attempts
+    // after a confirm can be refused by design. The client retries a refused login every 2-3 s
+    // (pixc::mqttReconnectWait), so ten refusals take 20-30 s: past that lag, and well inside the
+    // stale rule's ten minutes.
     static constexpr unsigned long kRefusalPullBaseMs = 60UL * 1000;
     static constexpr unsigned long kRefusalPullMaxMs = 30UL * 60 * 1000;
     unsigned long _refusalPullAfter = 0;
@@ -1309,7 +1329,7 @@ class PixcConnectBlink : public Usermod {
 #ifdef PIXC_MQTT_ESP_IDF
       if (WLED_MQTT_CONNECTED) _refusalPullWait = kRefusalPullBaseMs;
       if (mqtt != nullptr && !WLED_MQTT_CONNECTED && WiFi.status() == WL_CONNECTED &&
-          _prov == Prov::Idle && !_provWanted && mqtt->loginRefusals() >= kRefusalsBeforePull &&
+          _prov == Prov::Idle && !_provWanted && mqtt->loginRefusals() >= pixc::kLoginRefusalsBeforePull &&
           (_refusalPullAfter == 0 || (long)(now - _refusalPullAfter) >= 0)) {
         DEBUG_PRINTLN(F("[ePixC] broker refused the stored login: pulling a new one"));
         _provWanted = true;
@@ -1321,15 +1341,17 @@ class PixcConnectBlink : public Usermod {
         return;
       }
 #endif
+      if (WLED_MQTT_CONNECTED) _stalePulls = 0;
       if (WiFi.status() != WL_CONNECTED || WLED_MQTT_CONNECTED || _prov != Prov::Idle || _provWanted) {
         _brokerDownSince = 0;
         return;
       }
-      if (_brokerDownSince == 0) { _brokerDownSince = now ? now : 1; return; }
-      if (now - _brokerDownSince > kBrokerStaleMs) {
+      if (_brokerDownSince == 0) { _brokerDownSince = now ? now : 1; _staleRnd = esp_random(); return; }
+      if (now - _brokerDownSince > pixc::backoffPlusMinus20(_stalePulls, kBrokerStaleMs, kBrokerStaleMaxMs, _staleRnd)) {
         DEBUG_PRINTLN(F("[ePixC] broker unreachable with the stored login: pulling a new one"));
         _provWanted = true;
         _brokerDownSince = 0;
+        if (_stalePulls < 8) _stalePulls++;
       }
     }
 
@@ -1353,6 +1375,9 @@ class PixcConnectBlink : public Usermod {
               bootloopCheckOTA();
               _rebootAt = now + 1500;           // let the QoS0 "done" publish flush first
             } else if (strcmp(r.status, "failed") == 0) {
+              // The other half of stageOta()'s onUpdateBegin(true): usermods resume (audioreactive
+              // starts its FFT task again), as after a failed upload through WLED's own OTA.
+              if (_otaRunning) UsermodManager::onUpdateBegin(false);
               _otaRunning = false;
             }
             break;
@@ -1724,6 +1749,11 @@ class PixcConnectBlink : public Usermod {
         return;
       }
       _otaRunning = true;
+      // Tell the usermods an update begins, as WLED's own OTA does (ota_update.cpp): audioreactive
+      // suspends its always-on FFT task, which upstream does "to prevent crash" while the image is
+      // written to flash. The worker's every "failed" undoes this (drainNetResults); "done" reboots.
+      // No strip.suspend(): the light keeps playing during an update.
+      UsermodManager::onUpdateBegin(true);
       strlcpy(_otaJobId, job.jobId, sizeof(_otaJobId));
     }
 

@@ -63,8 +63,10 @@
 // delete anything.
 //
 // The deliberate way out is -D EPIXC_OTA_UNSIGNED_DEV_BUILD (see PixC_V1_dev in
-// platformio_override.ini). It suppresses only this guard — the device still refuses every OTA,
-// and an image built that way says so at boot and in the version it reports.
+// platformio_override.ini). It suppresses only this guard. With the key above compiled in, it
+// changes nothing: the image takes signed updates (PixC_V1_dev reports "-DEV" in its version).
+// Without a key, the device refuses every OTA, and the image says so at boot and reports
+// "-UNSIGNED-DEV" in its version.
 // -----------------------------------------------------------------------------
 #ifndef EPIXC_OTA_UNSIGNED_DEV_BUILD
 

@@ -4,7 +4,7 @@
 
 #include "pixc_mqtt_client.h"
 #include "../usermods/pixc_connect_blink/pixc_https.h"   // pixcTlsAttach: pinned roots + dates (D411)
-#include "../usermods/pixc_connect_blink/pixc_logic.h"   // backoffWithJitter()
+#include "../usermods/pixc_connect_blink/pixc_logic.h"   // mqttReconnectWait()
 #include <esp_random.h>
 
 // TLS ONLY (audit S10). This used to choose TLS by port - 8883 TLS, anything else plaintext - and
@@ -43,7 +43,9 @@ PixcMqttClient& PixcMqttClient::setClientId(const char* clientId) {
 PixcMqttClient& PixcMqttClient::setCredentials(const char* username, const char* password) {
   const char* u = username ? username : "";
   const char* p = password ? password : "";
-  if (_user != u || _pass != p) { _user = u; _pass = p; _dirty = true; _loginRefusals = 0; }
+  if (_user != u || _pass != p) {
+    _user = u; _pass = p; _dirty = true; _loginRefusals = 0; _lastWasRefusal = false;
+  }
   return *this;
 }
 
@@ -119,10 +121,14 @@ void PixcMqttClient::handle(esp_mqtt_event_handle_t event) {
       enqueue(kEvData, event);
       break;
     }
-    case MQTT_EVENT_ERROR:
+    case MQTT_EVENT_ERROR: {
       // Worth a line: a TLS failure here is otherwise a silent reconnect loop, and the two causes
       // that matter - a certificate the pinned roots do not cover, and credentials the broker
       // rejects - look identical from the outside without it.
+      //
+      // Which of the two it was also decides the next wait (scheduleReconnect): esp-mqtt sends the
+      // DISCONNECTED event of a failed attempt after this one.
+      bool refused = false;
       if (event->error_handle != nullptr) {
         DEBUG_PRINTF("[ePixC] MQTT error type=%d tls=%d sock_errno=%d\n",
                      (int)event->error_handle->error_type,
@@ -135,10 +141,13 @@ void PixcMqttClient::handle(esp_mqtt_event_handle_t event) {
         if (event->error_handle->error_type == MQTT_ERROR_TYPE_CONNECTION_REFUSED &&
             (event->error_handle->connect_return_code == MQTT_CONNECTION_REFUSE_BAD_USERNAME ||
              event->error_handle->connect_return_code == MQTT_CONNECTION_REFUSE_NOT_AUTHORIZED)) {
+          refused = true;
           if (_loginRefusals < 255) _loginRefusals++;
         }
       }
+      _lastWasRefusal = refused;
       break;
+    }
     default:
       break;
   }
@@ -177,11 +186,13 @@ bool PixcMqttClient::enqueue(uint8_t kind, esp_mqtt_event_handle_t event) {
 }
 
 void PixcMqttClient::scheduleReconnect() {
-  const uint32_t delayMs = pixc::backoffWithJitter(_attempt, kBackoffBaseMs, kBackoffMaxMs, esp_random());
-  if (_attempt < 16) _attempt++;
+  // A refused login is retried flat until the usermod pulls a new one (pixc::mqttReconnectWait).
+  const pixc::ReconnectWait w = pixc::mqttReconnectWait(_attempt, _lastWasRefusal, _loginRefusals,
+                                                        kBackoffBaseMs, kBackoffMaxMs, esp_random());
+  if (w.backoffStep && _attempt < 16) _attempt++;
   _reconnectDue = true;
-  _nextAttemptAt = millis() + delayMs;
-  DEBUG_PRINTF("[ePixC] MQTT reconnect in %u ms (attempt %u)\n", (unsigned)delayMs, (unsigned)_attempt);
+  _nextAttemptAt = millis() + w.ms;
+  DEBUG_PRINTF("[ePixC] MQTT reconnect in %u ms (attempt %u)\n", (unsigned)w.ms, (unsigned)_attempt);
 }
 
 void PixcMqttClient::loop() {
@@ -194,6 +205,7 @@ void PixcMqttClient::loop() {
           _connected = true;
           _attempt = 0;
           _loginRefusals = 0;
+          _lastWasRefusal = false;
           _reconnectDue = false;
           if (_onConnect) _onConnect(ev->sessionPresent);
           break;
@@ -340,6 +352,7 @@ void PixcMqttClient::connect() {
     _client = nullptr;
     _connected = false;
     _started = false;
+    _lastWasRefusal = false;   // a rebuilt client has not been refused yet
     flushEvents();
   }
   // A pending backoff applies to a (re)start as well, so WLED's 30-second initMqtt() calls cannot

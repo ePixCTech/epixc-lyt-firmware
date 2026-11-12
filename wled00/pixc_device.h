@@ -19,9 +19,10 @@ void pixcRequestFactoryReset(const char* why);
 bool pixcFactoryResetPending();
 
 // Format LittleFS (cfg, wsec with every key, presets, everything), erase the Wi-Fi configuration
-// in NVS and the usermod's own NVS namespaces, then restart. Keeps `pixc_fac` (the factory hotspot
-// password) and `pixc_ota` (the anti-rollback floor): a reset must not make a unit accept an older
-// signed image, and the password printed on its label must keep working. Does not return.
+// in NVS, the usermod's own NVS namespaces (reset counter, pending login, energy log) and any crash
+// dump, then restart. Keeps `pixc_fac` (the factory hotspot password) and `pixc_ota` (the
+// anti-rollback floor): a reset must not make a unit accept an older signed image, and the
+// password printed on its label must keep working. Does not return.
 [[noreturn]] void pixcFactoryWipeNow();
 
 // Reboot `ms` from now, from the loop (so a reply can leave first).

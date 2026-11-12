@@ -27,7 +27,8 @@
 // **Reconnects are ours, with backoff and jitter** (audit R3). esp-mqtt's own reconnect is a fixed
 // 10 s for every unit, so a broker restart brought the whole fleet back in the same second. Auto
 // reconnect is disabled and `loop()` calls esp_mqtt_client_reconnect() on an exponential schedule
-// with jitter (pixc::backoffWithJitter).
+// with jitter (pixc::backoffWithJitter). A refused login is the exception: it is retried every
+// 2-3 s until the usermod pulls a new login (pixc::mqttReconnectWait).
 //
 // Payload chunking is passed through as `index`/`total`, which is what `onMqttMessage` already
 // reassembles — the esp-mqtt names for those are `current_data_offset` and `total_data_len`.
@@ -101,6 +102,9 @@ class PixcMqttClient {
   QueueHandle_t _events = nullptr;
   bool _connected = false;
   volatile uint8_t _loginRefusals = 0;
+  /// The last failed attempt was a refused login, not a transport or TLS failure. Written by the
+  /// esp-mqtt task, and by the loop on connect and on new credentials; read by scheduleReconnect().
+  volatile bool _lastWasRefusal = false;
   /// Consecutive failed attempts since the last successful connect; drives the backoff.
   uint8_t _attempt = 0;
   bool _reconnectDue = false;

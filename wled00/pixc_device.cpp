@@ -7,6 +7,7 @@
 #include "../usermods/pixc_connect_blink/pixc_logic.h"
 
 #include <Preferences.h>
+#include <esp_core_dump.h>
 #include <esp_random.h>
 #include <esp_system.h>
 #include <esp_wifi.h>
@@ -52,10 +53,16 @@ void pixcFactoryWipeNow() {
   // Wi-Fi configuration the ESP32 keeps in its own NVS namespace (WLED stores credentials there
   // with WiFi.persistent(true) on first connect).
   esp_wifi_restore();
-  for (const char* ns : {kNsReset, "pixc_prov"}) {   // the reset counter and a pending broker login
+  // The reset counter, a pending broker login, and the energy log: its hours not yet acknowledged
+  // would otherwise reach the cloud under the next owner's pairing (review 2026-11-10). pixc_fac
+  // (the label's data) and pixc_ota (the anti-rollback floor) stay.
+  for (const char* ns : {kNsReset, "pixc_prov", "pixc_e"}) {
     Preferences p;
     if (p.begin(ns, false)) { p.clear(); p.end(); }
   }
+  // A crash dump (the coredump partition) holds task stacks from this owner's use, which can carry
+  // keys, the Wi-Fi password or the broker login. ESP_ERR_NOT_FOUND when there is none: ignored.
+  esp_core_dump_image_erase();
   // Everything on the filesystem: cfg.json, wsec.json (Wi-Fi PSK, device key, LAN key, broker
   // password), presets.json and any other file.
   WLED_FS.format();

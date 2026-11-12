@@ -399,6 +399,37 @@ static void testBackoff() {
   }
 }
 
+// Review 2026-11-10: ten refused logins took 7 to 13 minutes on the 2 s to 5 min backoff, so the
+// 10-minute stale rule usually fired before the refusal rule.
+static void testLoginRefusalRetry() {
+  // The waits between ten refusals in a row: flat 2-3 s, none a backoff step, 30 s at most.
+  for (uint32_t r : {0u, 999u, 1000u, 123457u, 0xFFFFFFFFu}) {
+    uint8_t attempt = 0;
+    uint32_t total = 0;
+    for (uint8_t refusals = 1; refusals < pixc::kLoginRefusalsBeforePull; refusals++) {
+      const pixc::ReconnectWait w = pixc::mqttReconnectWait(attempt, true, refusals, 2000, 300000, r);
+      CHECK(w.ms >= 2000 && w.ms < 3000);
+      CHECK(!w.backoffStep);
+      if (w.backoffStep) attempt++;
+      total += w.ms;
+    }
+    CHECK(attempt == 0);
+    CHECK(total >= 18000 && total <= 30000);
+  }
+  // From the pull on, the backoff applies to refusals too.
+  pixc::ReconnectWait w = pixc::mqttReconnectWait(0, true, pixc::kLoginRefusalsBeforePull, 2000, 300000, 0);
+  CHECK(w.backoffStep && w.ms == 1000);
+  w = pixc::mqttReconnectWait(2, true, 255, 2000, 300000, 4000);
+  CHECK(w.backoffStep && w.ms == 8000);
+  // A transport or TLS failure still doubles, even after refusals were counted.
+  w = pixc::mqttReconnectWait(0, false, 0, 2000, 300000, 0);
+  CHECK(w.backoffStep && w.ms == 1000);
+  w = pixc::mqttReconnectWait(3, false, 5, 2000, 300000, 8000);
+  CHECK(w.backoffStep && w.ms == 16000);
+  w = pixc::mqttReconnectWait(20, false, 0, 2000, 300000, 0);
+  CHECK(w.backoffStep && w.ms == 150000);
+}
+
 // ---------------------------------------------------------------------------------------------
 // C2: the SSID in the health JSON is escaped.
 // ---------------------------------------------------------------------------------------------
@@ -798,6 +829,7 @@ int main() {
   testFactoryData();
   testJsonEscape();
   testBackoff();
+  testLoginRefusalRetry();
   testRedaction();
   testPinGuardBackoff();
   testPinGuardOwnerNeverLockedOut();
