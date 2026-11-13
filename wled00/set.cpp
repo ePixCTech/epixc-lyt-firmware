@@ -4,6 +4,11 @@
  * Receives client input
  */
 
+// Runtime state private to this file - previously WLED_GLOBAL, a leftover from
+// when all state lived in one big extern block regardless of who used it.
+static byte presetCycMin = 1;
+static byte presetCycMax = 5;
+
 //called upon POST settings form submit
 void handleSettingsSet(AsyncWebServerRequest *request, byte subPage)
 {
@@ -16,9 +21,9 @@ void handleSettingsSet(AsyncWebServerRequest *request, byte subPage)
   //0: menu 1: wifi 2: leds 3: ui 4: sync 5: time 6: sec 7: DMX 8: usermods 9: N/A 10: 2D
   if (subPage < 1 || subPage > 10 || !PIXC_UNLOCKED(request)) return;
 
+  switch (subPage) {
   //WIFI SETTINGS
-  if (subPage == SUBPAGE_WIFI)
-  {
+  case SUBPAGE_WIFI: {
     unsigned cnt = 0;
     for (size_t n = 0; n < WLED_MAX_WIFI_COUNT; n++) {
       char cs[4] = "CS"; cs[2] = 48+n; cs[3] = 0; //client SSID
@@ -105,7 +110,7 @@ void handleSettingsSet(AsyncWebServerRequest *request, byte subPage)
     apBehavior = request->arg(F("AB")).toInt();
     char oldSSID[33]; strcpy(oldSSID, apSSID);
     strlcpy(apSSID, request->arg(F("AS")).c_str(), 33);
-    if (!strcmp(oldSSID, apSSID) && apActive) forceReconnect = true;
+    if ((strcmp(oldSSID, apSSID) != 0) && apActive) forceReconnect = true; // AP SSID changed
     apHide = request->hasArg(F("AH"));
     int passlen = request->arg(F("AP")).length();
     if (passlen == 0 || (passlen > 7 && !isAsterisksOnly(request->arg(F("AP")).c_str(), 65))) {
@@ -118,11 +123,27 @@ void handleSettingsSet(AsyncWebServerRequest *request, byte subPage)
 
     #ifdef ARDUINO_ARCH_ESP32
     int tx = request->arg(F("TX")).toInt();
-    txPower = min(max(tx, (int)WIFI_POWER_2dBm), (int)WIFI_POWER_19_5dBm);
+    #if (ESP_IDF_VERSION_MAJOR > 4)
+      txPower = min(max((int)tx, (int)WIFI_POWER_2dBm), (int)WIFI_POWER_21dBm);  // V5 allows WIFI_POWER_21dBm = 84 ... WIFI_POWER_MINUS_1dBm = -4
+    #else
+      txPower = min(max((int)tx, (int)WIFI_POWER_2dBm), (int)WIFI_POWER_19_5dBm);
+    #endif
     #endif
 
     force802_3g = request->hasArg(F("FG"));
     noWifiSleep = request->hasArg(F("WS"));
+    #ifdef SOC_WIFI_SUPPORT_5G
+    if (request->hasArg(F("BM"))) {
+      int bm = request->arg(F("BM")).toInt();
+      if (bm >= WIFI_BAND_MODE_2G_ONLY && bm <= WIFI_BAND_MODE_AUTO) {
+        if (bm != wifiBandMode) { 
+          forceReconnect = true;
+          WiFi.scanDelete();
+        }
+        wifiBandMode = bm;
+      }
+    }
+    #endif
 
     #ifndef WLED_DISABLE_ESPNOW
     bool oldESPNow = enableESPNow;
@@ -149,11 +170,10 @@ void handleSettingsSet(AsyncWebServerRequest *request, byte subPage)
     ethernetType = request->arg(F("ETH")).toInt();
     initEthernet();
     #endif
-  }
+  } break;
 
   //LED SETTINGS
-  if (subPage == SUBPAGE_LEDS)
-  {
+  case SUBPAGE_LEDS: {
     int t = 0;
 
     if (rlyPin>=0 && PinManager::isPinAllocated(rlyPin, PinOwner::Relay)) {
@@ -308,6 +328,7 @@ void handleSettingsSet(AsyncWebServerRequest *request, byte subPage)
     }
     rlyMde = (bool)request->hasArg(F("RM"));
     rlyOpenDrain = (bool)request->hasArg(F("RO"));
+    relayDelay = request->arg(F("RLD")).toInt();
 
     disablePullUp = (bool)request->hasArg(F("IP"));
     touchThreshold = request->arg(F("TT")).toInt();
@@ -340,7 +361,7 @@ void handleSettingsSet(AsyncWebServerRequest *request, byte subPage)
             PinManager::deallocatePin(buttons[i].pin, PinOwner::Button);
             buttons[i].type = BTN_TYPE_NONE;
           }
-          #ifdef SOC_TOUCH_VERSION_2 // ESP32 S2 and S3 have a fucntion to check touch state but need to attach an interrupt to do so
+          #ifdef SOC_TOUCH_VERSION_2 // ESP32 S2 and S3 have a function to check touch state but need to attach an interrupt to do so
           else touchAttachInterrupt(buttons[i].pin, touchButtonISR, touchThreshold << 4); // threshold on Touch V2 is much higher (1500 is a value given by Espressif example, I measured changes of over 5000)
           #endif
         } else
@@ -402,22 +423,20 @@ void handleSettingsSet(AsyncWebServerRequest *request, byte subPage)
     if (t > 0) briMultiplier = t;
 
     doInitBusses = busesChanged;
-  }
+  } break;
 
   //UI
-  if (subPage == SUBPAGE_UI)
-  {
+  case SUBPAGE_UI: {
     strlcpy(serverDescription, request->arg(F("DS")).c_str(), 33);
     simplifiedUI = request->hasArg(F("SU"));
     DEBUG_PRINTLN(F("Enumerating ledmaps"));
     enumerateLedmaps();
     DEBUG_PRINTLN(F("Loading custom palettes"));
     loadCustomPalettes(); // (re)load all custom palettes
-  }
+  } break;
 
   //SYNC
-  if (subPage == SUBPAGE_SYNC)
-  {
+  case SUBPAGE_SYNC: {
     int t = request->arg(F("UP")).toInt();
     if (t > 0) udpPort = t;
     t = request->arg(F("U2")).toInt();
@@ -526,11 +545,10 @@ void handleSettingsSet(AsyncWebServerRequest *request, byte subPage)
     t = request->arg(F("BD")).toInt();
     if (t >= 96 && t <= 15000) serialBaud = t;
     updateBaudRate(serialBaud *100);
-  }
+  } break;
 
   //TIME
-  if (subPage == SUBPAGE_TIME)
-  {
+  case SUBPAGE_TIME: {
     ntpEnabled = request->hasArg(F("NT"));
     strlcpy(ntpServerName, request->arg(F("NS")).c_str(), 33);
     useAMPM = !request->hasArg(F("CF"));
@@ -620,11 +638,10 @@ void handleSettingsSet(AsyncWebServerRequest *request, byte subPage)
     }
     compactTimers();
 
-  }
+  } break;
 
   //SECURITY
-  if (subPage == SUBPAGE_SEC)
-  {
+  case SUBPAGE_SEC: {
     if (request->hasArg(F("RS"))) //complete factory reset
     {
       WLED_FS.format();
@@ -680,11 +697,10 @@ void handleSettingsSet(AsyncWebServerRequest *request, byte subPage)
       #endif
       otaSameSubnet = request->hasArg(F("SU"));
     }
-  }
+  } break;
 
   #ifdef WLED_ENABLE_DMX // include only if DMX is enabled
-  if (subPage == SUBPAGE_DMX)
-  {
+  case SUBPAGE_DMX: {
     int t = request->arg(F("PU")).toInt();
     if (t >= 0  && t <= 63999) e131ProxyUniverse = t;
 
@@ -709,12 +725,11 @@ void handleSettingsSet(AsyncWebServerRequest *request, byte subPage)
       t = request->arg(argname).toInt();
       DMXFixtureMap[i] = t;
     }
-  }
+  } break;
   #endif
 
   //USERMODS
-  if (subPage == SUBPAGE_UM)
-  {
+  case SUBPAGE_UM: {
     if (!requestJSONBufferLock(JSON_LOCK_SETTINGS)) {
       request->deferResponse();
       return;
@@ -813,16 +828,13 @@ void handleSettingsSet(AsyncWebServerRequest *request, byte subPage)
       if (name.endsWith("[]")) {
         name.replace("[]","");
         value.replace(",",".");      // just in case conversion
-        if (!subObj[name].is<JsonArray>()) {
-          JsonArray ar = subObj.createNestedArray(name);
-          if (value.indexOf(".") >= 0) ar.add(value.toFloat());  // we do have a float
-          else                         ar.add(value.toInt());    // we may have an int
-          j=0;
-        } else {
-          if (value.indexOf(".") >= 0) subObj[name].add(value.toFloat());  // we do have a float
-          else                         subObj[name].add(value.toInt());    // we may have an int
-          j++;
-        }
+        JsonArray ar = subObj[name].as<JsonArray>();
+        bool newArray = ar.isNull();
+        if (newArray) ar = subObj.createNestedArray(name);
+        if (value.indexOf(".") >= 0) ar.add(value.toFloat());  // we do have a float
+        else                         ar.add(value.toInt());    // we may have an int
+        if (newArray) j=0;
+        else          j++;
         DEBUG_PRINTF_P(PSTR("[%d] = %s\n"), j, value.c_str());
       } else {
         // we are using a hidden field with the same name as our parameter (!before the actual parameter!)
@@ -848,12 +860,11 @@ void handleSettingsSet(AsyncWebServerRequest *request, byte subPage)
     UsermodManager::readFromConfig(um);  // force change of usermod parameters
     DEBUG_PRINTLN(F("Done re-init UsermodManager::"));
     releaseJSONBufferLock();
-  }
+  } break;
 
   #ifndef WLED_DISABLE_2D
   //2D panels
-  if (subPage == SUBPAGE_2D)
-  {
+  case SUBPAGE_2D: {
     strip.isMatrix = request->arg(F("SOMP")).toInt();
     strip.panel.clear();
     if (strip.isMatrix) {
@@ -886,8 +897,11 @@ void handleSettingsSet(AsyncWebServerRequest *request, byte subPage)
     strip.deserializeMap(); // (re)load default ledmap (will also setUpMatrix() if ledmap does not exist)
     strip.makeAutoSegments(true); // force re-creation of segments
     strip.resume();
-  }
+  } break;
   #endif
+  default:
+    break;
+  }
 
   lastEditTime = millis();
   // do not save if factory reset or LED settings (which are saved after LED re-init)

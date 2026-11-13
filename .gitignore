@@ -1,5 +1,4 @@
 .cache
-.clang-format
 .direnv
 .DS_Store
 .idea
@@ -13,12 +12,16 @@ __pycache__/
 /.dummy
 /dependencies.lock
 /managed_components
+/docs/temp/
+/docs/tmp/
+/docs/ignore/
 
 esp01-update.sh
 # Upstream ignores this as a per-developer override. For ePixC it IS the product
 # definition — partition table, GPIO map, LED type, every WLED_DISABLE_* flag — so
 # losing it means losing the ability to build the firmware that ships. Tracked.
 !platformio_override.ini
+AGENTS.local.md
 platformio_release.ini
 replace_fs.py
 wled-update.sh

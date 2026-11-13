@@ -146,8 +146,17 @@ CLAIMS = [
         # `WLED_ENABLE_DMX` as a substring, so the naive pattern reports the flag as present and
         # this row fails on a truthful build. The check would then be corrected by loosening it,
         # which is how a guard ends up passing for the wrong reason.
+        #
+        # Repointed 2026-11-13 (merge of WLED main at 01f74928, fw-idf5 stage 1): upstream now names
+        # the flag once, to take it OUT of its ESP32-P4 builds (`[esp32p4]` build_unflags, the line
+        # after its DMX-input unflag). That one place is excepted by its exact context, so any other
+        # mention still goes red. The override is read too, outside its commented-out examples.
         "evidence": [
-            {"file": "platformio.ini", "must": "absent", "pattern": r"WLED_ENABLE_DMX(?!_INPUT)"},
+            {"file": "platformio.ini", "must": "absent",
+             "pattern": r"(?<!-D WLED_ENABLE_DMX_INPUT ;; library not compatible with -P4 -D )"
+                        r"WLED_ENABLE_DMX(?!_INPUT)"},
+            {"file": "platformio_override.ini", "must": "absent",
+             "pattern": r"(?<![;#] )-D WLED_ENABLE_DMX(?!_INPUT)"},
         ],
     },
     {

@@ -184,10 +184,9 @@ class Bus {
               type == TYPE_NET_DDP_RGBW || type == TYPE_NET_ARTNET_RGBW;                   // network types with white channel
     }
     static constexpr bool hasCCT(uint8_t type) {
-      return  type == TYPE_WS2812_2CH_X3 || type == TYPE_WS2812_WWA ||
+      return  type == TYPE_WS2812_WWA    || type == TYPE_SM16825 ||
               type == TYPE_ANALOG_2CH    || type == TYPE_ANALOG_5CH ||
-              type == TYPE_FW1906        || type == TYPE_WS2805     ||
-              type == TYPE_SM16825;
+              type == TYPE_FW1906        || type == TYPE_WS2805;
     }
     static constexpr bool  isTypeValid(uint8_t type)  { return (type > 15 && type < 128); }
     static constexpr bool  isDigital(uint8_t type)    { return (type >= TYPE_DIGITAL_MIN && type <= TYPE_DIGITAL_MAX) || is2Pin(type); }
@@ -442,6 +441,7 @@ class BusHub75Matrix : public Bus {
     uint8_t _rows = 1; // panels per row
     uint8_t _cols = 1; // panels per column
     bool _isVirtual = false; // note: this is not strictly needed but there are padding bytes here anyway
+    bool _isQuadScan = false;
     CRGB *_ledBuffer = nullptr; // note: using uint32_t buffer is only 2% faster and not worth the extra RAM
     byte *_ledsDirty = nullptr;
     // workaround for missing constants on include path for non-MM
@@ -571,6 +571,7 @@ namespace BusManager {
   [[gnu::hot]] uint32_t getPixelColor(unsigned pix);
   void        show();
   bool        canAllShow();
+  void        blank();  // Set all pixels to black
   inline void setStatusPixel(uint32_t c) { for (auto &bus : busses) bus->setStatusPixel(c);}
   inline void setBrightness(uint8_t b)   { for (auto &bus : busses) bus->setBrightness(b); }
   // for setSegmentCCT(), cct can only be in [-1,255] range; allowWBCorrection will convert it to K
