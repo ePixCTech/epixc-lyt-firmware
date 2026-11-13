@@ -32,7 +32,11 @@ if env.get("PIOPLATFORM") == "espressif32":
     # Find sections.ld on the linker search path (LIBPATH).
     sections_ld_path = None
     for ld_dir in env.get("LIBPATH", []):
-        candidate = Path(str(ld_dir)) / "sections.ld"
+        # Substituted (ePixC): platform espressif32 8.0.0 (Arduino 3.3.12) has sections.ld only in
+        # the libs' memory-type folder, which LIBPATH names as "${__get_board_memory_type(__env__)}".
+        # Unsubstituted, nothing was found, the else branch below waited for a sections.ld that an
+        # Arduino build never makes, and --gc-sections dropped every usermod's array entry.
+        candidate = Path(env.subst(str(ld_dir))) / "sections.ld"
         if candidate.exists():
             sections_ld_path = candidate
             break
@@ -45,7 +49,9 @@ if env.get("PIOPLATFORM") == "espressif32":
         # leaves the ASSERTs satisfied.
         build_dir = Path(env.subst("$BUILD_DIR"))
         patched_path = build_dir / "dynarray_sections.ld"
-        shutil.copy(sections_ld_path, patched_path)
+        # The bytes only, not the mode (ePixC): the box builds with a read-only PlatformIO home, and
+        # a read-only copy could not be patched below.
+        shutil.copyfile(sections_ld_path, patched_path)
         inject_before_marker(patched_path, "_rodata_end = ABSOLUTE(.);")
 
         # Replace "sections.ld" in LINKFLAGS with an absolute path to our

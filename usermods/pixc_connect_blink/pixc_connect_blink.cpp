@@ -934,7 +934,8 @@ class PixcConnectBlink : public Usermod {
     // still erased after that event: it is never sent, and it holds task stacks from before the
     // crash, which can carry keys, the Wi-Fi password or the broker login.
     //
-    // The check's answers, read from IDF 4.4.7's libespcoredump.a: ESP_OK for a whole dump,
+    // The check's answers, read from IDF 4.4.7's libespcoredump.a, and the same in IDF 5.5.5's
+    // (fw-idf5, disassembled: a size word of 0xFFFFFFFF still returns 0x104): ESP_OK for a whole dump,
     // ESP_ERR_INVALID_CRC for one that fails its checksum, ESP_ERR_INVALID_SIZE for a blank or
     // erased partition (the size word is 0xFFFFFFFF) and for an impossible size, ESP_ERR_NOT_FOUND
     // only when there is no coredump partition. So only the first two count as a dump: treating

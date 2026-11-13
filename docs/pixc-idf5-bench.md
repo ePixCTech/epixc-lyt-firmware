@@ -19,7 +19,8 @@ Founder decision, 2026-11-13 (Production review 2026-11-10, decisions):
 | 0 | Founder | One OTA on today's IDF 4.4 line (`17.0.1-pixc7`), before any IDF 5 image. |
 | 1 | Agent, done | Merge of WLED main at `01f74928`. `PixC_V1` stays on IDF 4.4 (`espressif32@6.13.0`). |
 | 1 bench | Founder | The merged build on IDF 4.4. This finds faults from the merge alone. |
-| 2 | Agent | `espressif32@8.0.0`, the ePixC code on IDF 5, and the CI checks for IDF 5. |
+| 2 | Agent, done | `espressif32@8.0.0`. Every ePixC env builds on IDF 5, and the box's image gates read the IDF 5 build. |
+| 2, rest | Agent | mbedTLS 3 in the ePixC TLS paths (the pinned roots, the OTA signature check), the WPA2/WPA3 hotspot, the readers of `deviceId` in `/json/info`. |
 | 2 bench | Founder | The IDF 5 build on a spare board, written by cable. |
 | 3 | Founder | The first board crosses from IDF 4.4 to IDF 5 by OTA, with a forced revert. |
 | 4 | Agent, then founder | Writer ticket 09: the secure bootloader from IDF v5.5.5, on a spare board. |
@@ -51,6 +52,43 @@ Measured on the stage 1 build (`PixC_V1`, IDF 4.4.7, 2026-11-13):
 | `bootloader.bin` | 15,104 bytes (IDF 4.4.7, not changed) |
 
 The study measured 1,462,544 bytes for the app image before the merge.
+
+## What stage 2 changed
+
+- `PixC_V1` uses `platform = espressif32@8.0.0`: Arduino-ESP32 3.3.12 on ESP-IDF v5.5.5
+  (`b774170ff46`), mbedTLS 3.6.6, GCC 14.2. The fallback platform (pioarduino `55.03.312-1`) was
+  not necessary. The platform names the Arduino core, the ESP32-S3 libraries and esptool by
+  range; `platform_packages` pins the exact versions of this build.
+- `PixC_V1` takes upstream's IDF 5 flags and libraries (`${esp32s3.build_flags}`):
+  `WLED_USE_SHARED_RMT`, `ESP32_ARDUINO_NO_RGB_BUILTIN`, NeoPixelBus `76afe832` (the CORE3
+  branch, IDF 5's RMT driver), and no NeoEsp32RmtHI. The section `[pixc_esp32s3_idf_V4]` is gone.
+- Libraries that no ePixC image compiles are not in `lib_deps`: esp_dmx, IRremoteESP8266,
+  AsyncMqttClient and the two GIF libraries.
+- Faults of the new platform. The build showed no sign of the first two:
+  - Its Arduino build script sets no `-O` flag. Every file compiled with `-O0`: the image was
+    2,730,144 bytes (87 % of the slot), with deeper stacks and slower effects. `PixC_V1` sets
+    `-Os` now, as Arduino 2.0.17 did.
+  - `pio-scripts/dynarray.py` did not find the linker script, so the linker dropped the usermods'
+    entries. The image linked and booted with no ePixC usermod and no mic usermod. The script
+    finds it now, and a new gate (`ci/checks/usermods-registered.py`) stops a build without them.
+  - The build stopped in two scripts: `pio-scripts/output_bins.py` on an empty define of the
+    platform, and `pio-scripts/strip-floats.py` on its linker flags in lists.
+- Code: the task watchdog is set to 20 s with IDF 5's call (`esp_task_wdt_reconfigure`; Arduino
+  3.x has already started it at 5 s). The MQTT client uses IDF 5's nested esp-mqtt config, and
+  registers its event handler on the client. The partition table is the same, byte for byte.
+- CI: `nm.sh` reads the new toolchain (`toolchain-xtensa-esp-elf`). `bootloader-rollback.py` reads
+  the sdkconfig of `framework-arduinoespressif32-esp32s3-libs`: bootloader and app rollback on,
+  the certificate-bundle hook on, `MBEDTLS_DYNAMIC_FREE_CA_CERT` off, ESP-IDF v5.5.5.
+  `rollback-later.sh` accepts only the strong `verifyRollbackLater`, not the framework's weak one.
+- Not changed: the setup hotspot is WPA2 still, and the TLS code has the same logic.
+
+Measured on the stage 2 build (`PixC_V1`, IDF 5.5.5, 2026-11-13):
+
+| Item | Value |
+|---|---|
+| App image | 1,664,384 bytes of the 3,145,728-byte OTA slot (52.9 %) |
+| Static RAM | 62,852 bytes (19.2 %) |
+| `bootloader.bin` | 19,968 bytes (IDF 5.5.5, prebuilt) |
 
 ## Stage 0: one OTA on IDF 4.4
 
@@ -88,10 +126,12 @@ the first board by cable: its cable writes are over. Compare each result with `1
 Write the spare board by cable. It gets the IDF 5 bootloader. Do not use the first board.
 
 - [ ] 1. Cold boot ten times. Look for "CONFLICT! driver_ng" aborts, watchdog and interrupt
-      watchdog resets, and 8 MB octal PSRAM not found.
+      watchdog resets, and 8 MB octal PSRAM not found. On `PixC_V1_dev`, the serial log shows
+      that the ePixC usermod and the mic usermod start.
 - [ ] 2. 300 LEDs on GPIO16 under Wi-Fi load. Run fast effects, a Sync DDP stream at 60 fps, live
       power every 2 s and a TLS reconnect at the same time. Look for flicker (a scope if you can).
-      The high-priority RMT interrupt (NeoEsp32RmtHI) is not in the IDF 5 build.
+      The high-priority RMT interrupt (NeoEsp32RmtHI) is not in the IDF 5 build. The effects run as
+      smoothly as on the IDF 4.4 build.
 - [ ] 3. No orange flash at boot. The blue run, the green run and Aurora still play.
 - [ ] 4. Limiter and energy: full white on 5 m. The published amps are the same as the IDF 4.4
       build.
@@ -100,8 +140,8 @@ Write the spare board by cable. It gets the IDF 5 bootloader. Do not use the fir
       and ESP32-C3 only.
 - [ ] 6. Pairing v2 on iOS and on Android: hotspot `ePixC-XXXX` with the label password, the retry
       after a wrong Wi-Fi password, 409 for a second phone, `_pixc._tcp` found by mDNS.
-- [ ] 7. Hotspot WPA2/WPA3 mixed (when stage 2 sets it): join from iOS and from Android, by the
-      label QR and by hand.
+- [ ] 7. Hotspot WPA2/WPA3 mixed (when the rest of stage 2 sets it): join from iOS and from
+      Android, by the label QR and by hand.
 - [ ] 8. TLS:
   - [ ] Provisioning, and MQTT over `wss://api.epixc.in/mqtt`.
   - [ ] Certificate dates (D411): the Let's Encrypt expired, valid and revoked test hosts.
@@ -112,7 +152,8 @@ Write the spare board by cable. It gets the IDF 5 bootloader. Do not use the fir
       lease.
 - [ ] 10. 24 h soak with the lwIP thread-safety asserts on (`LWIP_CHECK_THREAD_SAFETY`): SNTP,
       LAN API, DDP and MQTT together. Record `heap_min`, `heap_largest` and `mqtt_dropped`.
-- [ ] 11. Watchdog: 20 s never trips in normal use. A hang that you cause trips it.
+- [ ] 11. Watchdog: 20 s never trips in normal use. A hang that you cause trips it after 20 s,
+      not after 5 s (Arduino 3.x starts the watchdog at 5 s, and WLED sets it to 20 s).
 - [ ] 12. Factory reset: five power-ons, and the reset from the cloud.
 - [ ] 13. A panic that you cause on the dev build: the core dump fits in 64 KB, and its summary
       reads back.
@@ -122,11 +163,11 @@ Measure and record in the vault:
 
 | Item | IDF 4.4 (stage 1) | IDF 5 |
 |---|---|---|
-| App image (slot 3,145,728 bytes) | 1,471,456 bytes | |
-| Static RAM | 60,172 bytes | |
+| App image (slot 3,145,728 bytes) | 1,471,456 bytes | 1,664,384 bytes |
+| Static RAM | 60,172 bytes | 62,852 bytes |
 | Free internal heap after boot | | |
 | Largest free internal block after boot | | |
-| `bootloader.bin` | 15,104 bytes | |
+| `bootloader.bin` | 15,104 bytes | 19,968 bytes |
 
 ## Stage 3: the first board crosses by OTA
 

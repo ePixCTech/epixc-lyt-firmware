@@ -98,10 +98,12 @@ constexpr uint8_t kDrainPerLoop = 8;
 constexpr uint32_t kBackoffBaseMs = 2000, kBackoffMaxMs = 300000;   // 2 s doubling to 5 min
 }  // namespace
 
-esp_err_t PixcMqttClient::eventHandler(esp_mqtt_event_handle_t event) {
-  auto* self = static_cast<PixcMqttClient*>(event->user_context);
-  if (self != nullptr) self->handle(event);
-  return ESP_OK;
+// Registered for every esp-mqtt event (esp_mqtt_client_register_event in start()); the client
+// itself is the handler argument.
+void PixcMqttClient::eventHandler(void* handlerArgs, esp_event_base_t, int32_t, void* eventData) {
+  auto* self = static_cast<PixcMqttClient*>(handlerArgs);
+  auto event = static_cast<esp_mqtt_event_handle_t>(eventData);
+  if (self != nullptr && event != nullptr) self->handle(event);
 }
 
 // Runs on the esp-mqtt task. Copies and queues; never calls into WLED.
@@ -142,7 +144,7 @@ void PixcMqttClient::handle(esp_mqtt_event_handle_t event) {
             (event->error_handle->connect_return_code == MQTT_CONNECTION_REFUSE_BAD_USERNAME ||
              event->error_handle->connect_return_code == MQTT_CONNECTION_REFUSE_NOT_AUTHORIZED)) {
           refused = true;
-          if (_loginRefusals < 255) _loginRefusals++;
+          if (_loginRefusals < 255) _loginRefusals = _loginRefusals + 1;
         }
       }
       _lastWasRefusal = refused;
@@ -158,7 +160,7 @@ bool PixcMqttClient::enqueue(uint8_t kind, esp_mqtt_event_handle_t event) {
   const size_t topicLen = kind == kEvData ? _lastTopic.length() : 0;
   const size_t dataLen = kind == kEvData ? (size_t)event->data_len : 0;
   auto* ev = static_cast<QueuedEvent*>(malloc(sizeof(QueuedEvent) + topicLen + 1 + dataLen + 1));
-  if (ev == nullptr) { _dropped++; return false; }
+  if (ev == nullptr) { _dropped = _dropped + 1; return false; }
   ev->kind = kind;
   ev->qos = (uint8_t)event->qos;
   ev->retain = event->retain;
@@ -181,7 +183,7 @@ bool PixcMqttClient::enqueue(uint8_t kind, esp_mqtt_event_handle_t event) {
   // 20 ms (several passes) is enough room for it; while this waits, esp-mqtt reads nothing more.
   // What is still dropped is counted, and the health report carries the count (`mqtt_dropped`).
   const TickType_t wait = pdMS_TO_TICKS(kind == kEvData ? 20 : 50);
-  if (xQueueSend(_events, &ev, wait) != pdTRUE) { free(ev); _dropped++; return false; }
+  if (xQueueSend(_events, &ev, wait) != pdTRUE) { free(ev); _dropped = _dropped + 1; return false; }
   return true;
 }
 
@@ -229,7 +231,7 @@ void PixcMqttClient::loop() {
           if (ev->total != _rxTotal || ev->index != _rxNext || ev->len > ev->total - ev->index) {
             _rxTotal = 0;
             _rxNext = UINT32_MAX;   // nothing matches until the next message starts at index 0
-            _dropped++;
+            _dropped = _dropped + 1;
             break;
           }
           _rxNext += ev->len;
@@ -261,65 +263,66 @@ bool PixcMqttClient::start() {
     if (_events == nullptr) return false;
   }
 
+  // ESP-IDF 5's nested config. Each field below is the one this client set on IDF 4.4.
   esp_mqtt_client_config_t cfg = {};
-  cfg.event_handle = &PixcMqttClient::eventHandler;
-  cfg.user_context = this;
-  cfg.host = _host.c_str();
-  cfg.port = _port;
-  cfg.keepalive = _keepAlive;
+  cfg.session.keepalive = _keepAlive;
   // esp-mqtt defaults to a 1 KB buffer for both directions. AsyncMqttClient had no such limit, so
   // the default would silently shrink two things WLED already does: a full state publish with
   // several segments, and an inbound preset or config push. Inbound over the limit is chunked and
   // reassembled; **outbound over the limit simply fails**, which is the one that would have been
   // hard to see. 2 KB in, 4 KB out, at a one-off cost of about 6 KB of RAM.
-  cfg.buffer_size = 2048;
-  cfg.out_buffer_size = 4096;
+  cfg.buffer.size = 2048;
+  cfg.buffer.out_size = 4096;
   // WLED's handlers no longer run here (see loop()); what is left is the TLS handshake - an
   // RSA-4096 chain verify for ISRG Root X1 - and socket I/O. 8 KB over esp-mqtt's 6 KB default
   // for the pinned-root verify callback: it was 7 KB, and the bench has only ever run this task
   // over plaintext 1883, so the TLS path's depth is unmeasured on hardware and this image is the
   // one that has to reach the broker to take any later fix. Check uxTaskGetStackHighWaterMark.
-  cfg.task_stack = 8192;
+  cfg.task.stack_size = 8192;
   // Our own reconnect schedule (loop()). With auto reconnect off, esp-mqtt waits for
   // esp_mqtt_client_reconnect(), waking every reconnect_timeout_ms/2 only to notice a stop - so a
   // short value keeps esp_mqtt_client_stop() from blocking the caller for long.
-  cfg.disable_auto_reconnect = true;
-  cfg.reconnect_timeout_ms = 1000;
-  if (_clientId.length() > 0) cfg.client_id = _clientId.c_str();
-  if (_user.length() > 0) cfg.username = _user.c_str();
-  if (_pass.length() > 0) cfg.password = _pass.c_str();
+  cfg.network.disable_auto_reconnect = true;
+  cfg.network.reconnect_timeout_ms = 1000;
+  if (_clientId.length() > 0) cfg.credentials.client_id = _clientId.c_str();
+  if (_user.length() > 0) cfg.credentials.username = _user.c_str();
+  if (_pass.length() > 0) cfg.credentials.authentication.password = _pass.c_str();
   if (_willTopic.length() > 0) {
-    cfg.lwt_topic = _willTopic.c_str();
-    cfg.lwt_msg = _willPayload.c_str();
-    cfg.lwt_qos = _willQos;
-    cfg.lwt_retain = _willRetain ? 1 : 0;
+    cfg.session.last_will.topic = _willTopic.c_str();
+    cfg.session.last_will.msg = _willPayload.c_str();
+    cfg.session.last_will.qos = _willQos;
+    cfg.session.last_will.retain = _willRetain ? 1 : 0;
   }
   // Outlives esp_mqtt_client_init below, which copies it.
   String uri;
   if (_port == kMqttWssPort) {
     // TLS ends at Caddy, which routes /mqtt to the broker; the same trust decision as below.
     //
-    // As a URI, not host + port + `path`: esp-mqtt (IDF 4.4.7) hands `path` to the WebSocket only
+    // As a URI, not host + port + `path`: esp-mqtt on IDF 4.4.7 handed `path` to the WebSocket only
     // from esp_mqtt_client_set_uri, so with `cfg.path` the light asked for "/", Caddy answered 401,
     // and esp_transport_ws, which never reads the status, said "Sec-WebSocket-Accept not found".
-    // No light reached the broker this way (first board, 2026-10-30).
+    // No light reached the broker this way (first board, 2026-10-30). The URI is kept on IDF 5.
     //
-    // No `cfg.transport`: the `wss` scheme picks it, and esp_mqtt_check_cfg_conflict rejects a URI
-    // and a transport together, so esp_mqtt_client_init returned NULL - with only a warning, which
+    // No `transport`: the `wss` scheme picks it, and esp_mqtt_check_cfg_conflict rejects a URI and
+    // a transport together, so esp_mqtt_client_init returned NULL - with only a warning, which
     // this build's log level drops. The first pixc6 build did exactly that, silently, every attempt.
     uri = String("wss://") + _host + ":" + String(_port) + "/mqtt";
-    cfg.uri = uri.c_str();
-    cfg.crt_bundle_attach = pixcTlsAttach;
+    cfg.broker.address.uri = uri.c_str();
+    cfg.broker.verification.crt_bundle_attach = pixcTlsAttach;
   } else if (_port == kMqttsPort) {
-    cfg.transport = MQTT_TRANSPORT_OVER_SSL;
+    cfg.broker.address.hostname = _host.c_str();
+    cfg.broker.address.port = _port;
+    cfg.broker.address.transport = MQTT_TRANSPORT_OVER_SSL;
     // The same pinned roots the provisioning fetch uses, and the same certificate date check
     // (D411), both set by pixcTlsAttach (pixc_https.cpp). The hook is esp-mqtt's
     // `crt_bundle_attach`, but it attaches no bundle: a bundle trusts every public CA, which means
     // any of them can mint a certificate for our broker.
-    cfg.crt_bundle_attach = pixcTlsAttach;
+    cfg.broker.verification.crt_bundle_attach = pixcTlsAttach;
   } else {
 #ifdef EPIXC_ALLOW_PLAINTEXT_MQTT
-    cfg.transport = MQTT_TRANSPORT_OVER_TCP;   // PixC_V1_dev bench broker only
+    cfg.broker.address.hostname = _host.c_str();   // PixC_V1_dev bench broker only
+    cfg.broker.address.port = _port;
+    cfg.broker.address.transport = MQTT_TRANSPORT_OVER_TCP;
 #else
     DEBUG_PRINTF("[ePixC] MQTT refused: port %u is not TLS (443 or 8883)\n", (unsigned)_port);
     return false;
@@ -332,7 +335,10 @@ bool PixcMqttClient::start() {
     DEBUG_PRINTLN(F("[ePixC] MQTT client refused its config"));
     return false;
   }
-  if (esp_mqtt_client_start(_client) != ESP_OK) {
+  // IDF 5 has no `event_handle` in the config: the handler is registered on the client, before it
+  // starts.
+  if (esp_mqtt_client_register_event(_client, MQTT_EVENT_ANY, &PixcMqttClient::eventHandler, this) != ESP_OK ||
+      esp_mqtt_client_start(_client) != ESP_OK) {
     esp_mqtt_client_destroy(_client);
     _client = nullptr;
     return false;

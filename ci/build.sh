@@ -87,6 +87,7 @@ step "the LAN API is gated";                       bash ci/checks/lan-gated.sh "
 step "no bench defaults";                          bash ci/checks/no-bench-defaults.sh "$ENV_NAME"
 step "verifyRollbackLater is overridden";          bash ci/checks/rollback-later.sh "$ENV_NAME"
 step "bootloader rollback is compiled in";         python3 ci/checks/bootloader-rollback.py "$ENV_NAME"
+step "the usermods are registered";                python3 ci/checks/usermods-registered.py "$ENV_NAME"
 step "an OTA public key is compiled in";           python3 ci/checks/ota-pubkey.py "$ENV_NAME"
 
 # The app image exactly as built, not a merged factory image: the box signs these bytes (pixc.sig).

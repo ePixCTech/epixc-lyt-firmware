@@ -10,7 +10,10 @@
 # it read GitHub's variables: the env is the first argument.
 set -euo pipefail
 . "$(dirname "$0")/nm.sh"
-if [[ $("$NM" "$ELF" | grep -c ' verifyRollbackLater$' || true) -ne 1 ]]; then
+# ' T ': the strong definition. An image without the override still has the symbol: the framework's
+# weak default ('W', Arduino 3.3.12 esp32-hal-misc.c), which confirms at boot. Counting that one
+# would pass the image this gate is for.
+if [[ $("$NM" "$ELF" | grep -c ' T verifyRollbackLater$' || true) -ne 1 ]]; then
   echo "error: verifyRollbackLater is not overridden: OTA images would be confirmed before the broker (D35)"
   exit 1
 fi

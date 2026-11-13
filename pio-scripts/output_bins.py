@@ -8,7 +8,9 @@ OUTPUT_DIR = "build_output{}".format(os.path.sep)
 #OUTPUT_DIR = os.path.join("build_output")
 
 def _get_cpp_define_value(env, define):
-    define_list = [item[-1] for item in env["CPPDEFINES"] if item[0] == define]
+    # Only (name, value) pairs: platform espressif32 8.0.0 (Arduino 3.3.12) appends an empty string
+    # (its Zigbee define, when no Zigbee mode is set), where item[0] raised IndexError (ePixC).
+    define_list = [item[-1] for item in env["CPPDEFINES"] if isinstance(item, (tuple, list)) and item[0] == define]
 
     if define_list:
         return define_list[0]

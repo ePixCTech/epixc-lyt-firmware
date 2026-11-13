@@ -125,10 +125,11 @@ CLAIMS = [
         # audit took the flag out of PixC_V1 with build_unflags that day. The id is kept so the
         # vault row keeps its history. Both halves are pinned now: upstream still sets it (so the
         # unflag is doing something), and PixC_V1 removes it (dev and citest extend PixC_V1).
+        # `[esp32_idf_V5]` since fw-idf5 stage 2 (2026-11-13): PixC_V1 takes upstream's IDF 5 flags.
         "id": "dmx-input-compiled-inactive",
         "section": "Protocols",
         "ticket": "161, hardening audit 2026-10-20",
-        "row": "**DMX input is not in any ePixC image.** Upstream's `[esp32_idf_V4]` sets "
+        "row": "**DMX input is not in any ePixC image.** Upstream's `[esp32_idf_V5]` sets "
                "`WLED_ENABLE_DMX_INPUT`, and `PixC_V1` removes it with `build_unflags`. No ePixC "
                "board has a DMX transceiver.",
         "evidence": [

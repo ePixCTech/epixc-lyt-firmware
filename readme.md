@@ -45,11 +45,12 @@ ePixC's code is in `usermods/pixc_connect_blink/`, in the `wled00/pixc_*` files 
   `ci/test.sh` (the host tests, the claims and brand checks, the pinned CA roots), then, only if
   it passed, `ci/build.sh`: `pio run -e PixC_V1` and every image gate in `ci/checks/` (the image
   fits the OTA slot, no plaintext HTTP client, the LAN API gated, no bench defaults,
-  `verifyRollbackLater`, bootloader rollback, an OTA public key compiled in). The box signs
-  `pixc.bin` with the OTA key, refusing an image whose compiled key is not its own, and the
-  admin console deploys it (Deploy, Firmware). The build also keeps what a first flash over USB
-  needs: `bootloader.bin`, `partitions.bin`, `boot_app0.bin` and `flash.json` (chip, flash
-  settings and each file's offset, read from the build), written to a board as they are.
+  `verifyRollbackLater`, bootloader rollback, the usermods registered, an OTA public key compiled
+  in). The box signs `pixc.bin` with the OTA key, refusing an image whose compiled key is not its
+  own, and the admin console deploys it (Deploy, Firmware). The build also keeps what a first
+  flash over USB needs: `bootloader.bin`, `partitions.bin`, `boot_app0.bin` and `flash.json`
+  (chip, flash settings and each file's offset, read from the build), written to a board as they
+  are.
   GitHub Actions builds nothing here since 2026-10-26: ePixC's workflow and upstream's are gone.
   Both scripts run on a laptop too: `bash ci/test.sh`, `bash ci/build.sh <folder>`.
 

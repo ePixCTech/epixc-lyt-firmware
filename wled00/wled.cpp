@@ -384,7 +384,25 @@ void WLED::loop()
 #if WLED_WATCHDOG_TIMEOUT > 0
 void WLED::enableWatchdog() {
   #ifdef ARDUINO_ARCH_ESP32
+  #if ESP_IDF_VERSION_MAJOR >= 5
+  // ePixC (fw-idf5): IDF 5 takes a config struct. Arduino 3.x has already started the task
+  // watchdog (CONFIG_ESP_TASK_WDT_INIT, 5 s), so it is reconfigured, as esp_task_wdt_init() did on
+  // IDF 4.4 when the watchdog was running: the new timeout and a panic, and the idle tasks that
+  // the framework's sdkconfig watches. Upstream never gets here: its IDF 5 envs set the timeout to 0.
+  esp_task_wdt_config_t wdtConfig = {};
+  wdtConfig.timeout_ms = WLED_WATCHDOG_TIMEOUT * 1000;
+  #if CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0
+  wdtConfig.idle_core_mask |= 1 << 0;
+  #endif
+  #if CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU1
+  wdtConfig.idle_core_mask |= 1 << 1;
+  #endif
+  wdtConfig.trigger_panic = true;
+  esp_err_t watchdog = esp_task_wdt_reconfigure(&wdtConfig);
+  if (watchdog == ESP_ERR_INVALID_STATE) watchdog = esp_task_wdt_init(&wdtConfig);   // not started yet
+  #else
   esp_err_t watchdog = esp_task_wdt_init(WLED_WATCHDOG_TIMEOUT, true);
+  #endif
   DEBUG_PRINT(F("Watchdog enabled: "));
   if (watchdog == ESP_OK) {
     DEBUG_PRINTLN(F("OK"));

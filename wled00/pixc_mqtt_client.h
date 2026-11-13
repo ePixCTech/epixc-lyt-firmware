@@ -90,7 +90,7 @@ class PixcMqttClient {
   uint32_t dropped() const { return _dropped; }
 
  private:
-  static esp_err_t eventHandler(esp_mqtt_event_handle_t event);
+  static void eventHandler(void* handlerArgs, esp_event_base_t base, int32_t eventId, void* eventData);
   void handle(esp_mqtt_event_handle_t event);
   bool start();
 
