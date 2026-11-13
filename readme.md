@@ -84,6 +84,12 @@ The example re-issues `17.0.1-pixc7` as `17.0.1-pixc9`, because `17.0.1-pixc8` i
    git switch master
    git restore --source=lyt-v17.0.1-pixc7 --staged --worktree -- :/
    ```
+   If the restored `ci/build.sh` does not contain `image_home` (`17.0.1-pixc6` and older), also
+   take `ci/build.sh` from `master`. The box's build image has a read-only PlatformIO home. An older
+   `ci/build.sh` gives that home to PlatformIO, and PlatformIO stops because it cannot write there.
+   ```sh
+   git restore --source=master --staged --worktree -- ci/build.sh
+   ```
 3. Set the next version: one more than the newest `pixcN` tag. A light gets only a version that is
    newer than the version that it runs. This command changes `package.json` and the two versions in
    `package-lock.json`.

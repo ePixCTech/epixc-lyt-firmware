@@ -6,7 +6,15 @@
 #     <out>/bootloader.bin, partitions.bin, boot_app0.bin, flash.json
 #                                   what a first flash over USB needs, and how to write it
 #                                   (ci/flash-files.py); written to a board as they are, not signed
-# PlatformIO is requirements.txt's, in a venv under $HOME/.cache/epixc-pio, made once and made again
+# PlatformIO is requirements.txt's. On the box the build image has it (epixc-backend
+# deploy/native/pipeline/image): PIO, and PLATFORMIO_CORE_DIR, its PlatformIO home with this tree's
+# platform and tools, read-only, so that no build can change the compilers of a later build.
+# PlatformIO writes its state, its lock files and its downloads into its home, so a read-only home
+# lends only its folders: they are linked into a new home under $HOME (on the box, a new one for
+# every build). The image's PlatformIO must be the version that requirements.txt pins, and a
+# platform or a tool that the image does not have cannot be installed into it: change the image
+# with the pins.
+# Without PIO (a laptop), a venv under $HOME/.cache/epixc-pio, made once and made again
 # when requirements.txt changes, with its own PlatformIO home beside it: a tool's Python modules
 # (esptool's) are installed into the Python that installs the tool, so a venv made again must
 # install the tools again too. PIO=<path to pio> uses another PlatformIO, and its home, instead.
@@ -16,7 +24,22 @@ cd "$(dirname "$0")/.."
 step() { printf '\n==> %s\n' "$1"; }
 ENV_NAME=PixC_V1
 
-if [ -z "${PIO:-}" ]; then
+if [ -n "${PIO:-}" ] && [ -d "${PLATFORMIO_CORE_DIR:-}" ] && [ ! -w "$PLATFORMIO_CORE_DIR" ]; then
+  image_home="$PLATFORMIO_CORE_DIR"
+  export PLATFORMIO_CORE_DIR="$HOME/.cache/epixc-pio-image"
+  step "PlatformIO from the build image: $image_home (read-only), linked into $PLATFORMIO_CORE_DIR"
+  rm -rf "$PLATFORMIO_CORE_DIR"
+  mkdir -p "$PLATFORMIO_CORE_DIR"
+  for d in "$image_home"/*/; do
+    [ -d "$d" ] || continue
+    ln -s "${d%/}" "$PLATFORMIO_CORE_DIR/"
+  done
+  pinned=$(sed -n 's/^platformio==\([^ ]*\).*/\1/p' requirements.txt)
+  have=$("$PIO" --version)
+  if [ "$have" != "PlatformIO Core, version $pinned" ]; then
+    echo "error: the build image has $have, but requirements.txt pins $pinned: make the image again with this requirements.txt"; exit 1
+  fi
+elif [ -z "${PIO:-}" ]; then
   cache="$HOME/.cache/epixc-pio"
   want=$(python3 -c 'import hashlib; print(hashlib.sha256(open("requirements.txt", "rb").read()).hexdigest())')
   if [ ! -x "$cache/venv/bin/pio" ] || [ "$(cat "$cache/requirements.sha256" 2>/dev/null || true)" != "$want" ]; then
