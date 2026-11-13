@@ -813,7 +813,111 @@ static void testCertDates() {
   CHECK(pixc::certTimeVerdict(from, pixc::kBadTime, 120, floor) == CertTime::Expired);
 }
 
+// ---------------------------------------------------------------------------------------------
+// Review 2026-11-10 (rollback-deadline-not-armed): a new image that cannot reach the broker is
+// reverted, also when its HTTPS path is broken and no login can be got.
+// ---------------------------------------------------------------------------------------------
+static void testProbation() {
+  const uint32_t min = 60UL * 1000;
+  // Who pulls a login at a Wi-Fi connection: no login; or a new image, once a boot.
+  CHECK(pixc::pullLoginOnConnect(false, false, false));
+  CHECK(pixc::pullLoginOnConnect(false, false, true));
+  CHECK(!pixc::pullLoginOnConnect(true, false, false));    // a stored login, no update: no rotation
+  CHECK(pixc::pullLoginOnConnect(true, true, false));      // a post-OTA boot with a stored login
+  CHECK(!pixc::pullLoginOnConnect(true, true, true));      // already pulled this boot
+  CHECK(!pixc::pullLoginOnConnect(true, false, true));
+
+  // Not on probation, or on the broker: never.
+  CHECK(!pixc::rollbackDue(false, false, true, 999 * min, 999 * min));
+  CHECK(!pixc::rollbackDue(true, true, true, 999 * min, 999 * min));
+  // A login confirmed this boot: 15 minutes after it, not before.
+  CHECK(!pixc::rollbackDue(true, false, true, 15 * min - 1, 20 * min));
+  CHECK(pixc::rollbackDue(true, false, true, 15 * min, 20 * min));
+  CHECK(pixc::rollbackDue(true, false, true, pixc::kRollbackAfterLoginMs, 0));
+  // No login this boot (the HTTPS path is broken too): the old rule never started; the backstop
+  // reverts after 60 minutes of Wi-Fi uptime, and not before.
+  CHECK(!pixc::rollbackDue(true, false, false, 999 * min, 60 * min - 1));
+  CHECK(pixc::rollbackDue(true, false, false, 0, 60 * min));
+  CHECK(pixc::rollbackDue(true, false, false, 0, pixc::kRollbackWifiUpMs + 1));
+  // A login confirmed only lately: the backstop still applies at 60 minutes of Wi-Fi.
+  CHECK(pixc::rollbackDue(true, false, true, 1 * min, 60 * min));
+  CHECK(!pixc::rollbackDue(true, false, true, 1 * min, 59 * min));
+  // The broker reached at the last moment wins over both.
+  CHECK(!pixc::rollbackDue(true, true, false, 0, 61 * min));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Review 2026-11-10 (coredump-never-read): the crash summary in the boot event.
+// ---------------------------------------------------------------------------------------------
+static void testPanicReport() {
+  // A typical summary: valid JSON once wrapped as the boot event carries it.
+  const char rawTask[16] = "loopTask";
+  const uint32_t bt[16] = {0x42001234, 0x42005678, 0x4037abcd, 0x42009abc, 0x42000001, 0x42000002,
+                           0x42000003, 0x42000004, 0x42000005, 0x42000006};
+  const char rawElf[17] = "0123456789ABCDEF";
+  pixc::PanicSummary p;
+  pixc::panicFrom(p, rawTask, sizeof(rawTask), 0x42001234, bt, 10, rawElf, sizeof(rawElf));
+  CHECK(std::strcmp(p.task, "loopTask") == 0);
+  CHECK(p.depth == pixc::kPanicBtMax);                    // ten given, eight kept
+  CHECK(std::strcmp(p.elf, "0123456789abcdef") == 0);
+  char frag[pixc::kPanicJsonMax];
+  const size_t len = pixc::formatPanic(frag, sizeof(frag), p);
+  CHECK(len > 0 && len < sizeof(frag));
+  std::string event = std::string("{\"type\":\"boot\",\"reason\":\"panic\",") + frag + "}";
+  DynamicJsonDocument doc(2048);
+  CHECK(!deserializeJson(doc, event));
+  CHECK(doc["panic"]["task"] == "loopTask");
+  CHECK(doc["panic"]["pc"] == "0x42001234");
+  CHECK(doc["panic"]["bt"].size() == pixc::kPanicBtMax);
+  CHECK(doc["panic"]["bt"][2] == "0x4037abcd");
+  CHECK(doc["panic"]["bt"][7] == "0x42000004");
+  CHECK(doc["panic"]["elf"] == "0123456789abcdef");
+
+  // The widest there can be: a 16-byte name with no NUL, all quotes and backslashes, the largest
+  // PCs, the full ELF hash. It fills the bound to the byte and still parses.
+  char wide[16];
+  for (int i = 0; i < 16; i++) wide[i] = (i % 2) ? '"' : '\\';
+  uint32_t big[16];
+  for (int i = 0; i < 16; i++) big[i] = 0xFFFFFFFFu;
+  pixc::panicFrom(p, wide, sizeof(wide), 0xFFFFFFFFu, big, 16, "ffffffffffffffff", 16);
+  CHECK(std::strlen(p.task) == pixc::kPanicTaskMax);
+  const size_t w = pixc::formatPanic(frag, sizeof(frag), p);
+  std::printf("  crash summary: worst case %zu bytes, buffer %zu\n", w, sizeof(frag));
+  CHECK(w == pixc::kPanicJsonMax - 1);                    // the bound is exact, not loose
+  event = std::string("{") + frag + "}";
+  DynamicJsonDocument d2(2048);
+  CHECK(!deserializeJson(d2, event));
+  CHECK(std::strlen(d2["panic"]["task"].as<const char*>()) == pixc::kPanicTaskMax);
+
+  // Read back from flash after a crash, nothing is trusted: control and non-ASCII bytes in the name
+  // become '?', a depth past the array is cut, non-hex in the hash is dropped, and the result is
+  // still valid JSON (a byte that is not UTF-8 would make the backend drop the event).
+  const char junk[16] = {'a', '\x01', '\xff', '\xc3', 'b', '\n', 0, 'z'};
+  pixc::panicFrom(p, junk, sizeof(junk), 0, bt, 1000, "12zz34\"5", 8);
+  CHECK(std::strcmp(p.task, "a???b?") == 0);
+  CHECK(p.depth == pixc::kPanicBtMax);
+  CHECK(std::strcmp(p.elf, "12345") == 0);
+  CHECK(pixc::formatPanic(frag, sizeof(frag), p) > 0);
+  event = std::string("{") + frag + "}";
+  DynamicJsonDocument d3(2048);
+  CHECK(!deserializeJson(d3, event));
+  CHECK(d3["panic"]["task"] == "a???b?");
+  // No backtrace, no hash, no name: an empty list and empty strings, still valid.
+  pixc::panicFrom(p, nullptr, 0, 0x40000000, nullptr, 3, nullptr, 0);
+  CHECK(p.depth == 0 && p.task[0] == 0 && p.elf[0] == 0);
+  CHECK(pixc::formatPanic(frag, sizeof(frag), p) > 0);
+  CHECK(std::strcmp(frag, "\"panic\":{\"task\":\"\",\"pc\":\"0x40000000\",\"bt\":[],\"elf\":\"\"}") == 0);
+  // A buffer too small: nothing, never a cut member.
+  pixc::panicFrom(p, rawTask, sizeof(rawTask), 0x42001234, bt, 8, rawElf, sizeof(rawElf));
+  char small[64];
+  CHECK(pixc::formatPanic(small, sizeof(small), p) == 0);
+  CHECK(small[0] == 0);
+  CHECK(pixc::formatPanic(nullptr, 10, p) == 0);
+}
+
 int main() {
+  testProbation();
+  testPanicReport();
   testPinGuardV2Mode();
   testCertDates();
   testLanAuthVectors();

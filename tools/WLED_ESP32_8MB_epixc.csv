@@ -30,10 +30,18 @@
 # effect only on a unit whose flash encryption is on; on any other, IDF treats no partition as
 # encrypted, so the filesystem stays exactly as it was.
 #
+# `coredump` is flagged `encrypted` too (review 2026-11-10), for the same reason and with the same
+# effect: nothing until flash encryption is on. A panic's dump holds task stacks, which can carry
+# keys, the Wi-Fi password or the broker login; the light reports the dump's summary in its next
+# boot event and then erases it (pixc_connect_blink readCrashDump). It applies to boards written
+# with this table from now on: a board already written keeps its table (the bench light).
+# `nvs` cannot be encrypted with the prebuilt framework (no NVS encryption compiled in), so the
+# light keeps no Wi-Fi password there (wled.cpp, PIXC_LAN_AUTH: WiFi.persistent(false)).
+#
 # Name,   Type, SubType, Offset,   Size,     Flags
 nvs,      data, nvs,     0x9000,   0x5000,
 otadata,  data, ota,     0xe000,   0x2000,
 app0,     app,  ota_0,   0x10000,  0x300000,
 app1,     app,  ota_1,   0x310000, 0x300000,
 spiffs,   data, spiffs,  0x610000, 0x1E0000, encrypted
-coredump, data, coredump,,         64K
+coredump, data, coredump,,         64K,      encrypted

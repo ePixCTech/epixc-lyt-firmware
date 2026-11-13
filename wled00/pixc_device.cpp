@@ -50,8 +50,9 @@ bool pixcFactoryResetPending() { return resetPending; }
 
 void pixcFactoryWipeNow() {
   DEBUG_PRINTF("[ePixC] factory reset: wiping (%s)\n", resetWhy);
-  // Wi-Fi configuration the ESP32 keeps in its own NVS namespace (WLED stores credentials there
-  // with WiFi.persistent(true) on first connect).
+  // Wi-Fi configuration the ESP32 keeps in its own NVS namespace. Since review 2026-11-10 the
+  // driver stores no credentials there (wled.cpp: WiFi.persistent(false)); a board that ran an
+  // older image may still hold the copy upstream WLED writes at the first connection.
   esp_wifi_restore();
   // The reset counter, a pending broker login, and the energy log: its hours not yet acknowledged
   // would otherwise reach the cloud under the next owner's pairing (review 2026-11-10). pixc_fac

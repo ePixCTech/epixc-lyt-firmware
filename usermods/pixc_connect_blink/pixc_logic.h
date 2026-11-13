@@ -799,5 +799,129 @@ inline CertTime certTimeVerdict(int64_t validFrom, int64_t validTo, int64_t now,
   return CertTime::Ok;
 }
 
+// ---------------------------------------------------------------------------------------------
+// A new image on probation (D35; review 2026-11-10, rollback-deadline-not-armed)
+// ---------------------------------------------------------------------------------------------
+// An OTA image boots PENDING_VERIFY and is confirmed when it reaches the broker
+// (confirmImageIfPending). Until then the usermod reverts it to the previous image when either rule
+// below is true, and a reset of any kind reverts it too.
+//  - A broker login was confirmed by the API over TLS this boot (the network, DNS, the pinned roots
+//    and the backend all work) and the broker is still not reached kRollbackAfterLoginMs later.
+//  - The Wi-Fi has been up for kRollbackWifiUpMs in all this boot and the broker is still not
+//    reached, however the login was got. This is the backstop for an image whose HTTPS path is
+//    broken as well: the first rule never starts for it, and before this it stayed on probation,
+//    refusing every OTA, until somebody cut the power.
+// A post-OTA boot pulls a fresh login as soon as the Wi-Fi connects (pullLoginOnConnect), so the
+// first rule starts at once. Before, a light with a stored login waited for the 10-minute stale rule,
+// and a broker-less image reverted after about 25 minutes.
+constexpr uint32_t kRollbackAfterLoginMs = 15UL * 60 * 1000;
+constexpr uint32_t kRollbackWifiUpMs = 60UL * 60 * 1000;
+
+// Whether a Wi-Fi connection pulls a broker login now. A light with no login pulls one. An image on
+// probation pulls one too, once a boot (`gotLoginThisBoot`: the API answered a pull this boot), so a
+// good image rotates its broker password once for each update, never on every boot.
+inline bool pullLoginOnConnect(bool haveLogin, bool onProbation, bool gotLoginThisBoot) {
+  return !haveLogin || (onProbation && !gotLoginThisBoot);
+}
+
+// Whether the image on probation is reverted now. `onProbation`: this boot runs a PENDING_VERIFY
+// image that is not yet confirmed (or reverted). `loginConfirmedThisBoot`: the API confirmed a broker
+// login this boot, `sinceLoginMs` ago. `wifiUpMs`: the Wi-Fi's uptime this boot, summed over every
+// connection.
+inline bool rollbackDue(bool onProbation, bool brokerConnected, bool loginConfirmedThisBoot,
+                        uint32_t sinceLoginMs, uint32_t wifiUpMs) {
+  if (!onProbation || brokerConnected) return false;
+  if (loginConfirmedThisBoot && sinceLoginMs >= kRollbackAfterLoginMs) return true;
+  return wifiUpMs >= kRollbackWifiUpMs;
+}
+
+// ---------------------------------------------------------------------------------------------
+// The crash report (review 2026-11-10, coredump-never-read)
+// ---------------------------------------------------------------------------------------------
+// A panic writes a core dump to the coredump partition. At the next boot the usermod reads its
+// summary (esp_core_dump_get_summary), the first boot event carries it as `"panic":{...}`, and the
+// dump is erased once that event is published. Cable access is over, so this is the only way a
+// crash in the field can be read. The program counters are the crashing image's: after an OTA
+// revert they belong to the image that crashed, not to the one that reports them, so `elf` (the
+// first 16 hex digits of the crashing image's ELF SHA-256, CONFIG_APP_RETRIEVE_LEN_ELF_SHA) names
+// the ELF to decode them with (xtensa-esp32s3-elf-addr2line -e firmware.elf <pc>).
+
+constexpr size_t kPanicTaskMax = 15;   // a FreeRTOS task name (configMAX_TASK_NAME_LEN 16, less NUL)
+constexpr size_t kPanicBtMax = 8;      // backtrace PCs sent; the summary holds up to 16
+constexpr size_t kPanicElfMax = 16;    // hex digits of the ELF SHA-256 the dump records
+
+struct PanicSummary {
+  char task[kPanicTaskMax + 1];   // the task that crashed, NUL-terminated
+  uint32_t pc;                    // the program counter of the exception
+  uint32_t bt[kPanicBtMax];       // the backtrace, innermost first
+  uint8_t depth;                  // entries of bt used, 0 to kPanicBtMax
+  char elf[kPanicElfMax + 1];     // hex digits only, NUL-terminated; may be empty
+};
+
+// Fills `out` from a core dump summary's fields. The dump is read back from flash after a crash,
+// so nothing in it is trusted: the task name may have no NUL within `taskLen` bytes and may hold any
+// byte (each one outside printable ASCII becomes '?': a byte that is not UTF-8 makes the event
+// invalid JSON), the depth may be anything, and only hex digits are kept from the ELF hash.
+inline void panicFrom(PanicSummary& out, const char* task, size_t taskLen, uint32_t pc,
+                      const uint32_t* bt, uint32_t depth, const char* elf, size_t elfLen) {
+  out = {};
+  size_t n = 0;
+  for (; task != nullptr && n < taskLen && n < kPanicTaskMax && task[n] != 0; n++) {
+    const unsigned char c = static_cast<unsigned char>(task[n]);
+    out.task[n] = (c >= 0x20 && c <= 0x7e) ? static_cast<char>(c) : '?';
+  }
+  out.task[n] = 0;
+  out.pc = pc;
+  out.depth = static_cast<uint8_t>(bt == nullptr ? 0 : (depth < kPanicBtMax ? depth : kPanicBtMax));
+  for (uint8_t i = 0; i < out.depth; i++) out.bt[i] = bt[i];
+  n = 0;
+  for (size_t i = 0; elf != nullptr && i < elfLen && elf[i] != 0 && n < kPanicElfMax; i++) {
+    if (isHexDigit(elf[i])) out.elf[n++] = detail::lower(elf[i]);
+  }
+  out.elf[n] = 0;
+}
+
+// The longest `"panic":{...}` there can be, NUL included: its fixed text, a task name of quotes or
+// backslashes (each escaped to two characters), the PCs at 10 characters each and the ELF hash.
+constexpr size_t kPanicJsonMax = 17 + kPanicTaskMax * 2          // "panic":{"task":" + the name
+    + 8 + 10                                                     // ","pc":" + 0x%08lx
+    + 8 + kPanicBtMax * 12 + (kPanicBtMax - 1)                   // ","bt":[ + "0x%08lx",...
+    + 9 + kPanicElfMax + 2                                       // ],"elf":" + hash + "}
+    + 1;                                                         // NUL
+
+// Formats the crash summary as a JSON member for the boot event: "panic":{"task":"loopTask",
+// "pc":"0x42001234","bt":["0x42001234",...],"elf":"0123456789abcdef"}. `buf` holds kPanicJsonMax
+// bytes. Returns the length written, or 0 when it did not fit (nothing is then sent: a cut member
+// would make the whole event invalid JSON, and the backend would drop it).
+inline size_t formatPanic(char* buf, size_t cap, const PanicSummary& p) {
+  if (buf == nullptr || cap == 0) return 0;
+  char name[kPanicTaskMax + 1];
+  for (size_t i = 0; i < kPanicTaskMax; i++) {   // printable ASCII only, as panicFrom keeps it
+    const unsigned char c = static_cast<unsigned char>(p.task[i]);
+    name[i] = (c == 0 || (c >= 0x20 && c <= 0x7e)) ? static_cast<char>(c) : '?';
+  }
+  name[kPanicTaskMax] = 0;
+  char task[kPanicTaskMax * 2 + 1];
+  jsonEscape(name, task, sizeof(task));
+  int n = snprintf(buf, cap, "\"panic\":{\"task\":\"%s\",\"pc\":\"0x%08lx\",\"bt\":[", task,
+                   static_cast<unsigned long>(p.pc));
+  size_t len = n > 0 ? static_cast<size_t>(n) : cap;
+  const uint8_t depth = p.depth < kPanicBtMax ? p.depth : static_cast<uint8_t>(kPanicBtMax);
+  for (uint8_t i = 0; i < depth && len < cap; i++) {
+    n = snprintf(buf + len, cap - len, "%s\"0x%08lx\"", i ? "," : "", static_cast<unsigned long>(p.bt[i]));
+    len = n > 0 ? len + static_cast<size_t>(n) : cap;
+  }
+  char elf[kPanicElfMax + 1];
+  size_t e = 0;
+  for (; e < kPanicElfMax && p.elf[e] != 0 && isHexDigit(p.elf[e]); e++) elf[e] = p.elf[e];
+  elf[e] = 0;
+  if (len < cap) {
+    n = snprintf(buf + len, cap - len, "],\"elf\":\"%s\"}", elf);
+    len = n > 0 ? len + static_cast<size_t>(n) : cap;
+  }
+  if (len >= cap) { buf[0] = 0; return 0; }
+  return len;
+}
+
 }  // namespace pixc
 // AI: end

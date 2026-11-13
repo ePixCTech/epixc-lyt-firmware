@@ -537,7 +537,18 @@ void WLED::setup()
 
   #ifndef ESP8266
   WiFi.setScanMethod(WIFI_ALL_CHANNEL_SCAN);
+#ifdef PIXC_LAN_AUTH
+  // ePixC (review 2026-11-10): the Wi-Fi driver never stores the home network's name and password
+  // in NVS. wsec.json already holds them, on the filesystem that flash encryption covers (the
+  // `spiffs` row is `encrypted`); NVS is not encrypted (the prebuilt framework has no NVS
+  // encryption), so upstream's copy at the first connection would stay readable from the chip.
+  // With persistent(false) the driver starts with RAM storage (WiFi.mode() below). Upstream keeps
+  // the copy for a faster first connection; bench: cold-boot connect time, and the reconnect after
+  // a router restart.
+  WiFi.persistent(false);
+#else
   WiFi.persistent(true); // storing credentials in NVM fixes boot-up pause as connection is much faster, is disabled after first connection
+#endif
   // ESP32 DNS name must be set before the first connection to the DHCP server; otherwise, the default ESP name (such as "esp32s3-267D0C") will be used.
   char hostname[64] = {'\0'};
   getWLEDhostname(hostname, sizeof(hostname), true);   // create DNS name based on mDNS name if set, or fall back to standard WLED server name
@@ -547,6 +558,11 @@ void WLED::setup()
   #endif
   WiFi.onEvent(WiFiEvent);
   WiFi.mode(WIFI_STA); // enable scanning
+#if defined(PIXC_LAN_AUTH) && defined(ARDUINO_ARCH_ESP32)
+  // ePixC: RAM storage again, now that the driver is up and before the first WiFi.begin()
+  // (initConnection), in case anything started the driver before persistent(false) above.
+  esp_wifi_set_storage(WIFI_STORAGE_RAM);
+#endif
   findWiFi(true);      // start scanning for available WiFi-s
 
   // all GPIOs are allocated at this point
@@ -1011,7 +1027,16 @@ void WLED::handleConnection()
       sendImprovStateResponse(0x03, true);
       improvActive = 2;
     }
+#ifdef PIXC_LAN_AUTH
+    // ePixC (D513, review 2026-11-10): once the setup hotspot is open, the next station attempt
+    // waits 120 s, not 18 s. Each attempt drops to WIFI_MODE_NULL (initConnection), which closes the
+    // hotspot, and the hotspot opens again 12 s later, so with 18 s it was up only 6 s in every 18 s
+    // and a phone's join or the app's scan often missed it. Now it is up about 108 s in every 120 s;
+    // a light whose router comes back reconnects up to 2 minutes later.
+    if (now - lastReconnectAttempt > ((stac) ? 300000 : (apActive ? 120000 : 18000)) && wifiConfigured) {
+#else
     if (now - lastReconnectAttempt > ((stac) ? 300000 : 18000) && wifiConfigured) {
+#endif
       if (improvActive == 2) improvActive = 3;
       DEBUG_PRINTF_P(PSTR("Last reconnect (%lus) too old (@ %lus).\n"), lastReconnectAttempt/1000, nowS);
       if (++selectedWiFi >= multiWiFi.size()) selectedWiFi = 0; // we couldn't connect, try with another network from the list
