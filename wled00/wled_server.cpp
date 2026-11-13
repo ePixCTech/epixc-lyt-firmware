@@ -493,6 +493,17 @@ void initServer()
     // What a LAN config write may not change, whoever signed it: the broker, the access point, the
     // provisioning keys, OTA settings (pixc_lan.cpp). The LAN key itself is set only by the cloud.
     if (isConfig) pixcSanitizeLanCfg(root);
+    // The Wi-Fi networks (nw.ins), which every LAN-key holder may change: a wrong list refuses the
+    // whole write, before any of it applies; a good one is applied on the loop task (pixc_lan.cpp).
+    if (isConfig) {
+      const int wifiRefused = pixcStageLanWifi(root);
+      if (wifiRefused) {
+        releaseJSONBufferLock();
+        pixcSendSigned(request, signer, wifiRefused, CONTENT_TYPE_JSON,
+                       wifiRefused == 503 ? "{\"error\":\"BUSY\"}" : "{\"error\":\"BAD_REQUEST\"}");
+        return;
+      }
+    }
     // A preset save or delete past the write ceiling is refused whole, before any of it applies
     // (D465). cfg.json writes are not refused: WLED::loop() spaces them out (pixcConfigWriteDue).
     uint32_t presetRetryMs = 0;

@@ -85,6 +85,9 @@ bool deserializeConfig(JsonObject doc, bool fromFS) {
   }
 #endif
 
+  // ePixC (PIXC_LAN_AUTH): a LAN write's list never reaches this point. pixcStageLanWifi()
+  // (pixc_lan.cpp) checks it, takes it out of the request and replaces the saved list with it, which
+  // can also shorten the list (wifi-backup-networks). Here it is cfg.json at boot.
   size_t n = 0;
   JsonArray nw_ins = nw["ins"];
   if (!nw_ins.isNull()) {

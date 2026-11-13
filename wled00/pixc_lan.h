@@ -53,7 +53,8 @@ class PixcHashPrint : public Print {
 // and the current boot id. Run BEFORE taking the JSON lock. On failure the reply has been sent.
 bool pixcPreAuthorise(AsyncWebServerRequest* request);
 
-// Pairing results staged by the async_tcp handler are applied here, on the loop task.
+// Pairing results and LAN Wi-Fi lists staged by the async_tcp handler are applied here, on the
+// loop task.
 void pixcLanLoop();
 
 // The flash write ceiling (D465, pixc::lan::WriteBudget).
@@ -95,6 +96,12 @@ bool pixcHandleAuthedPost(AsyncWebServerRequest* request, JsonObject root, const
 // keys, OTA settings, the settings PIN, ePixC's own section, and the button, relay and IR hardware
 // this product does not fit (a button is a LAN factory reset).
 void pixcSanitizeLanCfg(JsonObject root);
+
+// A LAN /json/cfg write's Wi-Fi networks, "nw":{"ins":[...]}: the whole list, home network first,
+// up to WLED_MAX_WIFI_COUNT (pixc::lan::mergeWifiList). Checked here, on the async_tcp task, and
+// applied by pixcLanLoop(). Returns 0 when the write may go on (with "ins" taken out of `root`), or
+// the status to refuse the whole write with: 400 for a wrong list, 503 while the last one waits.
+int pixcStageLanWifi(JsonObject root);
 
 // Remove what a state write may not do (pixc::lan::sanitizeState): WLED's HTTP-style API in "win",
 // the UDP sync notifier switches in "udpn", and "rb" from a stored preset. deserializeState() and

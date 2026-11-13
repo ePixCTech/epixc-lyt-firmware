@@ -32,6 +32,13 @@ struct PendingPair {
   char kLan[33];
   char apiHost[64];
 } pendingPair;
+// A LAN config write's Wi-Fi networks (nw.ins), checked on the async_tcp task and applied on the
+// loop (pixcLanLoop), like a pairing: handleConnection() reads multiWiFi there.
+struct PendingWifi {
+  volatile bool ready = false;
+  size_t count = 0;
+  pixc::lan::WifiNet nets[WLED_MAX_WIFI_COUNT];
+} pendingWifi;
 // A per-address brake on hosts sending bad signatures - no global ceiling (a 128-bit key cannot be
 // guessed at any rate) and two free failures, so the one request a client signs with the key
 // before a rotation costs nothing.
@@ -217,18 +224,10 @@ void handlePairPost(AsyncWebServerRequest* request) {
 // Apply a validated pairing on the loop task: Wi-Fi and both keys in one save, then reboot.
 void applyPendingPair() {
   PendingPair& pp = pendingPair;
-  // One network, the one the phone gave. Static addressing is not offered at pairing.
-  selectedWiFi = 0;
-  multiWiFi.resize(1);
-  memset(multiWiFi[0].clientSSID, 0, sizeof(multiWiFi[0].clientSSID));
-  memset(multiWiFi[0].clientPass, 0, sizeof(multiWiFi[0].clientPass));
-  strlcpy(multiWiFi[0].clientSSID, pp.ssid, sizeof(multiWiFi[0].clientSSID));
-  strlcpy(multiWiFi[0].clientPass, pp.psk, sizeof(multiWiFi[0].clientPass));
-  multiWiFi[0].staticIP = IPAddress(0, 0, 0, 0);
-  memset(multiWiFi[0].bssid, 0, sizeof(multiWiFi[0].bssid));
+  bool sameKeys;
   {
     KeyLock lock;
-    const bool sameKeys = strcmp(pixcLanKey, pp.kLan) == 0 && strcmp(pixcDeviceKey, pp.kDev) == 0;
+    sameKeys = strcmp(pixcLanKey, pp.kLan) == 0 && strcmp(pixcDeviceKey, pp.kDev) == 0;
     strlcpy(pixcDeviceKey, pp.kDev, sizeof(pixcDeviceKey));
     strlcpy(pixcLanKey, pp.kLan, sizeof(pixcLanKey));
     previousLanKey[0] = 0;
@@ -240,6 +239,13 @@ void applyPendingPair() {
       mqttServer[0] = 0;
     }
   }
+  // The network the phone gave is the home network, the first in the list. A new pairing has no
+  // other. The wrong-password retry (same keys) writes the first only and keeps the backup networks
+  // a LAN write added (wifi-backup-networks), so the owner fixing the home network from the hotspot
+  // does not lose them. Static addressing is not offered at pairing.
+  selectedWiFi = 0;
+  if (!sameKeys || multiWiFi.empty()) multiWiFi.resize(1);
+  multiWiFi[0] = WiFiConfig(pp.ssid, pp.psk);
 #ifdef EPIXC_ALLOW_PLAINTEXT_PROVISION
   // Bench only: the app may point the light at a local API ("host" or "host:port").
   if (pp.apiHost[0]) {
@@ -259,9 +265,57 @@ void applyPendingPair() {
   pixcRebootAfter(1500);        // let the reply leave before the hotspot goes
 }
 
+// Apply a LAN write's Wi-Fi networks on the loop task. The light stays on the network it is using
+// until that connection drops (then findWiFi() picks among the new list) or the light restarts, as
+// a LAN Wi-Fi change always did; selectedWiFi follows that network to its new place in the list, or
+// goes back to the first when it was changed or removed.
+void applyPendingWifi() {
+  PendingWifi& pw = pendingWifi;
+  size_t inUse = 0;
+  if (static_cast<size_t>(selectedWiFi) < multiWiFi.size()) {
+    const WiFiConfig& cur = multiWiFi[selectedWiFi];
+    for (size_t i = 0; i < pw.count; i++) {
+      if (strcmp(pw.nets[i].ssid, cur.clientSSID) == 0 && strcmp(pw.nets[i].psk, cur.clientPass) == 0) {
+        inUse = i;
+        break;
+      }
+    }
+  }
+  multiWiFi.resize(pw.count);
+  for (size_t i = 0; i < pw.count; i++) multiWiFi[i] = WiFiConfig(pw.nets[i].ssid, pw.nets[i].psk);
+  selectedWiFi = inUse;
+  memset(pw.nets, 0, sizeof(pw.nets));
+  pw.count = 0;
+  pw.ready = false;             // last: the next write may stage only now
+  configNeedsWrite = true;      // cfg.json (names) + wsec.json (keys); WLED::loop() saves
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------------------------
+
+int pixcStageLanWifi(JsonObject root) {
+  JsonObject nw = root["nw"];
+  if (nw.isNull() || !nw.containsKey("ins")) return 0;
+  if (pendingWifi.ready) return 503;
+  pixc::lan::WifiNet saved[WLED_MAX_WIFI_COUNT];
+  size_t savedCount = 0;
+  for (; savedCount < multiWiFi.size() && savedCount < WLED_MAX_WIFI_COUNT; savedCount++) {
+    strlcpy(saved[savedCount].ssid, multiWiFi[savedCount].clientSSID, sizeof(saved[0].ssid));
+    strlcpy(saved[savedCount].psk, multiWiFi[savedCount].clientPass, sizeof(saved[0].psk));
+  }
+  const size_t n = pixc::lan::mergeWifiList(nw["ins"].as<JsonArray>(), saved, savedCount,
+                                            pendingWifi.nets, WLED_MAX_WIFI_COUNT);
+  memset(saved, 0, sizeof(saved));
+  if (n == 0) {
+    memset(pendingWifi.nets, 0, sizeof(pendingWifi.nets));
+    return 400;
+  }
+  pendingWifi.count = n;
+  pendingWifi.ready = true;     // applied by pixcLanLoop() on the loop task
+  nw.remove("ins");             // so deserializeConfig() leaves the list alone
+  return 0;
+}
 
 uint32_t pixcCallerIp(AsyncWebServerRequest* request) {
   AsyncClient* c = request ? request->client() : nullptr;
@@ -282,6 +336,7 @@ bool pixcSetLanKey(const char* keyHex) {
 
 void pixcLanLoop() {
   if (pendingPair.ready) applyPendingPair();
+  if (pendingWifi.ready) applyPendingWifi();
 }
 
 bool pixcPreAuthorise(AsyncWebServerRequest* request) {

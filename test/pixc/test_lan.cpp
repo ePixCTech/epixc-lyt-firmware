@@ -3,7 +3,8 @@
 // The pure parts of wled00/pixc_lan.cpp (wled00/pixc_lan_logic.h): the pairing endpoint's body
 // validation and 409 rule, the hotspot subnet, DDP lease slots and expiry, the signed
 // PATH_AND_QUERY, the LAN config sanitiser (with master's hw.btn/relay/ir rule, 14ea4da0), the
-// state sanitiser (security audit 2026-10-20), and the flash write ceiling and body gate (D465).
+// Wi-Fi list a LAN config write sets (wifi-backup-networks), the state sanitiser (security audit
+// 2026-10-20), and the flash write ceiling and body gate (D465).
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -203,7 +204,9 @@ static void testSanitizeLanCfg() {
   // All of "if" goes (security audit 2026-10-20): the broker, and the UDP sync notifier, which a
   // member could switch on before being removed and then drive the light with after the rotation.
   CHECK(r["if"].isNull());
-  CHECK(r["nw"]["ins"][0]["ssid"] == "Home");       // the app's "change network" stays
+  // The Wi-Fi networks stay: any LAN-key holder may change them (founder decision, production
+  // review 2026-11-10); mergeWifiList() checks the list.
+  CHECK(r["nw"]["ins"][0]["ssid"] == "Home");
   CHECK(r["ap"].isNull() && r["ota"].isNull() && r["pin"].isNull() && r["pixc"].isNull());
   CHECK(r["um"]["PixcConnect"].isNull());
   // Nor the power plan's cap (review 2026-11-13): only the cloud sets it, on /cfg as pixc.bri_max,
@@ -225,6 +228,82 @@ static void testSanitizeLanCfg() {
   CHECK(!deserializeJson(d2, R"({"if":5,"um":"x","bri":9})"));
   sanitizeLanCfg(d2.as<JsonObject>());
   CHECK(d2["bri"] == 9);
+}
+
+// wifi-backup-networks: a LAN write's "nw.ins" is the light's whole list of networks, home network
+// first, up to WLED_MAX_WIFI_COUNT (3).
+static void testWifiList() {
+  const size_t kMax = 3;
+  auto net = [](const char* ssid, const char* psk) {
+    WifiNet w{};
+    std::strcpy(w.ssid, ssid);
+    std::strcpy(w.psk, psk);
+    return w;
+  };
+  WifiNet out[kMax];
+  // `ins` (the array, as JSON) against the light's list now.
+  auto merge = [&](const char* ins, const std::vector<WifiNet>& saved) -> size_t {
+    DynamicJsonDocument d(2048);
+    if (deserializeJson(d, ins)) return 99;
+    return mergeWifiList(d.as<JsonArray>(), saved.data(), saved.size(), out, kMax);
+  };
+  auto is = [&](size_t i, const char* ssid, const char* psk) {
+    return std::strcmp(out[i].ssid, ssid) == 0 && std::strcmp(out[i].psk, psk) == 0;
+  };
+  const std::vector<WifiNet> home = {net("Home", "homepass1")};
+  const std::vector<WifiNet> three = {net("A", "aaaaaaaa"), net("B", "bbbbbbbb"), net("C", "cccccccc")};
+
+  // Add: the home network, sent without its key, keeps it; a backup brings its own.
+  CHECK(merge(R"([{"ssid":"Home"},{"ssid":"Backup","psk":"backup123"}])", home) == 2);
+  CHECK(is(0, "Home", "homepass1") && is(1, "Backup", "backup123"));
+  CHECK(merge(R"([{"ssid":"Home"},{"ssid":"B1","psk":"b1b1b1b1"},{"ssid":"B2","psk":"b2b2b2b2"}])", home) == 3);
+  CHECK(is(2, "B2", "b2b2b2b2"));
+  // Replace: a sibling changed the router's name and password.
+  CHECK(merge(R"([{"ssid":"Home 2","psk":"newpass12"}])", home) == 1 && is(0, "Home 2", "newpass12"));
+  // The same name with a new key takes the new key.
+  CHECK(merge(R"([{"ssid":"Home","psk":"changed1"}])", home) == 1 && is(0, "Home", "changed1"));
+  // Remove: a shorter list drops the rest (WLED only ever grew it), and a network that moves up
+  // keeps its key, though the client never saw it.
+  CHECK(merge(R"([{"ssid":"A"},{"ssid":"C"}])", three) == 2);
+  CHECK(is(0, "A", "aaaaaaaa") && is(1, "C", "cccccccc"));
+  CHECK(merge(R"([{"ssid":"B"}])", three) == 1 && is(0, "B", "bbbbbbbb"));   // the home network removed
+  CHECK(merge(R"([{"ssid":"C"},{"ssid":"A"},{"ssid":"B"}])", three) == 3);    // reordered
+  CHECK(is(0, "C", "cccccccc") && is(1, "A", "aaaaaaaa") && is(2, "B", "bbbbbbbb"));
+  // Two access points with one name: each keeps the key at its own place first.
+  const std::vector<WifiNet> twins = {net("Mesh", "firstkey"), net("Mesh", "secondkey")};
+  CHECK(merge(R"([{"ssid":"Mesh"},{"ssid":"Mesh"}])", twins) == 2);
+  CHECK(is(0, "Mesh", "firstkey") && is(1, "Mesh", "secondkey"));
+  // An open network says so with an empty key, and keeps it like any other.
+  CHECK(merge(R"([{"ssid":"Home"},{"ssid":"Cafe","psk":""}])", home) == 2 && is(1, "Cafe", ""));
+  CHECK(merge(R"([{"ssid":"Cafe"}])", {net("Cafe", "")}) == 1 && is(0, "Cafe", ""));
+  // Keys as at pairing: 8-63 characters or 64 hex; a 32-byte name.
+  CHECK(merge((R"([{"ssid":")" + std::string(32, 's') + R"(","psk":")" + std::string(63, 'p') + R"("}])").c_str(), home) == 1);
+  CHECK(merge((R"([{"ssid":"Home","psk":")" + std::string(64, 'a') + R"("}])").c_str(), home) == 1);
+  // A fixed access point and a static address are not taken from the LAN: the entry is read for
+  // its name and key only.
+  CHECK(merge(R"([{"ssid":"Home","bssid":"aabbccddeeff","ip":[10,0,0,9],"gw":[10,0,0,1],"sn":[255,0,0,0]}])", home) == 1);
+  CHECK(is(0, "Home", "homepass1"));
+
+  // Refused whole (0): the light keeps its list.
+  CHECK(merge("[]", home) == 0);                                             // no network
+  CHECK(merge(R"([{"ssid":"A"},{"ssid":"B"},{"ssid":"C"},{"ssid":"D","psk":"dddddddd"}])", three) == 0);
+  CHECK(merge(R"([{"ssid":"New"}])", home) == 0);                            // a new name, no key
+  CHECK(merge(R"([{"ssid":"New"}])", {}) == 0);                              // nothing saved yet
+  CHECK(merge(R"([{"psk":"homepass1"}])", home) == 0);                       // no name
+  CHECK(merge(R"([{"ssid":"","psk":"homepass1"}])", home) == 0);
+  CHECK(merge((R"([{"ssid":")" + std::string(33, 's') + R"(","psk":"homepass1"}])").c_str(), home) == 0);
+  CHECK(merge(R"([{"ssid":7,"psk":"homepass1"}])", home) == 0);
+  CHECK(merge(R"([{"ssid":"Home","psk":"short"}])", home) == 0);             // 1-7 characters
+  CHECK(merge((R"([{"ssid":"Home","psk":")" + std::string(64, 'z') + R"("}])").c_str(), home) == 0);
+  CHECK(merge((R"([{"ssid":"Home","psk":")" + std::string(65, 'a') + R"("}])").c_str(), home) == 0);
+  CHECK(merge(R"([{"ssid":"Home","psk":12345678}])", home) == 0);            // not a string
+  CHECK(merge(R"([{"ssid":"Home","psk":null}])", home) == 0);
+  CHECK(merge(R"(["Home"])", home) == 0);                                    // not an object
+  CHECK(merge(R"([{"ssid":"Home"},{"ssid":"Bad","psk":"short"}])", home) == 0);   // one bad entry
+  // "ins" that is not an array.
+  DynamicJsonDocument d(256);
+  CHECK(!deserializeJson(d, R"({"ins":{"ssid":"Home","psk":"homepass1"}})"));
+  CHECK(mergeWifiList(d["ins"].as<JsonArray>(), home.data(), home.size(), out, kMax) == 0);
 }
 
 // What a state write may not do (security audit 2026-10-20): no "win", no notifier switches, and no
@@ -367,6 +446,7 @@ void testLanLogic() {
   testLeases();
   testPathAndQuery();
   testSanitizeLanCfg();
+  testWifiList();
   testSanitizeState();
   testSanitizeStatePersists();
   testPersistsState();
