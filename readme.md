@@ -40,7 +40,7 @@ ePixC's code is in `usermods/pixc_connect_blink/`, in the `wled00/pixc_*` files 
   WLED's web UI, Alexa, DMX input, E1.31 and Art-Net, ESP-NOW, the GIF *Image* effect and other
   unused features turned off.
 - **`ci/`**: how the box builds a release (epixc-backend `deploy/native/pipeline`). A release is a
-  tag made by hand on `main`, named **`lyt-v<version>`** after `version` in `package.json` (the
+  tag made by hand on `master`, named **`lyt-v<version>`** after `version` in `package.json` (the
   version every light reports; the box refuses a tag that names another). The box runs
   `ci/test.sh` (the host tests, the claims and brand checks, the pinned CA roots), then, only if
   it passed, `ci/build.sh`: `pio run -e PixC_V1` and every image gate in `ci/checks/` (the image
@@ -55,6 +55,68 @@ ePixC's code is in `usermods/pixc_connect_blink/`, in the `wled00/pixc_*` files 
 
 Upstream's own README follows, unchanged. It describes WLED, not the ePixC build: several features
 it lists (Alexa, the web UI, DMX, E1.31 and Art-Net, ESP-NOW sync) are off in `PixC_V1`.
+
+## Re-issue an older release
+
+A light does not install an image whose build number is lower than the build that it runs
+(`otaRefusal` in `usermods/pixc_connect_blink/pixc_logic.h`). The build number is the commit time
+in minutes (`pio-scripts/pixc_build_id.py`), so an older release always has a lower number. Thus
+the console cannot roll the lights back to an older release: its Roll back is disabled, and it
+refuses to make a build current when the build number is lower than the current release's. To go
+back to an older release, re-issue its source as a new version. The new commit has a newer commit
+time, so its build number is higher.
+
+Before you start, make sure that:
+
+- The older release is a `lyt-v*` tag that the box built. Its tree must have `ci/test.sh` and
+  `ci/build.sh`, or the box does not build it.
+- Its `PIXC_SECURITY_VERSION` (`pixc_logic.h`) is the same as in the bad release. A light refuses
+  an image below the highest security version that it ran. If the bad release raised that number,
+  do not re-issue: the older source has the vulnerability that the bad release fixed. Fix the fault
+  in a new release.
+
+The example re-issues `17.0.1-pixc7` as `17.0.1-pixc9`, because `17.0.1-pixc8` is bad:
+
+1. Start on `master`, with no changes in the working tree.
+2. Restore the tree of the older release. This also deletes each file that the older release does
+   not have.
+   ```sh
+   git switch master
+   git restore --source=lyt-v17.0.1-pixc7 --staged --worktree -- :/
+   ```
+3. Set the next version: one more than the newest `pixcN` tag. A light gets only a version that is
+   newer than the version that it runs. This command changes `package.json` and the two versions in
+   `package-lock.json`.
+   ```sh
+   npm version 17.0.1-pixc9 --no-git-tag-version --ignore-scripts
+   ```
+4. Commit. Do not change the commit date (no `GIT_COMMITTER_DATE`, no
+   `--committer-date-is-author-date`), because the box makes the build number from it.
+   ```sh
+   git commit -am "17.0.1-pixc9: the source of 17.0.1-pixc7 again (re-issue)"
+   ```
+5. When the founder says to release, Claude pushes `master`, makes the annotated tag on this
+   commit, and pushes the tag. Do not move or delete a tag.
+   ```sh
+   git push origin master
+   git tag -a lyt-v17.0.1-pixc9 -m "17.0.1-pixc9: re-issue of 17.0.1-pixc7"
+   git push origin lyt-v17.0.1-pixc9
+   ```
+6. Build it in the console: Deploy, Builds, Build, then Firmware and the tag. The box tests, builds
+   and signs it. On the Firmware page (Deploy, Current builds, Firmware), make sure that the build
+   number of the ready build is higher than the build number of the current release.
+7. Deploy it on the Firmware page: Deploy at the ready build, then the target, the tag and a new
+   code. It becomes the current release of that target, and the lights get it when they next update.
+   Do this for each target that has the bad release. If the fault is urgent, also make the release
+   critical: then each light whose owner allows unattended updates installs it at the owner's hour.
+8. To continue from the newer code, revert the re-issue commit (`git revert <commit>`), repair the
+   fault, set the next version (`17.0.1-pixc10`), and release it as usual.
+
+`EPIXC_BUILD_NUMBER` (`pio-scripts/pixc_build_id.py`) sets the build number by hand. A re-issue
+does not need it; use it only for a special case. Never set it higher than the real time: each
+light that installs such an image refuses every later release until a commit time is higher than
+that number. Also, the light uses the number as its earliest possible time when it examines
+certificate dates (`kTlsTimeFloor` in `pixc_https.cpp`).
 
 ## Why this repository is public
 

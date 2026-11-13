@@ -8,8 +8,10 @@
 #                  It is the HEAD commit's committer time in minutes since 1970: the same number for
 #                  the same commit on a laptop and in CI (reproducible), independent of any CI run
 #                  counter or workflow name, and increasing along the release branch. Release images
-#                  must be built from a clean checkout of that branch; EPIXC_BUILD_NUMBER overrides
-#                  it only for an explicit re-issue.
+#                  must be built from a clean checkout of that branch. A re-issue of an older
+#                  release is a new commit on it (readme.md, "Re-issue an older release"), so its
+#                  commit time gives it a higher number; EPIXC_BUILD_NUMBER overrides the number
+#                  only for a special case.
 #   PIXC_FW_GIT    `git describe --always --dirty` - which source this image came from, reported in
 #                  the announce and boot event so two images with the same package.json version can
 #                  be told apart.
