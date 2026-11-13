@@ -22,10 +22,12 @@ ePixC's code is in `usermods/pixc_connect_blink/`, in the `wled00/pixc_*` files 
   takes OTA updates with an ECDSA P-256 signature check that refuses any image it cannot verify.
   It downloads updates only from `https://api.epixc.in/firmware/`.
 - **`pixc_https`**: an ESP-IDF `esp_http_client` wrapper with the ISRG roots pinned (X1, X2,
-  Root YE and Root YR) and no plaintext fallback, because the framework WLED pins has no
-  `WiFiClientSecure`.
+  Root YE and Root YR) and no plaintext fallback. It sets the trust decision for every TLS
+  connection of the light (provisioning, the OTA download and MQTT) in one place. It was made
+  because the framework WLED pinned until 2026-11 had no `WiFiClientSecure`.
 - **`wled00/pixc_lan*`, `wled00/pixc_device*`**: pairing and the signed LAN API. The setup
-  hotspot is `ePixC-XXXX` with a password for each unit from factory NVS (printed on the label).
+  hotspot is `ePixC-XXXX`, WPA2/WPA3 mixed, with a password for each unit from factory NVS
+  (printed on the label).
   `/json/pixc/pair` answers on the hotspot only, every other `/json` request must be signed with
   the light's LAN key, and DDP is taken only from an address that holds a realtime lease.
 - **`wled00/pixc_mqtt_client*`**: an esp-mqtt client with AsyncMqttClient's interface, for MQTT
@@ -45,12 +47,13 @@ ePixC's code is in `usermods/pixc_connect_blink/`, in the `wled00/pixc_*` files 
   `ci/test.sh` (the host tests, the claims and brand checks, the pinned CA roots), then, only if
   it passed, `ci/build.sh`: `pio run -e PixC_V1` and every image gate in `ci/checks/` (the image
   fits the OTA slot, no plaintext HTTP client, the LAN API gated, no bench defaults,
-  `verifyRollbackLater`, bootloader rollback, the usermods registered, an OTA public key compiled
-  in). The box signs `pixc.bin` with the OTA key, refusing an image whose compiled key is not its
-  own, and the admin console deploys it (Deploy, Firmware). The build also keeps what a first
-  flash over USB needs: `bootloader.bin`, `partitions.bin`, `boot_app0.bin` and `flash.json`
-  (chip, flash settings and each file's offset, read from the build), written to a board as they
-  are.
+  `verifyRollbackLater`, bootloader rollback and the framework's TLS and hotspot settings, the
+  usermods registered, an OTA public key compiled in, the image reports `package.json`'s
+  version). The box signs `pixc.bin` with the OTA key, refusing an image whose compiled key is
+  not its own, and the admin console deploys it (Deploy, Firmware). The build also keeps what a
+  first flash over USB needs: `bootloader.bin`, `partitions.bin`, `boot_app0.bin` and
+  `flash.json` (chip, flash settings and each file's offset, read from the build), written to a
+  board as they are.
   GitHub Actions builds nothing here since 2026-10-26: ePixC's workflow and upstream's are gone.
   Both scripts run on a laptop too: `bash ci/test.sh`, `bash ci/build.sh <folder>`.
 

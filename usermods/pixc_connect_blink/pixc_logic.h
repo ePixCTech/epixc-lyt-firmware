@@ -526,6 +526,9 @@ constexpr const char* kHostNotAllowed = "download host not allowed";  // OTA_FAI
 // download, not after it.
 constexpr const char* kBadField      = "command field malformed";     // OTA_FAILED (a server fault)
 constexpr const char* kShaMismatch   = "sha256 mismatch";             // OTA_CORRUPT_DOWNLOAD
+// The light could not compute the image's SHA-256 (an mbedTLS call returned an error). No "sha256":
+// nothing says the download was bad.
+constexpr const char* kDigestFailed  = "image digest failed";         // OTA_FAILED
 // No "sig" or "signature" in either: that word is the backend's first test, and neither of these
 // says anything about whether the image is genuine.
 constexpr const char* kSigDownload   = "verify file: connect or read failed";   // OTA_DOWNLOAD_FAILED

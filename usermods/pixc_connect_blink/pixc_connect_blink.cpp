@@ -399,10 +399,6 @@ void doOta(const Job& j) {
     otaProgress(j, "failed", 0, pixc::ota_fail::kNoSpace); pixcHttpsClose(stream); return;
   }
 
-  mbedtls_sha256_context sha;
-  mbedtls_sha256_init(&sha);
-  mbedtls_sha256_starts(&sha, 0);                   // 0 = SHA-256 (not SHA-224)
-
   static uint8_t buf[1024];                         // one worker task, one OTA at a time
   size_t written = 0;
   int lastPct = -1;
@@ -411,12 +407,19 @@ void doOta(const Job& j) {
   // Anti-rollback (S6): find the new image's build descriptor as it streams past.
   pixc::DescScanner desc(pixc_build_desc.magic);
 
-  while (true) {
+  // mbedTLS 3 (IDF 5) returns an error from every SHA-256 call, and each one is checked: a digest
+  // that was not computed must never be compared or verified. Ignoring a failed hash is the class
+  // of fault behind CVE-2025-27810 in mbedTLS's own handshake.
+  mbedtls_sha256_context sha;
+  mbedtls_sha256_init(&sha);
+  if (mbedtls_sha256_starts(&sha, 0) != 0) { ok = false; failMsg = pixc::ota_fail::kDigestFailed; }   // 0 = SHA-256
+
+  while (ok) {
     const int n = pixcHttpsRead(stream, buf, sizeof(buf));
     if (n < 0) { ok = false; failMsg = pixc::ota_fail::kRead; break; }
     if (n == 0) break;                              // end of body, clean or otherwise
     if (Update.write(buf, n) != (size_t)n) { ok = false; failMsg = pixc::ota_fail::kFlashWrite; break; }
-    mbedtls_sha256_update(&sha, buf, n);
+    if (mbedtls_sha256_update(&sha, buf, n) != 0) { ok = false; failMsg = pixc::ota_fail::kDigestFailed; break; }
     written += n;
     if (!desc.found()) {
       desc.feed(buf, n);
@@ -439,8 +442,8 @@ void doOta(const Job& j) {
   if (ok && !pixcHttpsComplete(stream)) { ok = false; failMsg = pixc::ota_fail::kStalled; }
   pixcHttpsClose(stream);
 
-  uint8_t digest[32];
-  mbedtls_sha256_finish(&sha, digest);
+  uint8_t digest[32] = {};
+  if (mbedtls_sha256_finish(&sha, digest) != 0 && ok) { ok = false; failMsg = pixc::ota_fail::kDigestFailed; }
   mbedtls_sha256_free(&sha);
 
   // Integrity first, then provenance. The digest is required: it used to be skipped entirely if the

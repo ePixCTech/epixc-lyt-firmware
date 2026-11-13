@@ -695,6 +695,7 @@ static void testOtaFailureCodes() {
   otaCode(f::kFieldTooLong, "OTA_FAILED");
   otaCode(f::kHostNotAllowed, "OTA_FAILED");
   otaCode(f::kShaMismatch, "OTA_CORRUPT_DOWNLOAD");
+  otaCode(f::kDigestFailed, "OTA_FAILED");
   otaCode(f::kNoSigningKey, "OTA_UNSIGNED_BUILD");
   otaCode(f::kBadSigningKey, "OTA_UNSIGNED_BUILD");
   otaCode(f::kNotConfirmed, "OTA_BUSY");
@@ -706,7 +707,7 @@ static void testOtaFailureCodes() {
   otaCode(pixc::otaRefusal(true, 4, 1, 5, 1), "OTA_DOWNGRADE_REFUSED");
   // Every word fits the 48-byte error field of the progress report.
   for (const char* w : {f::kLowMemory, f::kNoSpace, f::kRead, f::kStalled, f::kFlashWrite, f::kNoDigest,
-                        f::kFieldTooLong, f::kHostNotAllowed, f::kShaMismatch, f::kSigDownload, f::kNoSigUrl, f::kSigMismatch, f::kNoSigningKey,
+                        f::kFieldTooLong, f::kHostNotAllowed, f::kShaMismatch, f::kDigestFailed, f::kSigDownload, f::kNoSigUrl, f::kSigMismatch, f::kNoSigningKey,
                         f::kBadSigningKey, f::kNotConfirmed})
     CHECK(std::strlen(w) < 48);
   // The copy of the backend's table, pinned on its own test inputs (OtaErrorCode.of): whole words,

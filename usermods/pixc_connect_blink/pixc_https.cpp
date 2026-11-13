@@ -38,7 +38,8 @@ static int64_t x509Seconds(const mbedtls_x509_time& t) {
 
 // mbedTLS calls this for each certificate of the chain it verified, the pinned root at the top
 // included (x509_crt_merge_flags_with_cb), after its own checks. Adding a flag fails the handshake
-// with MBEDTLS_ERR_X509_CERT_VERIFY_FAILED, since verification is REQUIRED.
+// with MBEDTLS_ERR_X509_CERT_VERIFY_FAILED, since verification is REQUIRED. The same in mbedTLS 3.6,
+// where valid_from, valid_to and the fields of mbedtls_x509_time are still public.
 static int pixcVerifyDates(void*, mbedtls_x509_crt* crt, int depth, uint32_t* flags) {
   if (crt == nullptr || flags == nullptr) return MBEDTLS_ERR_X509_BAD_INPUT_DATA;
   const pixc::CertTime v = pixc::certTimeVerdict(x509Seconds(crt->valid_from), x509Seconds(crt->valid_to),
@@ -54,8 +55,9 @@ static int pixcVerifyDates(void*, mbedtls_x509_crt* crt, int depth, uint32_t* fl
 }
 
 // The pinned roots, parsed once and shared by every connection (esp-tls borrows a CA chain, never
-// frees it; this framework has no MBEDTLS_DYNAMIC_FREE_CA_CERT). One copy in RAM instead of one
-// per open connection, as `cert_pem` made. A failed parse is retried at the next connection.
+// frees it while CONFIG_MBEDTLS_DYNAMIC_FREE_CA_CERT is off, which ci/checks/bootloader-rollback.py
+// requires). One copy in RAM instead of one per open connection, as `cert_pem` made. A failed parse
+// is retried at the next connection.
 static mbedtls_x509_crt* s_roots = nullptr;
 
 static mbedtls_x509_crt* pinnedRoots() {

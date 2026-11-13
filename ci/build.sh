@@ -86,13 +86,14 @@ step "no plaintext HTTP client";                   bash ci/checks/no-plaintext-h
 step "the LAN API is gated";                       bash ci/checks/lan-gated.sh "$ENV_NAME"
 step "no bench defaults";                          bash ci/checks/no-bench-defaults.sh "$ENV_NAME"
 step "verifyRollbackLater is overridden";          bash ci/checks/rollback-later.sh "$ENV_NAME"
-step "bootloader rollback is compiled in";         python3 ci/checks/bootloader-rollback.py "$ENV_NAME"
+step "rollback, TLS and hotspot in the framework"; python3 ci/checks/bootloader-rollback.py "$ENV_NAME"
 step "the usermods are registered";                python3 ci/checks/usermods-registered.py "$ENV_NAME"
 step "an OTA public key is compiled in";           python3 ci/checks/ota-pubkey.py "$ENV_NAME"
 
 # The app image exactly as built, not a merged factory image: the box signs these bytes (pixc.sig).
 cp ".pio/build/$ENV_NAME/firmware.bin" "$out/pixc.bin"
 step "pixc.bin";                                   bash ci/checks/esp32-image.sh "$out/pixc.bin"
+step "pixc.bin reports package.json's version";    python3 ci/checks/build-version.py "$out/pixc.bin"
 
 step "the first flash: bootloader, partition table, boot_app0, flash.json"
 meta="$(mktemp -d "${TMPDIR:-/tmp}/epixc-pio-meta.XXXXXX")"

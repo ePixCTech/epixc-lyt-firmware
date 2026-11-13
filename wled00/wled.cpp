@@ -818,7 +818,19 @@ void WLED::initAP(bool resetAP)
   #endif
 
   WiFi.softAPConfig(IPAddress(4, 3, 2, 1), IPAddress(4, 3, 2, 1), IPAddress(255, 255, 255, 0));
+#if defined(PIXC_LAN_AUTH) && defined(CONFIG_ESP_WIFI_SOFTAP_SAE_SUPPORT)
+  // ePixC: WPA2/WPA3 mixed (transition mode; founder, review 2026-11-10). When a phone joins with
+  // WPA3 (SAE), a passive listener who knows the label password can no longer decrypt the pairing.
+  // When it joins with WPA2-PSK (an old phone, or the app's Android join, which asks for a WPA2
+  // network), that listener still can, as before. The label QR (T:WPA) covers both. PMF is not
+  // required, so WPA2 phones without it still join; the cipher is CCMP only. Arduino's other
+  // defaults stay: 4 stations, no FTM.
+  // The IDF 4.4 framework has no SoftAP SAE (and its softAP() takes no auth mode), so that build
+  // stays WPA2. ci/checks/bootloader-rollback.py requires SAE for a release.
+  WiFi.softAP(apSSID, apPass, apChannel, apHide, 4, false, WIFI_AUTH_WPA2_WPA3_PSK);
+#else
   WiFi.softAP(apSSID, apPass, apChannel, apHide);
+#endif
   #ifdef ARDUINO_ARCH_ESP32
   DEBUG_PRINT(F("access point maxTxPower set to ")); DEBUG_PRINTLN(txPower);
   WiFi.setTxPower(wifi_power_t(txPower));

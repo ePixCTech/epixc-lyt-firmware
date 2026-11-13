@@ -22,6 +22,12 @@
 #     pinned roots (pixcTlsAttach, D411), only when it is on;
 #   - CONFIG_MBEDTLS_DYNAMIC_FREE_CA_CERT off: on, esp-tls frees the CA chain after the first
 #     handshake, which is the shared pinned roots, and every later TLS connection fails.
+#   - CONFIG_MBEDTLS_HAVE_TIME_DATE off: on, mbedTLS checks the certificate dates itself against
+#     the clock, which says 1970 until SNTP answers, so every handshake before that fails.
+#     pixcVerifyDates (pixc_https.cpp, D411) checks the dates instead, with the image's build time
+#     as the floor of the clock.
+#   - CONFIG_ESP_WIFI_SOFTAP_SAE_SUPPORT on: the setup hotspot is WPA2/WPA3 mixed (initAP in
+#     wled.cpp). Without it the code falls back to WPA2 and nothing else shows it.
 # And versions.txt must name ESP-IDF v5.5.5, the version the bench tests (docs/pixc-idf5-bench.md).
 #
 # Taken from .github/workflows/epixc-firmware.yaml (removed 2026-10-26: the box builds). Changed
@@ -67,6 +73,12 @@ if "CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y" not in cfg:
 if "CONFIG_MBEDTLS_DYNAMIC_FREE_CA_CERT=y" in cfg:
     fail(f"{pkg} was built with CONFIG_MBEDTLS_DYNAMIC_FREE_CA_CERT on: esp-tls would free the "
          "shared pinned roots after the first handshake")
+if "CONFIG_MBEDTLS_HAVE_TIME_DATE=y" in cfg:
+    fail(f"{pkg} was built with CONFIG_MBEDTLS_HAVE_TIME_DATE on: mbedTLS would check certificate "
+         "dates against a clock that says 1970 until SNTP answers, and refuse every handshake before that")
+if "CONFIG_ESP_WIFI_SOFTAP_SAE_SUPPORT=y" not in cfg:
+    fail(f"{pkg} was built without CONFIG_ESP_WIFI_SOFTAP_SAE_SUPPORT: the setup hotspot would be "
+         "WPA2 only, not the WPA2/WPA3 mixed mode that batch 1 ships")
 
 versions = open(os.path.join(home, "versions.txt")).read()
 m = re.search(r"^esp-idf:\s*(\S+)", versions, re.M)
@@ -75,4 +87,5 @@ if not m or m.group(1) != IDF:
          "moved, so the bench results do not apply to this image")
 
 print(f"{pkg}: ESP-IDF {IDF}, CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y, CONFIG_APP_ROLLBACK_ENABLE=y, "
-      "CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y, CONFIG_MBEDTLS_DYNAMIC_FREE_CA_CERT off")
+      "CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y, CONFIG_MBEDTLS_DYNAMIC_FREE_CA_CERT off, "
+      "CONFIG_MBEDTLS_HAVE_TIME_DATE off, CONFIG_ESP_WIFI_SOFTAP_SAE_SUPPORT=y")

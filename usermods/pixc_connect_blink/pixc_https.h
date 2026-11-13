@@ -7,11 +7,13 @@
 /// The trust decision for every TLS connection this firmware makes - provisioning, the OTA
 /// download and its signature, and MQTT over TLS or WSS (pixc_mqtt_client.cpp) - in one place.
 /// Set as `crt_bundle_attach` in esp_http_client's and esp-mqtt's configs, which hands it the
-/// connection's mbedtls_ssl_config before the handshake (esp-tls, IDF 4.4). It sets:
+/// connection's mbedtls_ssl_config before the handshake (esp-tls, ESP-IDF 5.5.5, mbedTLS 3.6.6).
+/// It sets:
 ///  - the CA chain to the pinned roots (pixc_roots.h), parsed once and shared, and nothing else;
 ///  - verification REQUIRED (hostname still checked by esp-tls against the URL's host);
 ///  - a verify callback that checks every certificate's validity dates (pixc::certTimeVerdict,
-///    D411), which this framework's mbedTLS does not (no MBEDTLS_HAVE_TIME_DATE).
+///    D411), which this framework's mbedTLS does not (no MBEDTLS_HAVE_TIME_DATE; the box's build
+///    keeps it off, ci/checks/bootloader-rollback.py).
 /// Without the parsed roots it sets no CA chain, and mbedTLS then refuses the handshake.
 esp_err_t pixcTlsAttach(void* sslConf);
 

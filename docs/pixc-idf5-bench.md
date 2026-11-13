@@ -20,7 +20,7 @@ Founder decision, 2026-11-13 (Production review 2026-11-10, decisions):
 | 1 | Agent, done | Merge of WLED main at `01f74928`. `PixC_V1` stays on IDF 4.4 (`espressif32@6.13.0`). |
 | 1 bench | Founder | The merged build on IDF 4.4. This finds faults from the merge alone. |
 | 2 | Agent, done | `espressif32@8.0.0`. Every ePixC env builds on IDF 5, and the box's image gates read the IDF 5 build. |
-| 2, rest | Agent | mbedTLS 3 in the ePixC TLS paths (the pinned roots, the OTA signature check), the WPA2/WPA3 hotspot, the readers of `deviceId` in `/json/info`. |
+| 2, rest | Agent, done | mbedTLS 3 in the ePixC TLS paths (the pinned roots, the OTA signature check), the WPA2/WPA3 hotspot, the readers of `deviceId` in `/json/info`, and two more box gates. |
 | 2 bench | Founder | The IDF 5 build on a spare board, written by cable. |
 | 3 | Founder | The first board crosses from IDF 4.4 to IDF 5 by OTA, with a forced revert. |
 | 4 | Agent, then founder | Writer ticket 09: the secure bootloader from IDF v5.5.5, on a spare board. |
@@ -80,7 +80,7 @@ The study measured 1,462,544 bytes for the app image before the merge.
   the sdkconfig of `framework-arduinoespressif32-esp32s3-libs`: bootloader and app rollback on,
   the certificate-bundle hook on, `MBEDTLS_DYNAMIC_FREE_CA_CERT` off, ESP-IDF v5.5.5.
   `rollback-later.sh` accepts only the strong `verifyRollbackLater`, not the framework's weak one.
-- Not changed: the setup hotspot is WPA2 still, and the TLS code has the same logic.
+- Not changed in this part: the setup hotspot and the TLS code (the next section).
 
 Measured on the stage 2 build (`PixC_V1`, IDF 5.5.5, 2026-11-13):
 
@@ -89,6 +89,62 @@ Measured on the stage 2 build (`PixC_V1`, IDF 5.5.5, 2026-11-13):
 | App image | 1,664,384 bytes of the 3,145,728-byte OTA slot (52.9 %) |
 | Static RAM | 62,852 bytes (19.2 %) |
 | `bootloader.bin` | 19,968 bytes (IDF 5.5.5, prebuilt) |
+
+## What the rest of stage 2 changed
+
+TLS on mbedTLS 3.6.6 (commit `fw-idf5-3`):
+
+- OTA image check: mbedTLS 3 returns an error code from each SHA-256 call. `doOta` checks each
+  one. If a call fails, the light stops the update and reports "image digest failed"
+  (`OTA_FAILED`). It does not compare or verify a digest that it did not calculate.
+- OTA signature check: not changed. `mbedtls_pk_parse_public_key` and `mbedtls_pk_verify` work as
+  in mbedTLS 2.28. The framework does not use PSA crypto for them (`MBEDTLS_USE_PSA_CRYPTO` off).
+- Pinned roots and certificate dates (D411), for provisioning, the OTA download and MQTT over WSS:
+  not changed. esp-tls in IDF 5.5.5 sets verification REQUIRED and then calls `pixcTlsAttach`
+  (read from its `libesp-tls.a`). It does not read the hook's return value: if the roots do not
+  parse, the hook sets no CA chain, and mbedTLS refuses the handshake. The certificate date fields
+  are still public in mbedTLS 3.6. Two framework settings must stay as they are, and the box gate
+  `ci/checks/bootloader-rollback.py` now checks both:
+  - `CONFIG_MBEDTLS_HAVE_TIME_DATE` off. If it is on, mbedTLS checks the dates against the clock,
+    which shows 1970 until SNTP answers, and refuses each handshake before SNTP.
+  - `CONFIG_MBEDTLS_DYNAMIC_FREE_CA_CERT` off (stage 2 added this check).
+- The low-memory TLS guard is not added. It is the work-around for CVE-2025-27810 on mbedTLS 2.28,
+  and mbedTLS 3.6.3 and later have the fix. Add it only for the IDF 4.4 fallback.
+
+Setup hotspot:
+
+- The hotspot is WPA2/WPA3 mixed (transition mode): `WIFI_AUTH_WPA2_WPA3_PSK`, cipher CCMP, PMF not
+  required. The name and the label password do not change. The label QR (`WIFI:T:WPA;...`) does not
+  change: `T:WPA` is correct for WPA2 and WPA3.
+- A phone that joins with WPA3 (SAE) is safe from a passive listener who knows the label password.
+  A phone that joins with WPA2 is not safe from that listener, as before.
+- The app's join paths:
+  - iOS: `NEHotspotConfiguration` with the passphrase. It is correct for WPA2 and WPA3 networks.
+  - Android: `wifi_iot` asks for a WPA2 network (`WifiNetworkSpecifier.setWpa2Passphrase`). A
+    transition-mode hotspot accepts it. The bench must find which mode Android uses. To make
+    Android use WPA3, the app must ask for WPA3 (`setWpa3Passphrase`). That is a change in the app,
+    not in this build.
+- The IDF 4.4 framework has no WPA3 for its hotspot. The code uses WPA2 there, so the fallback
+  build still opens a hotspot. The box gate requires `CONFIG_ESP_WIFI_SOFTAP_SAE_SUPPORT` for a
+  release.
+
+`deviceId` in `/json/info`:
+
+- WLED's `deviceId` (`getDeviceId`, `wled00/util.cpp`) is a hash of the MAC and chip data. On the
+  ESP32-S3 the chip data changes on IDF 5, so a light shows a different `deviceId` after it
+  crosses.
+- No ePixC code reads it. Checked on 2026-11-13: epixc-app (it reads `mac`, `ip`, `wifi`, `leds`,
+  `live`, `lip` and `lm` from `/json/info`; the identity of a light is its MAC), epixc-sync,
+  epixc-backend, epixc-web, epixc-status and epixc-writer. Only WLED's web UI reads it (its usage
+  report), and no ePixC image has that UI. No change is necessary.
+
+Box gates (`ci/build.sh`):
+
+- New: `ci/checks/build-version.py`. The version in the image's WLED build description must be
+  the version in `package.json`. Each light reports this version as `fw_version`, and the box
+  names the release with the `package.json` version. If `pio-scripts/set_metadata.py` does not
+  set it, upstream's placeholder `17.0.0-devV5` goes into the image with only a warning.
+- `ci/checks/bootloader-rollback.py`: the two TLS settings above, and WPA3 for the hotspot.
 
 ## Stage 0: one OTA on IDF 4.4
 
@@ -123,7 +179,16 @@ the first board by cable: its cable writes are over. Compare each result with `1
 
 ## Stage 2 bench: the IDF 5 build on a spare board
 
-Write the spare board by cable. It gets the IDF 5 bootloader. Do not use the first board.
+Use a spare board. Do not use the first board: its cable writes are over.
+
+- [ ] Build the IDF 5 release on the box (a new `package.json` version, tag `lyt-v<version>`). Do
+      not deploy it in the console yet: the first board would update.
+- [ ] Write the spare board by cable with the Writer, as a new board: the bootloader, the
+      partition table, `boot_app0.bin` and the app (`flash.json`), then the factory data (the
+      hotspot password) and the label. The board gets the IDF 5 bootloader. A release image with
+      no factory password opens no hotspot. The Writer must first accept the IDF 5 bootloader
+      (19,968 bytes, `esp-idf: v5.5.5`; the Writer's part of fw-idf5).
+- [ ] Pair the spare board in the app. Then do the tests below.
 
 - [ ] 1. Cold boot ten times. Look for "CONFLICT! driver_ng" aborts, watchdog and interrupt
       watchdog resets, and 8 MB octal PSRAM not found. On `PixC_V1_dev`, the serial log shows
@@ -140,8 +205,15 @@ Write the spare board by cable. It gets the IDF 5 bootloader. Do not use the fir
       and ESP32-C3 only.
 - [ ] 6. Pairing v2 on iOS and on Android: hotspot `ePixC-XXXX` with the label password, the retry
       after a wrong Wi-Fi password, 409 for a second phone, `_pixc._tcp` found by mDNS.
-- [ ] 7. Hotspot WPA2/WPA3 mixed (when the rest of stage 2 sets it): join from iOS and from
-      Android, by the label QR and by hand.
+- [ ] 7. Hotspot, WPA2/WPA3 mixed (do it again after a factory reset, item 12):
+  - [ ] On a Mac, hold Option and click the Wi-Fi menu. The hotspot shows "WPA2/WPA3 Personal".
+        Join it by hand with the label password: the Mac shows "WPA3 Personal" for the connection.
+  - [ ] iPhone: pair in the app, once by the label QR and once by the password typed by hand.
+  - [ ] Android: pair in the app, once by the label QR and once by the password typed by hand. In
+        the phone's Wi-Fi details, write down the mode it shows for the hotspot (WPA2 or WPA3).
+        The app asks for WPA2, so WPA2 is the expected result. Write it in the vault.
+  - [ ] A phone or a laptop with no WPA3 joins the hotspot (WPA2).
+  - [ ] Each pairing completes: the blue run, then the green run.
 - [ ] 8. TLS:
   - [ ] Provisioning, and MQTT over `wss://api.epixc.in/mqtt`.
   - [ ] Certificate dates (D411): the Let's Encrypt expired, valid and revoked test hosts.
@@ -150,8 +222,14 @@ Write the spare board by cable. It gets the IDF 5 bootloader. Do not use the fir
   - [ ] The stack high-water mark of the esp-mqtt task during the handshake.
 - [ ] 9. Signed LAN API: a replay, `STALE_BOOT`, the body gate, the 429 limits. DDP only with a
       lease.
-- [ ] 10. 24 h soak with the lwIP thread-safety asserts on (`LWIP_CHECK_THREAD_SAFETY`): SNTP,
-      LAN API, DDP and MQTT together. Record `heap_min`, `heap_largest` and `mqtt_dropped`.
+- [ ] 10. 24 h soak. The framework has the lwIP thread-safety asserts on
+      (`LWIP_CHECK_THREAD_SAFETY`): a call from the wrong task stops the light, and the crash
+      report shows the assert. For 24 h, run SNTP, the LAN API (the app open on the light), a
+      Sync DDP stream and MQTT together. Record `heap_min`, `heap_largest` and `mqtt_dropped`
+      from the light's health reports at the start, after 1 h, and every few hours.
+  - [ ] No restart in the 24 h (the uptime in the health report increases all the time).
+  - [ ] `heap_min` and `heap_largest` do not decrease from hour 1 to hour 24.
+  - [ ] `mqtt_dropped` does not increase without a cause that you know.
 - [ ] 11. Watchdog: 20 s never trips in normal use. A hang that you cause trips it after 20 s,
       not after 5 s (Arduino 3.x starts the watchdog at 5 s, and WLED sets it to 20 s).
 - [ ] 12. Factory reset: five power-ons, and the reset from the cloud.
@@ -163,7 +241,7 @@ Measure and record in the vault:
 
 | Item | IDF 4.4 (stage 1) | IDF 5 |
 |---|---|---|
-| App image (slot 3,145,728 bytes) | 1,471,456 bytes | 1,664,384 bytes |
+| App image (slot 3,145,728 bytes) | 1,471,456 bytes | 1,664,464 bytes (`fw-idf5-3`) |
 | Static RAM | 60,172 bytes | 62,852 bytes |
 | Free internal heap after boot | | |
 | Largest free internal block after boot | | |
@@ -174,13 +252,37 @@ Measure and record in the vault:
 The first board keeps its IDF 4.4.7 bootloader. Espressif: always test with the bootloader that
 is in use. An IDF 4.4.7 bootloader starts an app from a newer IDF.
 
-- [ ] a. OTA from the IDF 4.4 build to the IDF 5 build. These stay: `cfg.json`, `wsec.json`, the
-      presets, the energy log, `pixc_fac` (the label password) and the `pixc_ota` floor. After a
-      revert, the IDF 4.4 image still mounts the file system that the IDF 5 image wrote.
-- [ ] b. Forced revert:
-  - [ ] An IDF 5 image with a wrong broker host goes back to the IDF 4.4 image. The keys and the
-        Wi-Fi stay.
-  - [ ] An IDF 5 image that crashes at boot goes back to the IDF 4.4 image.
+Do b first: it puts the board back on IDF 4.4. Then a crosses it for good. Use the IDF 5 release
+that passed the stage 2 bench.
+
+- [ ] Before: the first board runs the IDF 4.4 release of stage 0 and reaches the broker. Write
+      down its version, its colour, one preset and its energy history in the app.
+- [ ] b. Forced revert. A new image is on probation until it reaches the broker. A restart before
+      that, or 60 minutes of Wi-Fi with no broker, puts the previous image back.
+  - [ ] Deploy the IDF 5 release in the console. When the console shows "installing" (95 %), cut
+        the internet at the router (pull its internet cable, or pause the light's internet in the
+        router's app). Keep the Wi-Fi on. The light restarts on the IDF 5 image and cannot reach
+        the broker. The console may not show "done", because the internet is cut.
+  - [ ] b1. Remove the power for 10 s, then apply it. A restart on probation is the same for the
+        bootloader as a crash at boot: the light starts the IDF 4.4 image.
+  - [ ] Connect the internet again. In the console, the light's boot event shows the IDF 4.4
+        version, and the light reaches the broker with no new pairing: the keys and the Wi-Fi
+        stay. The backend then offers the IDF 5 release again, and the light starts the update.
+  - [ ] b2. When the console shows "installing" again, cut the internet again, and keep the
+        power on. Set "After a power cut" to Last state. During the first minutes, set a new
+        colour from the app on the home Wi-Fi (the LAN route) and wait 5 s: the IDF 5 image writes
+        `/last.json`. After 60 minutes of Wi-Fi with no broker (`kRollbackWifiUpMs`), the light
+        puts the IDF 4.4 image back by itself and restarts. It starts with the new colour: the
+        IDF 4.4 image mounts the file system that the IDF 5 image wrote.
+  - The third rule (no broker 15 minutes after the API confirmed a login) needs the API up and
+    the broker down. Do not cause that on the production server.
+- [ ] a. Connect the internet, and let the light update to the IDF 5 release. It reaches the
+      broker and confirms the image. The console shows the IDF 5 version for the light (the
+      `fw_version` that `ci/checks/build-version.py` checks). These stay: `cfg.json`, `wsec.json`,
+      the presets, the energy log, `pixc_fac` (the label password) and the `pixc_ota` floor.
+      WLED's `deviceId` in `/json/info` changes; no ePixC code reads it.
+- [ ] Remove the power after it confirmed. It starts on the IDF 5 image again: a confirmed image
+      is not put back.
 - [ ] c. OTA from IDF 5 to IDF 5, on both bootloaders (IDF 4.4.7 and IDF 5).
 - [ ] d. The light refuses a downgrade and a bad signature. It survives a power cut during the
       download.
@@ -204,4 +306,6 @@ Use a spare board. Never the first board.
 
 Ship IDF 4.4.7 with the low-memory guard before each TLS connection, and cross by OTA later.
 This stays possible on secured units too: a 4.4.7 bootloader starts IDF 5 apps. The guard is not
-in the code yet (fw-small-fixes left it for this case): add it before such a release.
+in the code yet (fw-small-fixes left it for this case): add it before such a release. On that
+build the setup hotspot is WPA2 only (the IDF 4.4 framework has no WPA3 hotspot), and
+`ci/checks/bootloader-rollback.py` (it reads the IDF 5 package layout) must change with it.
