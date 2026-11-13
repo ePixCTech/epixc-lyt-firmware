@@ -133,6 +133,20 @@ const char* pixcBootId() {
   if (bootId[0] == 0) snprintf(bootId, sizeof(bootId), "%08x", (unsigned)esp_random());
   return bootId;
 }
+
+uint8_t pixcBriMax = pixc::kBriMaxNone;
+
+bool pixcSetBriMax(int cap) {
+  if (!pixc::validBriMax(cap) || cap == pixcBriMax) return false;
+  pixcBriMax = (uint8_t)cap;
+  // The strip now, as it is: a stream (DDP) sets the brightness itself and a state change would not
+  // reach it. scaledBri() applies the new cap.
+  BusManager::setBrightness(scaledBri(strip.getBrightness()));
+  strip.trigger();
+  if (pixc::capState(bri, briLast, pixcBriMax)) stateUpdated(CALL_MODE_DIRECT_CHANGE);
+  DEBUG_PRINTF("[ePixC] brightness cap %u\n", (unsigned)pixcBriMax);
+  return true;
+}
 // AI: end
 
 #endif  // PIXC_LAN_AUTH

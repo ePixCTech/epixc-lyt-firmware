@@ -12,6 +12,9 @@
 #include "wled.h"
 #include "FXparticleSystem.h"  // TODO: better define the required function (mem service) in FX.h?
 #include "colors.h"
+#ifdef PIXC_LAN_AUTH
+#include "pixc_device.h"
+#endif
 
 /*
   Custom per-LED mapping has moved!
@@ -1815,6 +1818,9 @@ void WS2812FX::setCCT(uint16_t k) {
 // direct=true either expects the caller to call show() themselves (realtime modes) or be ok waiting for the next frame for the change to apply
 // direct=false immediately triggers an effect redraw
 void WS2812FX::setBrightness(uint8_t b, bool direct) {
+#ifdef PIXC_LAN_AUTH
+  if (b > pixcBriMax) b = pixcBriMax;   // ePixC: the power plan's cap, for every caller (pixc_device.h)
+#endif
   if (gammaCorrectBri) b = gamma8(b);
   if (_brightness == b) return;
   _brightness = b;

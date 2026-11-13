@@ -41,4 +41,15 @@ bool pixcFactoryApPsk(char* out, size_t cap);
 // A random 32-bit value drawn at boot, as 8 lowercase hex characters. Returned by GET /json/id and
 // bound into every LAN request signature, so a request captured before a reboot never replays.
 const char* pixcBootId();
+
+// The power plan's brightness cap (`pixc.bri_max` on /cfg, kept in cfg.json as
+// um.PixcConnect.bri_max): 1-255, 255 when the cloud sent none. Only the cloud sets it
+// (pixc_logic.h). WS2812FX::setBrightness() and scaledBri() hold the strip under it, whatever drives
+// it (a state write, a preset, a transition, DDP); deserializeState() and stateUpdated() hold the
+// light's `bri` under it, so the level it reports is the level it shows.
+extern uint8_t pixcBriMax;
+
+// A cap from the cloud (pixc::validBriMax, else ignored). A light above it dims to it at once and
+// reports the new level; a stream (DDP) is capped at once too. True when the cap changed.
+bool pixcSetBriMax(int cap);
 // AI: end

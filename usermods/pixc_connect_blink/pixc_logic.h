@@ -923,5 +923,29 @@ inline size_t formatPanic(char* buf, size_t cap, const PanicSummary& p) {
   return len;
 }
 
+// ---------------------------------------------------------------------------------------------
+// The power plan's brightness cap (review 2026-11-13, power-plan-cap)
+// ---------------------------------------------------------------------------------------------
+// The home's power plan is the most the light may show: Eco 127, Balanced 191, Full 255
+// (epixc-backend DeviceService.buildCfg). The cloud sends it on /cfg as `pixc.bri_max`, and only the
+// cloud: a LAN config write loses `pixc` and `um.PixcConnect` whole (pixc::lan::sanitizeLanCfg). Before
+// this, the plan only set the power-on brightness, and any write could go past it.
+constexpr uint8_t kBriMaxNone = 255;   // no cap: a light the cloud has not sent one
+
+// A cap as /cfg and cfg.json carry it. 0 is not one (a light that could never turn on): ignored.
+inline bool validBriMax(long cap) { return cap >= 1 && cap <= 255; }
+
+// A brightness under the cap.
+inline uint8_t capBri(uint8_t b, uint8_t cap) { return b > cap ? cap : b; }
+
+// A lower cap for the light's state: `bri` (0 is off, and stays off) and `briLast` (what "on" brings
+// back) come down to it. True when `bri` moved, so the light shows and reports the new level.
+inline bool capState(uint8_t& bri, uint8_t& briLast, uint8_t cap) {
+  briLast = capBri(briLast, cap);
+  if (bri <= cap) return false;
+  bri = cap;
+  return true;
+}
+
 }  // namespace pixc
 // AI: end

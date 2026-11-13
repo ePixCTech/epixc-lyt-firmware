@@ -1081,7 +1081,8 @@ class PixcConnectBlink : public Usermod {
     // auto-white mode), every legitimate push quietly reset them too.
     //
     // What the backend sends (epixc-backend DeviceService.buildCfg), and all that is applied:
-    //   def.bri, def.on      power plan brightness cap and restore-on-power
+    //   def.bri, def.on      power-on brightness (under the plan's cap) and restore-on-power
+    //   pixc.bri_max         the power plan's brightness cap, 1-255 (pixc_device.h, pixcSetBriMax)
     //   pixc.restore         "last", "on" or "off": what comes back after a power cut (pixc_last_state.h)
     //   light.tr.dur         slow-fade, in 100 ms units
     //   pixc.led_channels    "RGB" / "RGBW" - see applyLedWidth() and pixc_led_bus.h
@@ -1116,6 +1117,16 @@ class PixcConnectBlink : public Usermod {
         }
       }
       if (pixcSetRestoreMode(root["pixc"]["restore"] | (const char*)nullptr)) changed = true;
+      // The power plan's cap. Firmware before review 2026-11-13 ignores the key: there the plan sets
+      // only the power-on brightness. A light dimmed to a lower cap during a set-up look keeps the
+      // look (the cloud sends /cfg as the green run starts): the cap is not somebody's change, and
+      // onStateChange would end the look with no Aurora after it.
+      JsonVariant briMax = root["pixc"]["bri_max"];
+      if (briMax.is<int>()) {
+        _painting = (_look != Look::None);
+        if (pixcSetBriMax(briMax.as<int>())) changed = true;
+        _painting = false;
+      }
       if (applyLanKey(root["um"]["PixcConnect"]["settingsPin"] | (const char*)nullptr)) changed = true;
       // {"pixc":{"reprovision":true}}: pull a new broker login (the backend's "Reconnect to cloud").
       // The current one stays valid until the new one is confirmed, so a failed pull stays online.
@@ -1560,6 +1571,7 @@ class PixcConnectBlink : public Usermod {
       top["apiHost"] = _apiHost;
       top["apiPort"] = _apiPort;
       top["restore"] = pixcRestoreMode();
+      top["bri_max"] = pixcBriMax;
       // `settingsPin` is deliberately NOT written back. This same function answers
       // `GET /json/cfg`, and echoing the PIN here would publish the credential to exactly the
       // caller it exists to stop. WLED keeps settingsPIN in wsec.json for the same reason, and
@@ -1576,6 +1588,10 @@ class PixcConnectBlink : public Usermod {
       JsonObject top = root["PixcConnect"];
       if (top.isNull()) return false;
       pixcSetRestoreMode(top["restore"] | (const char*)nullptr);   // absent: unchanged (a LAN /json/cfg post reaches here too)
+      // The cap the cloud last sent, read at boot before the strip starts, so it is set and not
+      // applied. A LAN /json/cfg post never carries it: sanitizeLanCfg drops um.PixcConnect.
+      const int briMax = top["bri_max"] | 0;
+      if (pixc::validBriMax(briMax)) pixcBriMax = (uint8_t)briMax;
 #ifdef EPIXC_ALLOW_PLAINTEXT_PROVISION
       // Bench builds keep the host configurable, which is the entire reason the dev env exists:
       // the bench Mac's address rotates.

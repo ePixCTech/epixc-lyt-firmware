@@ -193,8 +193,8 @@ static void testSanitizeLanCfg() {
     "ap":{"ssid":"x","psk":"y"},
     "ota":{"lock":false},
     "pin":"1234",
-    "pixc":{"lan":"00"},
-    "um":{"PixcConnect":{"settingsPin":"k"},"AudioReactive":{"sync":{"mode":2}}},
+    "pixc":{"lan":"00","bri_max":255},
+    "um":{"PixcConnect":{"settingsPin":"k","bri_max":255},"AudioReactive":{"sync":{"mode":2}}},
     "hw":{"led":{"maxpwr":4000},"btn":{"ins":[{"type":2,"pin":[4]}],"tt":32},"relay":{"pin":5},
           "ir":{"pin":6,"type":1}}
   })"));
@@ -206,6 +206,9 @@ static void testSanitizeLanCfg() {
   CHECK(r["nw"]["ins"][0]["ssid"] == "Home");       // the app's "change network" stays
   CHECK(r["ap"].isNull() && r["ota"].isNull() && r["pin"].isNull() && r["pixc"].isNull());
   CHECK(r["um"]["PixcConnect"].isNull());
+  // Nor the power plan's cap (review 2026-11-13): only the cloud sets it, on /cfg as pixc.bri_max,
+  // and the light keeps it in cfg.json as um.PixcConnect.bri_max. Both are gone above.
+  CHECK(r["pixc"]["bri_max"].isNull() && r["um"]["PixcConnect"]["bri_max"].isNull());
   CHECK(r["um"]["AudioReactive"]["sync"]["mode"] == 2);
   CHECK(r["id"]["name"] == "Desk");
   CHECK(r["hw"]["led"]["maxpwr"] == 4000);          // the app's strip settings stay

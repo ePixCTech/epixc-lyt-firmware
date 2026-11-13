@@ -1,4 +1,7 @@
 #include "wled.h"
+#ifdef PIXC_LAN_AUTH
+#include "pixc_device.h"
+#endif
 
 /*
  * LED methods
@@ -59,6 +62,11 @@ byte scaledBri(byte in)
 {
   unsigned val = ((unsigned)in*briMultiplier)/100;
   if (val > 255) val = 255;
+#ifdef PIXC_LAN_AUTH
+  // ePixC: the power plan's cap on what reaches the LEDs (pixc_device.h). A scale-bri over 100 %,
+  // which a LAN config write may set, would otherwise lift a capped brightness past it.
+  if (val > pixcBriMax) val = pixcBriMax;
+#endif
   return (byte)val;
 }
 
@@ -88,6 +96,12 @@ void stateUpdated(byte callMode) {
   //call for notifier -> 0: init 1: direct change 2: button 3: notification 4: nightlight 5: other (No notification)
   //                     6: fx changed 7: hue 8: preset cycle 9: blynk 10: alexa 11: ws send only 12: button preset
   setValuesFromFirstSelectedSeg();  // a much better approach would be to use main segment: setValuesFromMainSeg()
+#ifdef PIXC_LAN_AUTH
+  // ePixC: the power plan's cap (pixc_device.h), so the level the light reports is the level it
+  // shows. deserializeState() caps a state write already; this is every other way `bri` is set:
+  // on after off, the power-on brightness, a nightlight, the set-up runs.
+  if (bri > pixcBriMax) bri = pixcBriMax;
+#endif
 
   if (bri != briOld || stateChanged) {
     if (stateChanged) currentPreset = 0; //something changed, so we are no longer in the preset

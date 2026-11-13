@@ -1,5 +1,6 @@
 #include "wled.h"
 #ifdef PIXC_LAN_AUTH
+#include "pixc_device.h"
 #include "pixc_lan.h"
 #endif
 
@@ -382,6 +383,11 @@ bool deserializeState(JsonObject root, byte callMode, byte presetId)
 
   bool onBefore = bri;
   getVal(root["bri"], bri);
+#ifdef PIXC_LAN_AUTH
+  // ePixC: the power plan's cap (pixc_device.h), from the cloud, the LAN, a preset or the saved
+  // state alike; before the change is judged, so a write above a light already at the cap is none.
+  if (bri > pixcBriMax) bri = pixcBriMax;
+#endif
   if (bri != briOld) stateChanged = true;
 
   bool on = root["on"] | (bri > 0);

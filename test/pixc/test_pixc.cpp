@@ -847,6 +847,34 @@ static void testProbation() {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Review 2026-11-13 (power-plan-cap): the power plan caps the light's brightness.
+// ---------------------------------------------------------------------------------------------
+static void testBriMax() {
+  // What /cfg and cfg.json may carry: 1-255. 0 would be a light that never turns on.
+  CHECK(pixc::validBriMax(1) && pixc::validBriMax(127) && pixc::validBriMax(255));
+  CHECK(!pixc::validBriMax(0) && !pixc::validBriMax(-1) && !pixc::validBriMax(256));
+  CHECK(pixc::kBriMaxNone == 255);
+  // Eco (127): a write of 255 gives 127; one under the cap, and off, are left alone.
+  CHECK(pixc::capBri(255, 127) == 127);
+  CHECK(pixc::capBri(128, 127) == 127);
+  CHECK(pixc::capBri(127, 127) == 127);
+  CHECK(pixc::capBri(40, 127) == 40);
+  CHECK(pixc::capBri(0, 127) == 0);
+  CHECK(pixc::capBri(255, pixc::kBriMaxNone) == 255);   // no plan: no cap
+  // Full to Eco on a light at full: it comes down to the cap, and "on" after off does too.
+  uint8_t bri = 255, briLast = 255;
+  CHECK(pixc::capState(bri, briLast, 127) && bri == 127 && briLast == 127);
+  // A light that is off stays off; only what "on" brings back comes down.
+  bri = 0; briLast = 200;
+  CHECK(!pixc::capState(bri, briLast, 191) && bri == 0 && briLast == 191);
+  // Under the cap: nothing moves. A higher cap never raises the light.
+  bri = 90; briLast = 90;
+  CHECK(!pixc::capState(bri, briLast, 127) && bri == 90 && briLast == 90);
+  bri = 127; briLast = 127;
+  CHECK(!pixc::capState(bri, briLast, 255) && bri == 127 && briLast == 127);
+}
+
+// ---------------------------------------------------------------------------------------------
 // Review 2026-11-10 (coredump-never-read): the crash summary in the boot event.
 // ---------------------------------------------------------------------------------------------
 static void testPanicReport() {
@@ -916,6 +944,7 @@ static void testPanicReport() {
 }
 
 int main() {
+  testBriMax();
   testProbation();
   testPanicReport();
   testPinGuardV2Mode();
