@@ -846,12 +846,13 @@ inline bool rollbackDue(bool onProbation, bool brokerConnected, bool loginConfir
 // dump is erased once that event is published. Cable access is over, so this is the only way a
 // crash in the field can be read. The program counters are the crashing image's: after an OTA
 // revert they belong to the image that crashed, not to the one that reports them, so `elf` (the
-// first 16 hex digits of the crashing image's ELF SHA-256, CONFIG_APP_RETRIEVE_LEN_ELF_SHA) names
-// the ELF to decode them with (xtensa-esp32s3-elf-addr2line -e firmware.elf <pc>).
+// first CONFIG_APP_RETRIEVE_LEN_ELF_SHA hex digits of the crashing image's ELF SHA-256: 9 on
+// IDF 5.5.5, 16 on IDF 4.4.7) names the ELF to decode them with
+// (xtensa-esp32s3-elf-addr2line -e firmware.elf <pc>).
 
 constexpr size_t kPanicTaskMax = 15;   // a FreeRTOS task name (configMAX_TASK_NAME_LEN 16, less NUL)
 constexpr size_t kPanicBtMax = 8;      // backtrace PCs sent; the summary holds up to 16
-constexpr size_t kPanicElfMax = 16;    // hex digits of the ELF SHA-256 the dump records
+constexpr size_t kPanicElfMax = 16;    // at most this many hex digits of the ELF SHA-256; 9 on IDF 5.5.5
 
 struct PanicSummary {
   char task[kPanicTaskMax + 1];   // the task that crashed, NUL-terminated

@@ -65,10 +65,10 @@ it lists (Alexa, the web UI, DMX, E1.31 and Art-Net, ESP-NOW sync) are off in `P
 A light does not install an image whose build number is lower than the build that it runs
 (`otaRefusal` in `usermods/pixc_connect_blink/pixc_logic.h`). The build number is the commit time
 in minutes (`pio-scripts/pixc_build_id.py`), so an older release always has a lower number. Thus
-the console cannot roll the lights back to an older release: its Roll back is disabled, and it
-refuses to make a build current when the build number is lower than the current release's. To go
-back to an older release, re-issue its source as a new version. The new commit has a newer commit
-time, so its build number is higher.
+the console cannot roll the lights back to an older release. Its Roll back is disabled. It does
+not make a build current when its build number is lower than the build number of the current
+release. To go back to an older release, re-issue its source as a new version. The new commit has
+a newer commit time, so its build number is higher.
 
 Before you start, make sure that:
 
@@ -76,8 +76,24 @@ Before you start, make sure that:
   `ci/build.sh`, or the box does not build it.
 - Its `PIXC_SECURITY_VERSION` (`pixc_logic.h`) is the same as in the bad release. A light refuses
   an image below the highest security version that it ran. If the bad release raised that number,
-  do not re-issue: the older source has the vulnerability that the bad release fixed. Fix the fault
-  in a new release.
+  do not re-issue. The older source has the vulnerability that the bad release fixed. Fix the
+  fault in a new release.
+- The box's build image has the platform of the older release. The image has one platform, and a
+  build cannot install a different one into it. The pins of the image are in epixc-backend
+  `deploy/native/pipeline/image/Containerfile`: `PIO_PLATFORM`, `PIO_FRAMEWORK`,
+  `PIO_FRAMEWORK_LIBS` and `PIO_ESPTOOL`. Compare them with `platform` and `platform_packages` of
+  `PixC_V1` in the older release's `platformio_override.ini`. The image's PlatformIO must also be
+  the version in the older release's `requirements.txt`.
+
+  If one of them is different, change the image in epixc-backend to the older release's pins, and
+  deploy the backend. The box uses the changed image from its next build. After the box built the
+  re-issue, set the pins back and deploy the backend again.
+
+  A release on IDF 4.4 has `platform = espressif32@6.13.0`. For it, set
+  `PIO_PLATFORM=espressif32@6.13.0` and
+  `PIO_FRAMEWORK=platformio/framework-arduinoespressif32@3.20017.241212` (ESP-IDF 4.4.7). Platform
+  6.13.0 does not use the other two pins. Only a light with the IDF 4.4.7 bootloader starts such an
+  image (`docs/pixc-idf5-bench.md`, stage 3, item e).
 
 The example re-issues `17.0.1-pixc7` as `17.0.1-pixc9`, because `17.0.1-pixc8` is bad:
 
@@ -89,10 +105,14 @@ The example re-issues `17.0.1-pixc7` as `17.0.1-pixc9`, because `17.0.1-pixc8` i
    git restore --source=lyt-v17.0.1-pixc7 --staged --worktree -- :/
    ```
    If the restored `ci/build.sh` does not contain `image_home` (`17.0.1-pixc6` and older), also
-   take `ci/build.sh` from `master`. The box's build image has a read-only PlatformIO home. An older
-   `ci/build.sh` gives that home to PlatformIO, and PlatformIO stops because it cannot write there.
+   take `ci/build.sh` from commit `36dc95eb`. The box's build image has a read-only PlatformIO
+   home. An older `ci/build.sh` gives that home to PlatformIO, and PlatformIO stops because it
+   cannot write there. The `ci/build.sh` of `36dc95eb` is the last one for IDF 4.4. It has
+   `image_home`, and it runs only the gates that an IDF 4.4 tree has. Do not take `ci/build.sh`
+   from `master`. The script on `master` runs gates that an older tree does not have, so the build
+   stops.
    ```sh
-   git restore --source=master --staged --worktree -- ci/build.sh
+   git restore --source=36dc95eb --staged --worktree -- ci/build.sh
    ```
 3. Set the next version: one more than the newest `pixcN` tag. A light gets only a version that is
    newer than the version that it runs. This command changes `package.json` and the two versions in
@@ -113,19 +133,19 @@ The example re-issues `17.0.1-pixc7` as `17.0.1-pixc9`, because `17.0.1-pixc8` i
    git push origin lyt-v17.0.1-pixc9
    ```
 6. Build it in the console: Deploy, Builds, Build, then Firmware and the tag. The box tests, builds
-   and signs it. On the Firmware page (Deploy, Current builds, Firmware), make sure that the build
-   number of the ready build is higher than the build number of the current release.
+   and signs it. Open the Firmware page (Deploy, Current builds, Firmware). Make sure that the
+   ready build has a higher build number than the current release.
 7. Deploy it on the Firmware page: Deploy at the ready build, then the target, the tag and a new
    code. It becomes the current release of that target, and the lights get it when they next update.
    Do this for each target that has the bad release. If the fault is urgent, also make the release
-   critical: then each light whose owner allows unattended updates installs it at the owner's hour.
-8. To continue from the newer code, revert the re-issue commit (`git revert <commit>`), repair the
-   fault, set the next version (`17.0.1-pixc10`), and release it as usual.
+   critical. Then each light whose owner allows unattended updates installs it at the owner's hour.
+8. To continue from the newer code, revert the re-issue commit (`git revert <commit>`). Then repair
+   the fault, set the next version (`17.0.1-pixc10`) and release it as usual.
 
 `EPIXC_BUILD_NUMBER` (`pio-scripts/pixc_build_id.py`) sets the build number by hand. A re-issue
-does not need it; use it only for a special case. Never set it higher than the real time: each
-light that installs such an image refuses every later release until a commit time is higher than
-that number. Also, the light uses the number as its earliest possible time when it examines
+does not need it; use it only for a special case. Never set it higher than the real time. A light
+that installs such an image refuses each later release until a commit time is higher than that
+number. Also, the light uses the number as its earliest possible time when it examines
 certificate dates (`kTlsTimeFloor` in `pixc_https.cpp`).
 
 ## Why this repository is public

@@ -16,9 +16,9 @@ Founder decision, 2026-11-13 (Production review 2026-11-10, decisions):
 
 | Stage | Who | What |
 |---|---|---|
-| 0 | Founder | One OTA on today's IDF 4.4 line (`17.0.1-pixc7`), before any IDF 5 image. |
+| 0 | Founder | One OTA on today's IDF 4.4 line (`17.0.1-pixc7`, the tree of `9af1bf20`), before any IDF 5 image. |
 | 1 | Agent, done | Merge of WLED main at `01f74928`. `PixC_V1` stays on IDF 4.4 (`espressif32@6.13.0`). |
-| 1 bench | Founder | The merged build on IDF 4.4. This finds faults from the merge alone. |
+| 1 bench | Founder | The merged build on IDF 4.4 (the tree of `36dc95eb`). This finds faults from the merge alone. |
 | 2 | Agent, done | `espressif32@8.0.0`. Every ePixC env builds on IDF 5, and the box's image gates read the IDF 5 build. |
 | 2, rest | Agent, done | mbedTLS 3 in the ePixC TLS paths (the pinned roots, the OTA signature check), the WPA2/WPA3 hotspot, the readers of `deviceId` in `/json/info`, and two more box gates. |
 | 2 bench | Founder | The IDF 5 build on a spare board, written by cable. |
@@ -148,15 +148,34 @@ Box gates (`ci/build.sh`):
 
 ## Stage 0: one OTA on IDF 4.4
 
-- [ ] The first board (`80b54ecf4940`) runs `17.0.1-pixc6`. Release `17.0.1-pixc7` and let the
+The source of `17.0.1-pixc7` is the tree of commit `9af1bf20`. It is `17.0.1-pixc6` with the fixes
+of review 2026-11-13, on IDF 4.4, before the upstream merge. Do not make it from a `master` that
+has the IDF 5 commits: that is an IDF 5 image.
+
+The box's build image must have `espressif32@6.13.0` when the box builds stages 0 and 1. The
+epixc-backend commit fw-idf5 changes the image to `espressif32@8.0.0`. Deploy that commit only
+after the box built stages 0 and 1. If it is already deployed, first change the image to the
+IDF 4.4 pins. The readme tells how ("Re-issue an older release", "Before you start").
+
+- [ ] Make `17.0.1-pixc7` on `master`. If `master` is at `17.0.1-pixc6`, fast-forward it to
+      `9af1bf20` (`git merge --ff-only 9af1bf20`). Then do steps 3 to 6 of the readme's "Re-issue
+      an older release". If `master` has the IDF 5 commits, do steps 2 to 6 with
+      `--source=9af1bf20`. After the release, revert the re-issue commit (step 8).
+- [ ] The first board (`80b54ecf4940`) runs `17.0.1-pixc6`. Deploy `17.0.1-pixc7`, and let the
       board update by OTA. Make sure that it reaches the broker after the update.
 
 Do this before any IDF 5 image. Then a failure in stage 3 has one cause, not two.
 
 ## Stage 1 bench: the merged build on IDF 4.4
 
-Release the merged build with a new version, or write it by cable to a spare board. Do not write
-the first board by cable: its cable writes are over. Compare each result with `17.0.1-pixc6`.
+The source of the merged build is the tree of commit `36dc95eb`. The box's build image must have
+`espressif32@6.13.0` (stage 0). Do not write the first board by cable: its cable writes are over.
+Compare each result with `17.0.1-pixc6`.
+
+- [ ] After stage 0, release the merged build with the next version. Merge `36dc95eb` into
+      `master` (`git merge 36dc95eb`), then do readme steps 3 to 7. If `master` has the IDF 5
+      commits, do readme steps 2 to 7 with `--source=36dc95eb`. After the release, revert the
+      re-issue commit (step 8). You can also write the build by cable to a spare board.
 
 - [ ] Boot. No orange or yellow flash at power-on.
 - [ ] Saved state. Set a colour, wait 5 s, then remove the power. The light comes back with that
@@ -183,18 +202,19 @@ Use a spare board. Do not use the first board: its cable writes are over.
 
 - [ ] Build the IDF 5 release on the box (a new `package.json` version, tag `lyt-v<version>`). Do
       not deploy it in the console yet: the first board would update.
-- [ ] Write the spare board by cable with the Writer, as a new board: the bootloader, the
-      partition table, `boot_app0.bin` and the app (`flash.json`), then the factory data (the
-      hotspot password) and the label. The board gets the IDF 5 bootloader. A release image with
-      no factory password opens no hotspot. The Writer must first accept the IDF 5 bootloader
-      (19,968 bytes, `esp-idf: v5.5.5`; the Writer's part of fw-idf5).
+- [ ] Write the spare board by cable with the Writer, as a new board. Write the bootloader, the
+      partition table, `boot_app0.bin` and the app (`flash.json`). Then write the factory data
+      (the hotspot password) and print the label. The board gets the IDF 5 bootloader. A release
+      image with no factory password opens no hotspot. The Writer must first accept the IDF 5
+      bootloader (19,968 bytes, `esp-idf: v5.5.5`; the Writer's part of fw-idf5).
 - [ ] Pair the spare board in the app. Then do the tests below.
 
 - [ ] 1. Cold boot ten times. Look for "CONFLICT! driver_ng" aborts, watchdog and interrupt
       watchdog resets, and 8 MB octal PSRAM not found. On `PixC_V1_dev`, the serial log shows
       that the ePixC usermod and the mic usermod start.
-- [ ] 2. 300 LEDs on GPIO16 under Wi-Fi load. Run fast effects, a Sync DDP stream at 60 fps, live
-      power every 2 s and a TLS reconnect at the same time. Look for flicker (a scope if you can).
+- [ ] 2. 300 LEDs on GPIO16 under Wi-Fi load. Run fast effects and a Sync DDP stream at 60 fps.
+      At the same time, read live power every 2 s and cause a TLS reconnect. Look for flicker (a
+      scope if you can).
       The high-priority RMT interrupt (NeoEsp32RmtHI) is not in the IDF 5 build. The effects run as
       smoothly as on the IDF 4.4 build.
 - [ ] 3. No orange flash at boot. The blue run, the green run and Aurora still play.
@@ -203,8 +223,9 @@ Use a spare board. Do not use the first board: its cable writes are over.
 - [ ] 5. Mic: the ICS-43434 on the new I2S driver. Compare with the IDF 4.4 build: the same sound,
       default gain and squelch, LytSync with the ePixC Mic. Upstream tested this driver on ESP32
       and ESP32-C3 only.
-- [ ] 6. Pairing v2 on iOS and on Android: hotspot `ePixC-XXXX` with the label password, the retry
-      after a wrong Wi-Fi password, 409 for a second phone, `_pixc._tcp` found by mDNS.
+- [ ] 6. Pairing v2 on iOS and on Android. Test the hotspot `ePixC-XXXX` with the label password,
+      and the retry after a wrong Wi-Fi password. Test 409 for a second phone, and `_pixc._tcp`
+      found by mDNS.
 - [ ] 7. Hotspot, WPA2/WPA3 mixed (do it again after a factory reset, item 12):
   - [ ] On a Mac, hold Option and click the Wi-Fi menu. The hotspot shows "WPA2/WPA3 Personal".
         Join it by hand with the label password: the Mac shows "WPA3 Personal" for the connection.
@@ -224,17 +245,20 @@ Use a spare board. Do not use the first board: its cable writes are over.
       lease.
 - [ ] 10. 24 h soak. The framework has the lwIP thread-safety asserts on
       (`LWIP_CHECK_THREAD_SAFETY`): a call from the wrong task stops the light, and the crash
-      report shows the assert. For 24 h, run SNTP, the LAN API (the app open on the light), a
-      Sync DDP stream and MQTT together. Record `heap_min`, `heap_largest` and `mqtt_dropped`
-      from the light's health reports at the start, after 1 h, and every few hours.
+      report shows the assert. For 24 h, run SNTP, the LAN API, a Sync DDP stream and MQTT
+      together. For the LAN API, keep the app open on the light. Record `heap_min`, `heap_largest`
+      and `mqtt_dropped` from the light's health reports at the start, after 1 h, and every few
+      hours.
   - [ ] No restart in the 24 h (the uptime in the health report increases all the time).
   - [ ] `heap_min` and `heap_largest` do not decrease from hour 1 to hour 24.
   - [ ] `mqtt_dropped` does not increase without a cause that you know.
 - [ ] 11. Watchdog: 20 s never trips in normal use. A hang that you cause trips it after 20 s,
-      not after 5 s (Arduino 3.x starts the watchdog at 5 s, and WLED sets it to 20 s).
+      not after 5 s. Arduino 3.x starts the watchdog at 5 s, and WLED sets it to 20 s.
 - [ ] 12. Factory reset: five power-ons, and the reset from the cloud.
-- [ ] 13. A panic that you cause on the dev build: the core dump fits in 64 KB, and its summary
-      reads back.
+- [ ] 13. Cause a panic on the dev build. The core dump fits in 64 KB, and its summary reads back.
+      The `elf` field of the boot event has 9 hex digits of the ELF SHA-256, not 16. IDF 5.5.5
+      keeps 9 (`CONFIG_APP_RETRIEVE_LEN_ELF_SHA`), and IDF 4.4.7 kept 16. The console does not
+      show `elf`; the edge keeps the whole event in `device_events`.
 - [ ] 14. Wi-Fi starts on the DC jack with no brownout.
 
 Measure and record in the vault:
@@ -260,17 +284,17 @@ that passed the stage 2 bench.
 - [ ] b. Forced revert. A new image is on probation until it reaches the broker. A restart before
       that, or 60 minutes of Wi-Fi with no broker, puts the previous image back.
   - [ ] Deploy the IDF 5 release in the console. When the console shows "installing" (95 %), cut
-        the internet at the router (pull its internet cable, or pause the light's internet in the
-        router's app). Keep the Wi-Fi on. The light restarts on the IDF 5 image and cannot reach
-        the broker. The console may not show "done", because the internet is cut.
+        the internet at the router. Pull its internet cable, or pause the light's internet in the
+        router's app. Keep the Wi-Fi on. The light restarts on the IDF 5 image and cannot reach the
+        broker. The console may not show "done", because the internet is cut.
   - [ ] b1. Remove the power for 10 s, then apply it. A restart on probation is the same for the
         bootloader as a crash at boot: the light starts the IDF 4.4 image.
   - [ ] Connect the internet again. In the console, the light's boot event shows the IDF 4.4
-        version, and the light reaches the broker with no new pairing: the keys and the Wi-Fi
-        stay. The backend then offers the IDF 5 release again, and the light starts the update.
+        version. The light reaches the broker with no new pairing: the keys and the Wi-Fi stay.
+        The backend then offers the IDF 5 release again, and the light starts the update.
   - [ ] b2. When the console shows "installing" again, cut the internet again, and keep the
         power on. Set "After a power cut" to Last state. During the first minutes, set a new
-        colour from the app on the home Wi-Fi (the LAN route) and wait 5 s: the IDF 5 image writes
+        colour from the app on the home Wi-Fi (the LAN route). Wait 5 s: the IDF 5 image writes
         `/last.json`. After 60 minutes of Wi-Fi with no broker (`kRollbackWifiUpMs`), the light
         puts the IDF 4.4 image back by itself and restarts. It starts with the new colour: the
         IDF 4.4 image mounts the file system that the IDF 5 image wrote.
@@ -286,16 +310,18 @@ that passed the stage 2 bench.
 - [ ] c. OTA from IDF 5 to IDF 5, on both bootloaders (IDF 4.4.7 and IDF 5).
 - [ ] d. The light refuses a downgrade and a bad signature. It survives a power cut during the
       download.
-- [ ] e. A forward re-issue back to the IDF 4.4 source works (readme, "Re-issue an older
-      release"). This works only on a light with the IDF 4.4.7 bootloader: an IDF 5 bootloader
-      does not start an app from an older IDF.
+- [ ] e. A forward re-issue back to the IDF 4.4 source works. Follow the readme's "Re-issue an
+      older release". First change the box's image to the IDF 4.4 pins ("Before you start"). If
+      the source has no `image_home`, take `ci/build.sh` from `36dc95eb` (step 2). This works
+      only on a light with the IDF 4.4.7 bootloader. An IDF 5 bootloader does not start an app
+      from an older IDF.
 
 ## Stage 4: the secure bootloader (Writer ticket 09)
 
 Use a spare board. Never the first board.
 
-- [ ] Build the bootloader from ESP-IDF v5.5.5 (`b774170ff46`), not 4.4.7: secure boot v2
-      (RSA-3072), flash encryption in release mode, log level ERROR or NONE.
+- [ ] Build the bootloader from ESP-IDF v5.5.5 (`b774170ff46`), not 4.4.7. Use secure boot v2
+      (RSA-3072), flash encryption in release mode and log level ERROR or NONE.
 - [ ] Measure its size against the 0x8000 limit, with padding and the 4 KB signature sector. If it
       does not fit, the partition table offset must move before batch 1. Then the bench boards need
       one more cable write, and the Writer, the CSV, `ci/flash-files.py` and the factory NVS at
@@ -307,5 +333,6 @@ Use a spare board. Never the first board.
 Ship IDF 4.4.7 with the low-memory guard before each TLS connection, and cross by OTA later.
 This stays possible on secured units too: a 4.4.7 bootloader starts IDF 5 apps. The guard is not
 in the code yet (fw-small-fixes left it for this case): add it before such a release. On that
-build the setup hotspot is WPA2 only (the IDF 4.4 framework has no WPA3 hotspot), and
-`ci/checks/bootloader-rollback.py` (it reads the IDF 5 package layout) must change with it.
+build the setup hotspot is WPA2 only, because the IDF 4.4 framework has no WPA3 hotspot. Also
+change `ci/checks/bootloader-rollback.py` with it: it reads the IDF 5 package layout. The box's
+image must have the IDF 4.4 pins (readme, "Re-issue an older release", "Before you start").
