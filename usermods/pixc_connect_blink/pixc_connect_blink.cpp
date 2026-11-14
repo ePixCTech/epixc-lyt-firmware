@@ -900,6 +900,7 @@ class PixcConnectBlink : public Usermod {
     // a crash summary (pixc::kPanicJsonMax). It was 192 bytes for the whole event before the crash
     // summary, which the widest boot event filled to the byte.
     static constexpr size_t kEventExtraMax = 192 + pixc::kPanicJsonMax;
+    static_assert(kEventExtraMax <= 512, "the boot event is built twice on the LED loop's stack (onMqttConnect, publishEvent)");
     bool publishEvent(const char* type, const char* extraJson = nullptr) {
       char buf[kEventExtraMax + 32];
       if (extraJson != nullptr) {
@@ -955,10 +956,63 @@ class PixcConnectBlink : public Usermod {
         pixc::panicFrom(_panic, s->exc_task, sizeof(s->exc_task), s->exc_pc, s->exc_bt_info.bt,
                         s->exc_bt_info.depth, (const char*)s->app_elf_sha256, sizeof(s->app_elf_sha256));
         _panicRead = true;
-        DEBUG_PRINTF("[ePixC] crash dump: task %s, pc 0x%08lx\n", _panic.task, (unsigned long)_panic.pc);
       }
       free(s);
+      if (_panicRead) {
+        const unsigned long at = millis();
+        findCrashedImage();
+        DEBUG_PRINTF("[ePixC] crash dump: task %s, pc 0x%08lx, elf %s, image %u (found in %lu ms)\n", _panic.task,
+                     (unsigned long)_panic.pc, _panic.elf, (unsigned)_panic.image, millis() - at);
+        (void)at;   // read only by the debug line, which a release build leaves out
+      }
 #endif
+    }
+
+    // Which image crashed, and its ELF hash, version and build (pixc_logic.h, the crash report).
+    // After a crash on probation the bootloader goes back to the previous image, so the image that
+    // reads the dump is not always the one that wrote it. The dump's ELF digits are compared with
+    // the ELF SHA-256 in the running image's descriptor, then in the other OTA slot's (two slots,
+    // tools/WLED_ESP32_8MB_epixc.csv): the crashed image stays there until the next update writes
+    // over it. Once a boot, only after a crash.
+    static_assert(sizeof(wled_metadata_t::wled_version) == pixc::kPanicVersionMax,
+                  "the crash report sends another image's whole WLED version");
+    void findCrashedImage() {
+      // 256 bytes and a 4 KB read buffer: on the heap, as the summary is.
+      esp_app_desc_t* d = (esp_app_desc_t*)malloc(sizeof(esp_app_desc_t));
+      if (d == nullptr) return;
+      char hex[65];
+      const esp_partition_t* running = esp_ota_get_running_partition();
+      if (running == nullptr || esp_ota_get_partition_description(running, d) != ESP_OK) { free(d); return; }
+      pixc_net::hex32(d->app_elf_sha256, hex);
+      const pixc::PanicImage image = pixc::crashedImage(_panic.elf, hex);
+      if (image == pixc::PanicImage::Running) pixc::panicImage(_panic, image, hex, nullptr, 0, 0);
+      if (image != pixc::PanicImage::Other) { free(d); return; }
+
+      // Another image crashed. In the other slot, its WLED version is in its wled_metadata_t, just
+      // after its esp_app_desc_t (wled00/ota_update.cpp, METADATA_OFFSET), and its build number in
+      // its BuildDesc, found as the OTA download finds it: the slot is read 4 KB at a time until
+      // the descriptor turns up (in the image's read-only data, near its start), all 3 MB of it
+      // only for an image with none. The bench times it (the IDF 5 bench checklist in docs/, item 13).
+      const esp_partition_t* other = esp_ota_get_next_update_partition(nullptr);
+      bool inOther = other != nullptr && esp_ota_get_partition_description(other, d) == ESP_OK;
+      if (inOther) { pixc_net::hex32(d->app_elf_sha256, hex); inOther = pixc::elfMatches(_panic.elf, hex); }
+      free(d);
+      // Written over since: the dump's own digits, and reverted.
+      if (!inOther) { pixc::panicImage(_panic, image, nullptr, nullptr, 0, 0); return; }
+      static constexpr size_t kChunk = 4096;
+      uint8_t* buf = (uint8_t*)malloc(kChunk);
+      wled_metadata_t meta;
+      bool haveMeta = false;
+      pixc::DescScanner desc(pixc_build_desc.magic);
+      for (size_t off = 0; buf != nullptr && off < other->size && !desc.found(); off += kChunk) {
+        const size_t n = std::min(kChunk, (size_t)(other->size - off));
+        if (esp_partition_read(other, off, buf, n) != ESP_OK) break;
+        if (off == 0) haveMeta = findWledMetadata(buf, n, &meta);
+        desc.feed(buf, n);
+      }
+      free(buf);
+      pixc::panicImage(_panic, image, hex, haveMeta ? meta.wled_version : nullptr, sizeof(meta.wled_version),
+                       desc.found() ? desc.build() : 0);
     }
 
     // After the boot event that reports it is published. Erasing the 64 KB partition holds the loop

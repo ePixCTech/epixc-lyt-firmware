@@ -839,20 +839,47 @@ inline bool rollbackDue(bool onProbation, bool brokerConnected, bool loginConfir
 }
 
 // ---------------------------------------------------------------------------------------------
-// The crash report (review 2026-11-10, coredump-never-read)
+// The crash report (review 2026-11-10, coredump-never-read; review 2026-11-14, r2-crash-elf-hash)
 // ---------------------------------------------------------------------------------------------
 // A panic writes a core dump to the coredump partition. At the next boot the usermod reads its
 // summary (esp_core_dump_get_summary), the first boot event carries it as `"panic":{...}`, and the
 // dump is erased once that event is published. Cable access is over, so this is the only way a
 // crash in the field can be read. The program counters are the crashing image's: after an OTA
-// revert they belong to the image that crashed, not to the one that reports them, so `elf` (the
-// first CONFIG_APP_RETRIEVE_LEN_ELF_SHA hex digits of the crashing image's ELF SHA-256: 9 on
-// IDF 5.5.5, 16 on IDF 4.4.7) names the ELF to decode them with
-// (xtensa-esp32s3-elf-addr2line -e firmware.elf <pc>).
+// revert they belong to the image that crashed, not to the one that reports them, so `elf` names
+// the ELF to decode them with (xtensa-esp32s3-elf-addr2line -e firmware.elf <pc>; the ELF is the
+// one whose `sha256sum` starts with `elf`).
+//
+// Which image crashed (founder, 2026-11-14: the console shows a crash's ELF hash, to decode a crash
+// after an OTA revert). The dump holds the first CONFIG_APP_RETRIEVE_LEN_ELF_SHA hex digits of the
+// crashing image's ELF SHA-256 (9 on IDF 5.5.5), written at the panic by the image that crashed, so
+// they name it after a revert too. Each image's descriptor (esp_app_desc_t) holds its whole ELF
+// SHA-256: esptool writes it at build time (--elf-sha256-offset 0xb0, from Arduino's
+// platformio-build.py; ci/checks/elf-sha.py checks it). The usermod (findCrashedImage) compares the
+// digits with the running image's descriptor, then with the other OTA slot's, where the image
+// that crashed stays after a revert until the next update writes over it:
+//   - the running image crashed: `elf` is its first 16 hex digits and `"reverted":false`. The boot
+//     event's own fw_version and fw_build are the crashed image's.
+//   - the other slot's image crashed (the bootloader went back to the running image after the
+//     crash): `elf` is that image's first 16 hex digits, `"reverted":true`, and `fw_version` (its
+//     WLED version, from its wled_metadata_t) and `fw_build` (its BuildDesc) are the crashed
+//     image's. The boot event's own fw_version and fw_build are the running image's.
+//   - an image in neither slot crashed (written over since): `elf` stays the dump's digits and
+//     `"reverted":true`.
+//   - unknown (fewer than kPanicElfMin digits, or no hash in the running image's descriptor):
+//     `elf` as the dump has it and no `reverted`.
+// 16 hex digits (64 bits) of the 64, not all of them: the event is built in fixed buffers on the
+// stack of the LED loop (the MQTT callbacks run there, pixc_mqtt_client.h), and 16 digits are enough
+// to tell every build we make apart.
 
 constexpr size_t kPanicTaskMax = 15;   // a FreeRTOS task name (configMAX_TASK_NAME_LEN 16, less NUL)
 constexpr size_t kPanicBtMax = 8;      // backtrace PCs sent; the summary holds up to 16
-constexpr size_t kPanicElfMax = 16;    // at most this many hex digits of the ELF SHA-256; 9 on IDF 5.5.5
+constexpr size_t kPanicElfMax = 16;    // hex digits of the ELF SHA-256 sent; the dump has 9 on IDF 5.5.5
+constexpr size_t kPanicElfMin = 8;     // fewest dump digits compared (CONFIG_APP_RETRIEVE_LEN_ELF_SHA's minimum)
+constexpr size_t kPanicVersionMax = 48;   // wled_metadata_t.wled_version (WLED_VERSION_MAX_LEN), maybe with no NUL
+
+// Which image the dump came from, as findCrashedImage finds out. Unknown is the value of a zeroed
+// summary (panicFrom), so a summary nobody looked at sends no `reverted`.
+enum class PanicImage : uint8_t { Unknown = 0, Running, Other };
 
 struct PanicSummary {
   char task[kPanicTaskMax + 1];   // the task that crashed, NUL-terminated
@@ -860,6 +887,9 @@ struct PanicSummary {
   uint32_t bt[kPanicBtMax];       // the backtrace, innermost first
   uint8_t depth;                  // entries of bt used, 0 to kPanicBtMax
   char elf[kPanicElfMax + 1];     // hex digits only, NUL-terminated; may be empty
+  PanicImage image;               // the running image or another one; sent as `reverted`
+  char version[kPanicVersionMax + 1];   // Other only: the crashed image's WLED version; may be empty
+  uint32_t build;                 // Other only: the crashed image's build number; 0 when not found
 };
 
 // Fills `out` from a core dump summary's fields. The dump is read back from flash after a crash,
@@ -885,16 +915,73 @@ inline void panicFrom(PanicSummary& out, const char* task, size_t taskLen, uint3
   out.elf[n] = 0;
 }
 
+// An image descriptor's ELF SHA-256, as 64 hex digits, is a hash: not all zeros, which is what a
+// descriptor holds when esptool was not told to write it.
+inline bool elfKnown(const char* elfHex) {
+  if (elfHex == nullptr) return false;
+  size_t n = 0;
+  bool nonZero = false;
+  for (; n < 64 && isHexDigit(elfHex[n]); n++) nonZero = nonZero || elfHex[n] != '0';
+  return n == 64 && nonZero;
+}
+
+// Whether the dump's digits (a PanicSummary's elf) are the start of `elfHex`, an image descriptor's
+// ELF SHA-256 as 64 hex digits. Fewer than kPanicElfMin digits match nothing, and nor does a
+// descriptor with no hash.
+inline bool elfMatches(const char* digits, const char* elfHex) {
+  if (digits == nullptr || !elfKnown(elfHex)) return false;
+  size_t n = 0;
+  for (; digits[n] != 0; n++) {
+    if (n >= 64 || detail::lower(digits[n]) != detail::lower(elfHex[n])) return false;
+  }
+  return n >= kPanicElfMin;
+}
+
+// Which image wrote the dump, from its digits and the running image's ELF SHA-256 (64 hex digits):
+// the running one, another one, or Unknown when either side cannot be compared.
+inline PanicImage crashedImage(const char* digits, const char* runningElfHex) {
+  if (!elfKnown(runningElfHex) || digits == nullptr || strlen(digits) < kPanicElfMin) return PanicImage::Unknown;
+  return elfMatches(digits, runningElfHex) ? PanicImage::Running : PanicImage::Other;
+}
+
+// Records which image crashed. `elfHex` is the matching descriptor's ELF SHA-256 (64 hex digits): its
+// first kPanicElfMax digits replace the dump's. nullptr when no slot matched: `elf` keeps the dump's
+// digits. `version` (up to `versionLen` bytes) and `build` (0: not found) are the crashed image's,
+// read from its slot, so untrusted: each byte outside printable ASCII, a quote or a backslash becomes
+// '?'. They are sent for Other only.
+inline void panicImage(PanicSummary& p, PanicImage image, const char* elfHex, const char* version,
+                       size_t versionLen, uint32_t build) {
+  p.image = image;
+  if (elfKnown(elfHex)) {
+    for (size_t i = 0; i < kPanicElfMax; i++) p.elf[i] = detail::lower(elfHex[i]);
+    p.elf[kPanicElfMax] = 0;
+  }
+  size_t n = 0;
+  for (; version != nullptr && n < versionLen && n < kPanicVersionMax && version[n] != 0; n++) {
+    const unsigned char c = static_cast<unsigned char>(version[n]);
+    p.version[n] = (c >= 0x20 && c <= 0x7e && c != '"' && c != '\\') ? static_cast<char>(c) : '?';
+  }
+  p.version[n] = 0;
+  p.build = build;
+}
+
 // The longest `"panic":{...}` there can be, NUL included: its fixed text, a task name of quotes or
-// backslashes (each escaped to two characters), the PCs at 10 characters each and the ELF hash.
+// backslashes (each escaped to two characters), the PCs at 10 characters each, the ELF hash, and
+// another image's flag, version and build number (the running image's flag alone is shorter).
 constexpr size_t kPanicJsonMax = 17 + kPanicTaskMax * 2          // "panic":{"task":" + the name
     + 8 + 10                                                     // ","pc":" + 0x%08lx
     + 8 + kPanicBtMax * 12 + (kPanicBtMax - 1)                   // ","bt":[ + "0x%08lx",...
-    + 9 + kPanicElfMax + 2                                       // ],"elf":" + hash + "}
+    + 9 + kPanicElfMax + 1                                       // ],"elf":" + hash + "
+    + 16                                                         // ,"reverted":true
+    + 15 + kPanicVersionMax + 1                                  // ,"fw_version":" + version + "
+    + 12 + 10                                                    // ,"fw_build": + %lu
+    + 1                                                          // }
     + 1;                                                         // NUL
 
 // Formats the crash summary as a JSON member for the boot event: "panic":{"task":"loopTask",
-// "pc":"0x42001234","bt":["0x42001234",...],"elf":"0123456789abcdef"}. `buf` holds kPanicJsonMax
+// "pc":"0x42001234","bt":["0x42001234",...],"elf":"0123456789abcdef","reverted":true,
+// "fw_version":"17.0.1-pixc6","fw_build":29380000}. `reverted` only when the image is known,
+// `fw_version` and `fw_build` only for another image, each when found. `buf` holds kPanicJsonMax
 // bytes. Returns the length written, or 0 when it did not fit (nothing is then sent: a cut member
 // would make the whole event invalid JSON, and the backend would drop it).
 inline size_t formatPanic(char* buf, size_t cap, const PanicSummary& p) {
@@ -920,7 +1007,30 @@ inline size_t formatPanic(char* buf, size_t cap, const PanicSummary& p) {
   for (; e < kPanicElfMax && p.elf[e] != 0 && isHexDigit(p.elf[e]); e++) elf[e] = p.elf[e];
   elf[e] = 0;
   if (len < cap) {
-    n = snprintf(buf + len, cap - len, "],\"elf\":\"%s\"}", elf);
+    n = snprintf(buf + len, cap - len, "],\"elf\":\"%s\"", elf);
+    len = n > 0 ? len + static_cast<size_t>(n) : cap;
+  }
+  if (p.image != PanicImage::Unknown && len < cap) {
+    n = snprintf(buf + len, cap - len, ",\"reverted\":%s", p.image == PanicImage::Other ? "true" : "false");
+    len = n > 0 ? len + static_cast<size_t>(n) : cap;
+  }
+  char version[kPanicVersionMax + 1];   // as panicImage keeps it: no byte that needs escaping
+  size_t v = 0;
+  for (; v < kPanicVersionMax && p.version[v] != 0; v++) {
+    const unsigned char c = static_cast<unsigned char>(p.version[v]);
+    version[v] = (c >= 0x20 && c <= 0x7e && c != '"' && c != '\\') ? static_cast<char>(c) : '?';
+  }
+  version[v] = 0;
+  if (p.image == PanicImage::Other && v > 0 && len < cap) {
+    n = snprintf(buf + len, cap - len, ",\"fw_version\":\"%s\"", version);
+    len = n > 0 ? len + static_cast<size_t>(n) : cap;
+  }
+  if (p.image == PanicImage::Other && p.build != 0 && len < cap) {
+    n = snprintf(buf + len, cap - len, ",\"fw_build\":%lu", static_cast<unsigned long>(p.build));
+    len = n > 0 ? len + static_cast<size_t>(n) : cap;
+  }
+  if (len < cap) {
+    n = snprintf(buf + len, cap - len, "}");
     len = n > 0 ? len + static_cast<size_t>(n) : cap;
   }
   if (len >= cap) { buf[0] = 0; return 0; }

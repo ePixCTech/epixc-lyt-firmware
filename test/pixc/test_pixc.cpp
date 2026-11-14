@@ -903,13 +903,17 @@ static void testPanicReport() {
   CHECK(doc["panic"]["elf"] == "0123456789abcdef");
 
   // The widest there can be: a 16-byte name with no NUL, all quotes and backslashes, the largest
-  // PCs, the full ELF hash. It fills the bound to the byte and still parses.
+  // PCs, the ELF hash, and another image's whole version with no NUL and the largest build number.
+  // It fills the bound to the byte and still parses.
   char wide[16];
   for (int i = 0; i < 16; i++) wide[i] = (i % 2) ? '"' : '\\';
   uint32_t big[16];
   for (int i = 0; i < 16; i++) big[i] = 0xFFFFFFFFu;
   pixc::panicFrom(p, wide, sizeof(wide), 0xFFFFFFFFu, big, 16, "ffffffffffffffff", 16);
   CHECK(std::strlen(p.task) == pixc::kPanicTaskMax);
+  char longVersion[pixc::kPanicVersionMax];
+  std::memset(longVersion, '9', sizeof(longVersion));
+  pixc::panicImage(p, pixc::PanicImage::Other, nullptr, longVersion, sizeof(longVersion), 0xFFFFFFFFu);
   const size_t w = pixc::formatPanic(frag, sizeof(frag), p);
   std::printf("  crash summary: worst case %zu bytes, buffer %zu\n", w, sizeof(frag));
   CHECK(w == pixc::kPanicJsonMax - 1);                    // the bound is exact, not loose
@@ -917,6 +921,8 @@ static void testPanicReport() {
   DynamicJsonDocument d2(2048);
   CHECK(!deserializeJson(d2, event));
   CHECK(std::strlen(d2["panic"]["task"].as<const char*>()) == pixc::kPanicTaskMax);
+  CHECK(std::strlen(d2["panic"]["fw_version"].as<const char*>()) == pixc::kPanicVersionMax);
+  CHECK(d2["panic"]["fw_build"] == 4294967295u);
 
   // Read back from flash after a crash, nothing is trusted: control and non-ASCII bytes in the name
   // become '?', a depth past the array is cut, non-hex in the hash is dropped, and the result is
@@ -944,10 +950,91 @@ static void testPanicReport() {
   CHECK(pixc::formatPanic(nullptr, 10, p) == 0);
 }
 
+// ---------------------------------------------------------------------------------------------
+// Review 2026-11-14 (r2-crash-elf-hash): which image crashed, after an OTA revert too.
+// ---------------------------------------------------------------------------------------------
+static void testPanicImage() {
+  // Two images' ELF SHA-256 as their descriptors hold them (hex32), and a descriptor esptool did
+  // not write.
+  const char* running = "0123456789abcdef00112233445566778899aabbccddeeff0011223344556677";
+  const char* crashed = "fedcba9876543210ffeeddccbbaa99887766554433221100ffeeddccbbaa9988";
+  const char* blank = "0000000000000000000000000000000000000000000000000000000000000000";
+  CHECK(pixc::elfKnown(running) && pixc::elfKnown(crashed));
+  CHECK(!pixc::elfKnown(blank));
+  CHECK(!pixc::elfKnown("0123456789abcdef"));               // not the whole hash
+  CHECK(!pixc::elfKnown(nullptr));
+
+  // The dump has the first 9 digits (IDF 5.5.5), upper or lower case.
+  CHECK(pixc::elfMatches("012345678", running));
+  CHECK(pixc::elfMatches("0123456789ABCDEF", running));
+  CHECK(!pixc::elfMatches("012345678", crashed));
+  CHECK(!pixc::elfMatches("0123456", running));             // too few digits to tell images apart
+  CHECK(!pixc::elfMatches("", running));
+  CHECK(!pixc::elfMatches("000000000", blank));             // a blank descriptor names no image
+  CHECK(!pixc::elfMatches(nullptr, running));
+
+  CHECK(pixc::crashedImage("012345678", running) == pixc::PanicImage::Running);
+  CHECK(pixc::crashedImage("fedcba987", running) == pixc::PanicImage::Other);
+  CHECK(pixc::crashedImage("fedcba987", blank) == pixc::PanicImage::Unknown);
+  CHECK(pixc::crashedImage("fedc", running) == pixc::PanicImage::Unknown);
+  CHECK(pixc::crashedImage(nullptr, running) == pixc::PanicImage::Unknown);
+
+  const char rawTask[16] = "loopTask";
+  const uint32_t bt[2] = {0x42001234, 0x42005678};
+  pixc::PanicSummary p;
+  char frag[pixc::kPanicJsonMax];
+
+  // The running image crashed: 16 digits of its hash, and reverted false. Its version and build are
+  // the boot event's own, so none are given here.
+  pixc::panicFrom(p, rawTask, sizeof(rawTask), 0x42001234, bt, 2, "012345678", 10);
+  CHECK(p.image == pixc::PanicImage::Unknown);
+  pixc::panicImage(p, pixc::PanicImage::Running, running, nullptr, 0, 0);
+  CHECK(std::strcmp(p.elf, "0123456789abcdef") == 0);
+  CHECK(pixc::formatPanic(frag, sizeof(frag), p) > 0);
+  CHECK(std::strstr(frag, "\"elf\":\"0123456789abcdef\",\"reverted\":false}") != nullptr);
+  CHECK(std::strstr(frag, "fw_version") == nullptr && std::strstr(frag, "fw_build") == nullptr);
+
+  // The bootloader went back to the running image after the crash: the other slot's hash, version
+  // and build number are the crashed image's.
+  pixc::panicFrom(p, rawTask, sizeof(rawTask), 0x42001234, bt, 2, "fedcba987", 10);
+  char version[pixc::kPanicVersionMax] = "17.0.2-pixc7";
+  pixc::panicImage(p, pixc::PanicImage::Other, crashed, version, sizeof(version), 29380000);
+  CHECK(pixc::formatPanic(frag, sizeof(frag), p) > 0);
+  std::string event = std::string("{\"type\":\"boot\",\"reason\":\"power_on\",\"fw_version\":\"17.0.1-pixc6\",") + frag + "}";
+  DynamicJsonDocument doc(2048);
+  CHECK(!deserializeJson(doc, event));
+  CHECK(doc["panic"]["elf"] == "fedcba9876543210");
+  CHECK(doc["panic"]["reverted"] == true);
+  CHECK(doc["panic"]["fw_version"] == "17.0.2-pixc7");
+  CHECK(doc["panic"]["fw_build"] == 29380000);
+  CHECK(doc["fw_version"] == "17.0.1-pixc6");                // the running image's, untouched
+
+  // Read from a slot, so untrusted: a version byte that would need escaping becomes '?'.
+  const char junk[6] = {'1', '"', '\\', '\x01', '\xc3', '7'};
+  pixc::panicImage(p, pixc::PanicImage::Other, crashed, junk, sizeof(junk), 0);
+  CHECK(std::strcmp(p.version, "1????7") == 0);
+  CHECK(pixc::formatPanic(frag, sizeof(frag), p) > 0);
+  CHECK(std::strstr(frag, "\"fw_version\":\"1????7\"}") != nullptr);   // no build number found: none sent
+
+  // The crashed image is in neither slot any more: the dump's own digits, and reverted true.
+  pixc::panicFrom(p, rawTask, sizeof(rawTask), 0x42001234, bt, 2, "fedcba987", 10);
+  pixc::panicImage(p, pixc::PanicImage::Other, nullptr, nullptr, 0, 0);
+  CHECK(pixc::formatPanic(frag, sizeof(frag), p) > 0);
+  CHECK(std::strstr(frag, "\"elf\":\"fedcba987\",\"reverted\":true}") != nullptr);
+
+  // Unknown (a descriptor with no hash): the dump's digits and no reverted.
+  pixc::panicFrom(p, rawTask, sizeof(rawTask), 0x42001234, bt, 2, "fedcba987", 10);
+  pixc::panicImage(p, pixc::PanicImage::Unknown, blank, nullptr, 0, 0);
+  CHECK(std::strcmp(p.elf, "fedcba987") == 0);
+  CHECK(pixc::formatPanic(frag, sizeof(frag), p) > 0);
+  CHECK(std::strstr(frag, "\"elf\":\"fedcba987\"}") != nullptr);
+}
+
 int main() {
   testBriMax();
   testProbation();
   testPanicReport();
+  testPanicImage();
   testPinGuardV2Mode();
   testCertDates();
   testLanAuthVectors();

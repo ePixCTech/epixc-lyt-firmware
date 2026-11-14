@@ -6,6 +6,10 @@
 #     <out>/bootloader.bin, partitions.bin, boot_app0.bin, flash.json
 #                                   what a first flash over USB needs, and how to write it
 #                                   (ci/flash-files.py); written to a board as they are, not signed
+#     <out>/private/<env>-<version>-<elfsha16>.elf
+#                                   the build's firmware.elf, to decode a crash's addresses. PRIVATE: the box
+#                                   keeps it apart and never publishes it. <elfsha16> is the first 16 hex digits of
+#                                   its SHA-256, the "elf" of a light's crash report (and of the console's Events)
 # PlatformIO is requirements.txt's. On the box the build image has it (epixc-backend
 # deploy/native/pipeline/image): PIO, and PLATFORMIO_CORE_DIR, its PlatformIO home with this tree's
 # platform and tools, read-only, so that no build can change the compilers of a later build.
@@ -89,11 +93,21 @@ step "verifyRollbackLater is overridden";          bash ci/checks/rollback-later
 step "rollback, TLS and hotspot in the framework"; python3 ci/checks/bootloader-rollback.py "$ENV_NAME"
 step "the usermods are registered";                python3 ci/checks/usermods-registered.py "$ENV_NAME"
 step "an OTA public key is compiled in";           python3 ci/checks/ota-pubkey.py "$ENV_NAME"
+step "the image names its ELF";                    python3 ci/checks/elf-sha.py "$ENV_NAME"
 
 # The app image exactly as built, not a merged factory image: the box signs these bytes (pixc.sig).
 cp ".pio/build/$ENV_NAME/firmware.bin" "$out/pixc.bin"
 step "pixc.bin";                                   bash ci/checks/esp32-image.sh "$out/pixc.bin"
 step "pixc.bin reports package.json's version";    python3 ci/checks/build-version.py "$out/pixc.bin"
+
+# The ELF, for decoding a crash after an OTA revert (elf-sha.py just proved the image names this very file).
+# Under private/, apart from the files above, so that nothing which copies those copies it.
+step "the ELF, private"
+elf_version=$(python3 -c 'import json; print(json.load(open("package.json"))["version"])')
+elf_sha16=$(python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest()[:16])' ".pio/build/$ENV_NAME/firmware.elf")
+mkdir -p "$out/private"
+cp ".pio/build/$ENV_NAME/firmware.elf" "$out/private/$ENV_NAME-$elf_version-$elf_sha16.elf"
+echo "$out/private/$ENV_NAME-$elf_version-$elf_sha16.elf"
 
 step "the first flash: bootloader, partition table, boot_app0, flash.json"
 meta="$(mktemp -d "${TMPDIR:-/tmp}/epixc-pio-meta.XXXXXX")"

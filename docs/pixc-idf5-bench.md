@@ -256,9 +256,18 @@ Use a spare board. Do not use the first board: its cable writes are over.
       not after 5 s. Arduino 3.x starts the watchdog at 5 s, and WLED sets it to 20 s.
 - [ ] 12. Factory reset: five power-ons, and the reset from the cloud.
 - [ ] 13. Cause a panic on the dev build. The core dump fits in 64 KB, and its summary reads back.
-      The `elf` field of the boot event has 9 hex digits of the ELF SHA-256, not 16. IDF 5.5.5
-      keeps 9 (`CONFIG_APP_RETRIEVE_LEN_ELF_SHA`), and IDF 4.4.7 kept 16. The console does not
-      show `elf`; the edge keeps the whole event in `device_events`.
+      The dump has 9 hex digits of the ELF SHA-256 (`CONFIG_APP_RETRIEVE_LEN_ELF_SHA` is 9 on
+      IDF 5.5.5). The light finds the image with those digits and sends 16.
+  - [ ] The `panic` of the next boot event has `"reverted":false` and an `elf` of 16 hex
+        digits. `sha256sum` of the build's `firmware.elf` starts with these digits.
+  - [ ] Cause a panic on an image that is on probation (after an OTA, before it gets to the
+        broker). The bootloader starts the previous image. Its boot event has `"reverted":true`,
+        and `panic` has the `elf`, `fw_version` and `fw_build` of the image that crashed. The
+        `fw_version` and `fw_build` of the event are those of the image that runs.
+  - [ ] In both cases, write down the time in the `crash dump:` line on the serial port
+        ("found in N ms"). After a revert, the light reads the other slot to find the build
+        number of the image that crashed.
+  - The console does not show `elf`; the edge keeps the whole event in `device_events`.
 - [ ] 14. Wi-Fi starts on the DC jack with no brownout.
 
 Measure and record in the vault:

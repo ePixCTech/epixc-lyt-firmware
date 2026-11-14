@@ -53,7 +53,11 @@ ePixC's code is in `usermods/pixc_connect_blink/`, in the `wled00/pixc_*` files 
   not its own, and the admin console deploys it (Deploy, Firmware). The build also keeps what a
   first flash over USB needs: `bootloader.bin`, `partitions.bin`, `boot_app0.bin` and
   `flash.json` (chip, flash settings and each file's offset, read from the build), written to a
-  board as they are.
+  board as they are. It also writes the build's `firmware.elf` to
+  `<folder>/private/<env>-<version>-<elfsha16>.elf`, where `<elfsha16>` is the first 16 hex digits
+  of the ELF's SHA-256: the `elf` that a light's crash report and the console's Events show. The
+  box keeps this file privately and never publishes it; a crash's addresses cannot be decoded
+  without it.
   GitHub Actions builds nothing here since 2026-10-26: ePixC's workflow and upstream's are gone.
   Both scripts run on a laptop too: `bash ci/test.sh`, `bash ci/build.sh <folder>`.
 
