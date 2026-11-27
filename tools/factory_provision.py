@@ -8,6 +8,10 @@ firmware names its hotspot `ePixC-XXXX` (last four MAC hex digits, upper case) a
 this password; a release build with no factory password opens no hotspot at all. A factory reset
 keeps `pixc_fac`, so the printed label stays valid for the life of the unit.
 
+It also writes the board's identity beside it (vault: 08-Codebase/Board runcheck, 1), which the
+firmware reports and its runcheck checks: `huid`, "EPX-" and the factory MAC in upper case, and with
+--hw-rev, `hw_rev`, the board revision ("H01-E1"). The production line's Writer writes the same keys.
+
 This tool:
   1. reads the unit's MAC over USB (esptool read_mac), or takes --mac;
   2. draws the password with the OS CSPRNG (secrets);
@@ -25,7 +29,7 @@ firmware first boots, or after an erase - never on a unit in a customer's hands.
 Requirements: pip install esp-idf-nvs-partition-gen esptool
 
 Examples:
-  tools/factory_provision.py --port /dev/cu.usbserial-0001 --log factory_units.csv
+  tools/factory_provision.py --port /dev/cu.usbserial-0001 --hw-rev H01-E1 --log factory_units.csv
   tools/factory_provision.py --mac aabbccddeeff --no-flash --out /tmp/nvs.bin   # dry run
 """
 import argparse
@@ -57,7 +61,7 @@ def hotspot_name(mac):
     return "ePixC-" + mac[-4:].upper()
 
 
-def build_nvs(psk, out_path):
+def build_nvs(psk, huid, hw_rev, out_path):
     with tempfile.TemporaryDirectory() as d:
         csv_path = os.path.join(d, "nvs.csv")
         with open(csv_path, "w", newline="") as f:
@@ -65,6 +69,9 @@ def build_nvs(psk, out_path):
             w.writerow(["key", "type", "encoding", "value"])
             w.writerow(["pixc_fac", "namespace", "", ""])
             w.writerow(["ap_psk", "data", "string", psk])
+            w.writerow(["huid", "data", "string", huid])
+            if hw_rev:
+                w.writerow(["hw_rev", "data", "string", hw_rev])
         try:
             subprocess.run([sys.executable, "-m", "esp_idf_nvs_partition_gen", "generate",
                             csv_path, out_path, NVS_SIZE], check=True, capture_output=True, text=True)
@@ -79,6 +86,7 @@ def main():
     ap.add_argument("--port", help="serial port of the unit (to read its MAC and flash)")
     ap.add_argument("--mac", help="12 hex digits, instead of reading it from --port")
     ap.add_argument("--psk", help="use this password instead of drawing one (re-labelling only)")
+    ap.add_argument("--hw-rev", help="the board revision, H + two digits + - + letter + digit (H01-E1)")
     ap.add_argument("--out", help="where to write the NVS image (default: a temp file)")
     ap.add_argument("--no-flash", action="store_true", help="build and print only")
     ap.add_argument("--log", help="CSV file to append mac,ssid,psk,time to")
@@ -97,9 +105,14 @@ def main():
     if not (8 <= len(psk) <= 63) or not all(0x20 <= ord(c) <= 0x7e for c in psk):
         sys.exit("password must be 8-63 printable ASCII characters (WPA2)")
     ssid = hotspot_name(mac)
+    huid = "EPX-" + mac.upper()
+    if args.hw_rev and not re.fullmatch(r"H[0-9]{2}-[A-Z][0-9]", args.hw_rev):
+        sys.exit("--hw-rev must look like H01-E1")
+    if not args.hw_rev:
+        print("warning: no --hw-rev: the board's runcheck fails its factory check without one")
 
     out_path = args.out or os.path.join(tempfile.gettempdir(), "epixc_nvs_%s.bin" % mac)
-    build_nvs(psk, out_path)
+    build_nvs(psk, huid, args.hw_rev, out_path)
 
     if not args.no_flash:
         if not args.port:
@@ -122,6 +135,8 @@ def main():
     print("Password  : %s" % psk)
     print("QR        : WIFI:T:WPA;S:%s;P:%s;;" % (ssid, psk))
     print("MAC       : %s" % mac)
+    print("HUID      : %s" % huid)
+    print("Revision  : %s" % (args.hw_rev or "(none)"))
 
 
 if __name__ == "__main__":
