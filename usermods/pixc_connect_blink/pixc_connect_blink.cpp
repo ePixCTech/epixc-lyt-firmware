@@ -17,6 +17,13 @@
 #include <esp_ota_ops.h>
 // esp_core_dump_image_check() / _get_summary() / _image_erase(): the crash report in the boot event.
 #include <esp_core_dump.h>
+// The board runcheck (`pixc info`): the running image's length (esp_image_verify), the chip's
+// revision, the flash's and the PSRAM's size, and an uptime that does not wrap.
+#include <esp_image_format.h>
+#include <esp_chip_info.h>
+#include <esp_flash.h>
+#include <esp_psram.h>
+#include <esp_timer.h>
 // CONFIG_APP_ROLLBACK_ENABLE. Reached implicitly through Arduino's headers, but named here for
 // the same reason esp_system.h is: this file reads it directly, and the value comes from the
 // prebuilt framework's sdkconfig rather than from anything in this repository.
@@ -137,7 +144,8 @@ extern "C" __attribute__((used)) const pixc::BuildDesc pixc_build_desc = {
 // NETWORK WORKER (audit R1)
 // =============================================================================================
 // Every blocking network operation the usermod makes - the provisioning HTTPS call and the OTA
-// download, verify and flash - runs on this one FreeRTOS task, never on the LED loop.
+// download, verify and flash - runs on this one FreeRTOS task, never on the LED loop. So does the
+// flash copy of the board's OTA check (`pixc otacheck`).
 //
 // Before this, provisioning ran from loop() every 10 s until it succeeded, blocking up to 8 s for a
 // TLS handshake plus DNS: with the API unreachable, effects and transitions froze for most of every
@@ -147,14 +155,14 @@ extern "C" __attribute__((used)) const pixc::BuildDesc pixc_build_desc = {
 // The worker touches NO WLED state. The loop posts a self-contained job (every string copied into
 // fixed buffers, so a second MQTT command cannot free what the worker is reading - the use-after-
 // free audit R2 found in the old _otaUrl/_otaSha Strings) and drains results on its own schedule,
-// applying them to WLED globals itself. Update.* is used only here; nothing else writes the
-// inactive OTA partition.
+// applying them to WLED globals itself. Update.* is used only here, and nothing but this task
+// writes the inactive OTA partition: the OTA download, and the board's OTA check (doOtaCheck).
 namespace pixc_net {
 
 constexpr size_t kUrlMax = 256;
 
 struct Job {
-  enum Kind : uint8_t { Provision, Confirm, Ota } kind;
+  enum Kind : uint8_t { Provision, Confirm, Ota, OtaCheck } kind;
   bool tls;                         // Provision/Confirm: HTTPS (always, in a release build)
   char url[kUrlMax];                // Provision/Confirm: the endpoint; Ota: the image URL
   char body[256];                   // Provision/Confirm: the JSON body
@@ -162,10 +170,12 @@ struct Job {
   char jobId[48];                   // Ota
   char sha256[65];                  // Ota
   char version[33];                 // Ota (for the log only)
+  uint8_t sig[80];                  // OtaCheck: the build's signature (DER), from the serial command
+  uint8_t sigLen;                   // OtaCheck
 };
 
 struct Result {
-  enum Kind : uint8_t { ProvisionOk, ProvisionFailed, ConfirmOk, ConfirmFailed, OtaProgress } kind;
+  enum Kind : uint8_t { ProvisionOk, ProvisionFailed, ConfirmOk, ConfirmFailed, OtaProgress, OtaCheckDone } kind;
   char host[MQTT_MAX_SERVER_LEN + 1];   // ProvisionOk
   uint16_t port;                         // ProvisionOk
   char user[41];                         // ProvisionOk: mqtt_username (the MAC)
@@ -174,7 +184,11 @@ struct Result {
   char jobId[48];                        // OtaProgress
   char status[16];                       // OtaProgress: downloading/installing/done/failed
   int8_t percent;                        // OtaProgress
-  char err[48];                          // OtaProgress / ProvisionFailed
+  char err[48];                          // OtaProgress / ProvisionFailed / OtaCheckDone
+  pixc::OtaStep signature, copy;         // OtaCheckDone
+  char orig[pixc::kOtaLabelMax + 1];     // OtaCheckDone: the running slot's label
+  char spare[pixc::kOtaLabelMax + 1];    // OtaCheckDone: the other slot's
+  uint32_t msSignature, msCopy;          // OtaCheckDone
 };
 
 // The anti-rollback floor: the highest security version this unit has run (NVS pixc_ota/sec).
@@ -293,6 +307,25 @@ void hex32(const uint8_t* d, char* out /* >=65 */) {
   out[64] = 0;
 }
 
+// The signature check itself: a detached ECDSA P-256 signature (DER) over an image's SHA-256
+// digest, against the public key compiled into this image. The OTA download (verifySignature,
+// below) and the board's OTA check (doOtaCheck, `pixc otacheck` on the serial line) both decide
+// here, so the check the Writer runs at the factory is the one every update meets in the field.
+// Returns a failure reason, or nullptr.
+const char* verifySignatureBytes(const uint8_t* sig, size_t sigLen, const uint8_t* digest) {
+  if (sizeof(PIXC_OTA_PUBKEY_PEM) <= 1) return pixc::ota_fail::kNoSigningKey;
+  mbedtls_pk_context pk;
+  mbedtls_pk_init(&pk);
+  // The length includes the terminating NUL: mbedtls treats a PEM as a NUL-counted buffer.
+  int rc = mbedtls_pk_parse_public_key(&pk, (const unsigned char*)PIXC_OTA_PUBKEY_PEM,
+                                       sizeof(PIXC_OTA_PUBKEY_PEM));
+  if (rc != 0) { mbedtls_pk_free(&pk); return pixc::ota_fail::kBadSigningKey; }
+
+  rc = mbedtls_pk_verify(&pk, MBEDTLS_MD_SHA256, digest, 32, sig, sigLen);
+  mbedtls_pk_free(&pk);
+  return rc == 0 ? nullptr : pixc::ota_fail::kSigMismatch;
+}
+
 // Verify a detached ECDSA P-256 signature over the image's SHA-256 digest.
 //
 // This is the check that makes an OTA safe to apply: the SHA-256 alone only proves the image
@@ -310,17 +343,7 @@ const char* verifySignature(const char* sigUrl, const uint8_t* digest) {
   uint8_t sig[80];
   const int got = pixcHttpsGetBinary(sigUrl, sig, sizeof(sig), 10000);
   if (got <= 0) return pixc::ota_fail::kSigDownload;   // a network failure, not a bad signature
-
-  mbedtls_pk_context pk;
-  mbedtls_pk_init(&pk);
-  // The length includes the terminating NUL: mbedtls treats a PEM as a NUL-counted buffer.
-  int rc = mbedtls_pk_parse_public_key(&pk, (const unsigned char*)PIXC_OTA_PUBKEY_PEM,
-                                       sizeof(PIXC_OTA_PUBKEY_PEM));
-  if (rc != 0) { mbedtls_pk_free(&pk); return pixc::ota_fail::kBadSigningKey; }
-
-  rc = mbedtls_pk_verify(&pk, MBEDTLS_MD_SHA256, digest, 32, sig, (size_t)got);
-  mbedtls_pk_free(&pk);
-  return rc == 0 ? nullptr : pixc::ota_fail::kSigMismatch;
+  return verifySignatureBytes(sig, (size_t)got, digest);
 }
 
   // Download the firmware image over TLS and flash it to the inactive OTA partition, verifying
@@ -485,14 +508,99 @@ void doOta(const Job& j) {
   otaProgress(j, "done", 100);      // the loop publishes it, then reboots
 }
 
+// The SHA-256 of the first `len` bytes of an app partition: an image as built, byte for byte the
+// pixc.bin the box signed. Returns a failure reason, or nullptr.
+const char* partitionDigest(const esp_partition_t* part, uint32_t len, uint8_t* digest, uint8_t* buf, size_t bufLen) {
+  mbedtls_sha256_context sha;
+  mbedtls_sha256_init(&sha);
+  const char* why = nullptr;
+  if (mbedtls_sha256_starts(&sha, 0) != 0) why = pixc::ota_fail::kDigestFailed;
+  for (uint32_t off = 0; why == nullptr && off < len; off += bufLen) {
+    const size_t n = std::min(bufLen, (size_t)(len - off));
+    if (esp_partition_read(part, off, buf, n) != ESP_OK) why = "flash read";
+    else if (mbedtls_sha256_update(&sha, buf, n) != 0) why = pixc::ota_fail::kDigestFailed;
+  }
+  if (mbedtls_sha256_finish(&sha, digest) != 0 && why == nullptr) why = pixc::ota_fail::kDigestFailed;
+  mbedtls_sha256_free(&sha);
+  return why;
+}
+
+// The board's OTA check up to its first restart (vault: 08-Codebase/Board runcheck, 4; the state
+// machine is pixc::otaCheckOnBoot): the running image against the build's signature the Writer
+// passed, then a copy of it in the spare OTA slot, verified the same way (SHA-256 equal to the
+// running image's, and the signature). Here because the copy writes the whole image to flash, 20-30 s.
+// Nothing is set to boot: the loop does that (applyOtaCheck).
+void doOtaCheck(const Job& j) {
+  Result r = {};
+  r.kind = Result::OtaCheckDone;
+  r.signature = r.copy = pixc::OtaStep::NotRun;
+  const esp_partition_t* running = esp_ota_get_running_partition();
+  const esp_partition_t* spare = esp_ota_get_next_update_partition(nullptr);
+  esp_image_metadata_t meta = {};
+  if (running == nullptr || spare == nullptr || spare == running) { strlcpy(r.err, "no spare OTA slot", sizeof(r.err)); post(r); return; }
+  strlcpy(r.orig, running->label, sizeof(r.orig));
+  strlcpy(r.spare, spare->label, sizeof(r.spare));
+  // As doOta: the other slot is the only fallback of an image still on probation.
+  esp_ota_img_states_t st;
+  if (esp_ota_get_state_partition(running, &st) == ESP_OK && st == ESP_OTA_IMG_PENDING_VERIFY) {
+    strlcpy(r.err, "running image not confirmed", sizeof(r.err)); post(r); return;
+  }
+  // The image's length as the bootloader reads it (header, segments, checksum, appended SHA-256):
+  // the size of the pixc.bin it was written from.
+  const esp_partition_pos_t pos = {running->address, running->size};
+  if (esp_image_verify(ESP_IMAGE_VERIFY_SILENT, &pos, &meta) != ESP_OK || meta.image_len == 0 ||
+      meta.image_len > spare->size) {
+    strlcpy(r.err, "running image unreadable", sizeof(r.err)); post(r); return;
+  }
+  static constexpr size_t kChunk = 4096;
+  uint8_t* buf = (uint8_t*)malloc(kChunk);
+  if (buf == nullptr) { strlcpy(r.err, pixc::ota_fail::kLowMemory, sizeof(r.err)); post(r); return; }
+
+  uint8_t digest[32] = {};
+  unsigned long t0 = millis();
+  const char* why = partitionDigest(running, meta.image_len, digest, buf, kChunk);
+  if (why == nullptr) why = verifySignatureBytes(j.sig, j.sigLen, digest);
+  r.msSignature = millis() - t0;
+  r.signature = why ? pixc::OtaStep::Fail : pixc::OtaStep::Ok;
+
+  if (why == nullptr) {
+    t0 = millis();
+    // Sector by sector as it writes (OTA_WITH_SEQUENTIAL_WRITES), so the flash is never held for one
+    // long erase. esp_ota_end() validates the copy as the bootloader would.
+    esp_ota_handle_t h = 0;
+    if (esp_ota_begin(spare, OTA_WITH_SEQUENTIAL_WRITES, &h) != ESP_OK) why = "spare slot: begin";
+    for (uint32_t off = 0; why == nullptr && off < meta.image_len; off += kChunk) {
+      const size_t n = std::min(kChunk, (size_t)(meta.image_len - off));
+      if (esp_partition_read(running, off, buf, n) != ESP_OK) why = "flash read";
+      else if (esp_ota_write(h, buf, n) != ESP_OK) why = pixc::ota_fail::kFlashWrite;
+      vTaskDelay(1);                                // let IDLE run; the LED loop is on the other core
+    }
+    if (why == nullptr) {
+      if (esp_ota_end(h) != ESP_OK) why = "spare slot: copy invalid";
+    } else if (h != 0) {
+      esp_ota_abort(h);
+    }
+    uint8_t copied[32] = {};
+    if (why == nullptr) why = partitionDigest(spare, meta.image_len, copied, buf, kChunk);
+    if (why == nullptr && memcmp(copied, digest, sizeof(digest)) != 0) why = pixc::ota_fail::kShaMismatch;
+    if (why == nullptr) why = verifySignatureBytes(j.sig, j.sigLen, copied);
+    r.msCopy = millis() - t0;
+    r.copy = why ? pixc::OtaStep::Fail : pixc::OtaStep::Ok;
+  }
+  free(buf);
+  if (why != nullptr) strlcpy(r.err, why, sizeof(r.err));
+  post(r);
+}
+
 void task(void*) {
   for (;;) {
     Job* j = nullptr;
     if (xQueueReceive(jobs, &j, portMAX_DELAY) != pdTRUE || j == nullptr) continue;
     busy = true;
-    if (j->kind == Job::Provision)    doProvision(*j);
-    else if (j->kind == Job::Confirm) doConfirm(*j);
-    else                              doOta(*j);
+    if (j->kind == Job::Provision)     doProvision(*j);
+    else if (j->kind == Job::Confirm)  doConfirm(*j);
+    else if (j->kind == Job::OtaCheck) doOtaCheck(*j);
+    else                               doOta(*j);
     memset(j->body, 0, sizeof(j->body));      // it held the device key
     busy = false;
     free(j);
@@ -717,17 +825,33 @@ class PixcConnectBlink : public Usermod {
     }
 
     void publishAnnounce() {
-      char buf[224];
+      char buf[320];
       // led_channels, NOT a chip name. hasWhiteChannel() only reveals the channel
       // count; it cannot tell a 5 V WS2812B from a 12 V WS2815. Publishing a guessed
       // chip name meant the device overwrote the strip model the app had set
       // accurately, destroying the one value the server needs to know the voltage.
       // The app owns led_chip; the device owns led_channels, which is what it knows.
       const char* ledChannels = strip.hasWhiteChannel() ? "RGBW" : "RGB";
+      // The board's identity from its factory data (vault: 08-Codebase/Board runcheck), null on a
+      // unit written before it or with a value the Writer would not write.
+      char huid[pixc::kHuidLen + 3], hwRev[pixc::kHwRevLen + 3];
+      identityJson(huid, sizeof(huid), hwRev, sizeof(hwRev));
       snprintf(buf, sizeof(buf),
-        "{\"fw_version\":\"%s\",\"fw_build\":%u,\"fw_git\":\"%s\",\"led_channels\":\"%s\",\"led_count\":%u}",
-        fwVersion(), (unsigned)PIXC_FW_BUILD, PIXC_FW_GIT, ledChannels, strip.getLengthTotal());
+        "{\"fw_version\":\"%s\",\"fw_build\":%u,\"fw_git\":\"%s\",\"led_channels\":\"%s\",\"led_count\":%u,"
+        "\"huid\":%s,\"hw_rev\":%s}",
+        fwVersion(), (unsigned)PIXC_FW_BUILD, PIXC_FW_GIT, ledChannels, strip.getLengthTotal(), huid, hwRev);
       publishKind("announce", buf);
+    }
+
+    // The factory huid and hw_rev as JSON values for the cloud: a quoted string when well formed
+    // (only [A-Z0-9-], nothing to escape), else null.
+    static void identityJson(char* huid, size_t huidCap, char* hwRev, size_t hwRevCap) {
+      const char* h = pixcFactoryHuid();
+      const char* r = pixcFactoryHwRev();
+      if (pixc::validHuid(h)) snprintf(huid, huidCap, "\"%s\"", h);
+      else strlcpy(huid, "null", huidCap);
+      if (pixc::validHwRev(r)) snprintf(hwRev, hwRevCap, "\"%s\"", r);
+      else strlcpy(hwRev, "null", hwRevCap);
     }
 
     // Estimated current draw, streamed only while someone has the light open (…/live). AMPS ONLY —
@@ -1493,6 +1617,7 @@ class PixcConnectBlink : public Usermod {
           case pixc_net::Result::ProvisionFailed: _prov = Prov::Idle; _provWanted = true; provisionFailed(now, r.err); break;
           case pixc_net::Result::ConfirmOk:       applyConfirm(); break;
           case pixc_net::Result::ConfirmFailed:   confirmFailed(now, r); break;
+          case pixc_net::Result::OtaCheckDone:    applyOtaCheck(r); break;
           case pixc_net::Result::OtaProgress:
             publishOtaProgress(r.jobId, r.status, r.percent, r.err);
             if (strcmp(r.status, "done") == 0) {
@@ -1513,10 +1638,356 @@ class PixcConnectBlink : public Usermod {
       }
     }
 
+    // AI: below section was generated by an AI
+    // =========================================================================================
+    // THE BOARD RUNCHECK (vault: 08-Codebase/Board runcheck)
+    // =========================================================================================
+    // The Writer's checks of a board it has just written, over UART0 at 115200: `pixc info`,
+    // `pixc runcheck`, `pixc otacheck <signature>` and `pixc otacheck status`, `pixc download`. One
+    // command a line; every answer is one line, "pixc " and a JSON object. Taken only in the first
+    // ten minutes after a boot or while no Wi-Fi is configured (pixc::serialCommandsOpen), so a unit
+    // in a home stops listening. The logic they rest on is host-tested in pixc_logic.h.
+    enum class Runcheck : uint8_t { Idle, Wifi, Led };
+    Runcheck _runcheck = Runcheck::Idle;
+    unsigned long _rcStepAt = 0;       // millis() the current check began
+    unsigned long _rcScanAt = 0;       // millis() of the last scan start, 0 before the first
+    uint8_t _rcScans = 0;
+    bool _rcOk = true;
+    char _rcFailed[40] = "";           // the failed checks' names as a JSON list's insides
+    bool _otaCheckRunning = false;     // the network worker has the check's part before the restart
+    pixc::OtaCheckState _otaCheck;     // as stored in NVS (pixc_otack): the last check, or the one under way
+    bool _firstPass = true;
+    // A scan started before WLED first starts the radio (about 2 s after boot, initConnection) is
+    // cut short by it, so the first one waits for that; an empty or failed scan is tried again.
+    static constexpr unsigned long kScanNotBeforeMs = 4000;
+    static constexpr unsigned long kScanRetryMs = 1000;
+    static constexpr unsigned long kScanTimeoutMs = 20000;
+    static constexpr uint8_t kScanTries = 3;
+
+    // One answer line. Built whole, so it goes out in one write.
+    static void answer(const char* json) {
+      if (serialCanTX) Serial.printf("pixc %s\r\n", json);
+    }
+
+    // `v` as stored, as a JSON string, or null when there is none. The factory strings are at most 32
+    // printable characters (pixc_device.cpp), so kIdJson bytes always hold one escaped.
+    static constexpr size_t kIdJson = 2 * 32 + 3;
+    static void jsonStringOrNull(const char* v, char* out, size_t cap) {
+      if (cap < 5) { if (cap) out[0] = 0; return; }
+      if (v == nullptr || v[0] == 0) { strlcpy(out, "null", cap); return; }
+      out[0] = '"';
+      const size_t n = pixc::jsonEscape(v, out + 1, cap - 2);
+      out[1 + n] = '"';
+      out[2 + n] = 0;
+    }
+
+    static const char* runningSlot() {
+      const esp_partition_t* p = esp_ota_get_running_partition();
+      return p != nullptr ? p->label : "";
+    }
+
+    static uint32_t uptimeMs() {
+      const uint64_t ms = (uint64_t)esp_timer_get_time() / 1000;   // never wraps, unlike millis()
+      return ms > 0xFFFFFFFFull ? 0xFFFFFFFFu : (uint32_t)ms;
+    }
+
+    // Once a boot, at the loop's first pass: the line the Writer waits for after a restart.
+    void banner() {
+      char huid[kIdJson], buf[320];
+      jsonStringOrNull(pixcFactoryHuid(), huid, sizeof(huid));
+      snprintf(buf, sizeof(buf), "{\"ready\":true,\"fw_version\":\"%s\",\"huid\":%s,\"ota_slot\":\"%s\",\"reset_reason\":\"%s\"}",
+               fwVersion(), huid, runningSlot(), resetReasonName());
+      answer(buf);
+    }
+
+    void serialInfo() {
+      char huid[kIdJson], hwRev[kIdJson], mac[13], buf[640];
+      jsonStringOrNull(pixcFactoryHuid(), huid, sizeof(huid));
+      jsonStringOrNull(pixcFactoryHwRev(), hwRev, sizeof(hwRev));
+      pixc::macHex(pixcBaseMac(), mac, sizeof(mac));
+      esp_chip_info_t chip;
+      esp_chip_info(&chip);
+      uint32_t flash = 0;
+      if (esp_flash_get_physical_size(esp_flash_default_chip, &flash) != ESP_OK) flash = 0;
+      const size_t psram = esp_psram_is_initialized() ? esp_psram_get_size() : 0;
+      // chip_rev as esptool prints it ("v0.2"): the IDF's revision is major * 100 + minor.
+      snprintf(buf, sizeof(buf),
+               "{\"huid\":%s,\"hw_rev\":%s,\"mac\":\"%s\",\"fw_version\":\"%s\",\"fw_build\":%u,\"chip_rev\":\"v%u.%u\","
+               "\"flash_mb\":%u,\"psram_mb\":%u,\"ota_slot\":\"%s\",\"reset_reason\":\"%s\"}",
+               huid, hwRev, mac, fwVersion(), (unsigned)PIXC_FW_BUILD, (unsigned)(chip.revision / 100),
+               (unsigned)(chip.revision % 100), (unsigned)(flash >> 20), (unsigned)(psram >> 20), runningSlot(),
+               resetReasonName());
+      answer(buf);
+    }
+
+    void checkDone(const char* name, bool ok) {
+      if (ok) return;
+      _rcOk = false;
+      const size_t n = strlen(_rcFailed);
+      snprintf(_rcFailed + n, sizeof(_rcFailed) - n, "%s\"%s\"", n ? "," : "", name);
+    }
+
+    // `pixc runcheck`: factory now, then the Wi-Fi scan and the LED test from the loop (runcheckStep).
+    void runcheckStart() {
+      if (_runcheck != Runcheck::Idle) { answer("{\"error\":\"busy\"}"); return; }
+      _rcOk = true;
+      _rcFailed[0] = 0;
+      const unsigned long t0 = millis();
+      const char* huid = pixcFactoryHuid();
+      const char* hwRev = pixcFactoryHwRev();
+      const char* why = nullptr;
+      if (huid[0] == 0) why = "no huid";
+      else if (!pixc::validHuid(huid)) why = "huid malformed";
+      else if (!pixc::huidMatchesMac(huid, pixcBaseMac())) why = "huid is another chip's";
+      else if (hwRev[0] == 0) why = "no hw_rev";
+      else if (!pixc::validHwRev(hwRev)) why = "hw_rev malformed";
+      char h[kIdJson], r[kIdJson], mac[13], buf[320];
+      jsonStringOrNull(huid, h, sizeof(h));
+      jsonStringOrNull(hwRev, r, sizeof(r));
+      pixc::macHex(pixcBaseMac(), mac, sizeof(mac));
+      snprintf(buf, sizeof(buf), "{\"check\":\"factory\",\"ok\":%s,\"ms\":%lu,\"huid\":%s,\"hw_rev\":%s,\"mac\":\"%s\"%s%s%s}",
+               why ? "false" : "true", millis() - t0, h, r, mac, why ? ",\"error\":\"" : "", why ? why : "", why ? "\"" : "");
+      answer(buf);
+      checkDone("factory", why == nullptr);
+      _runcheck = Runcheck::Wifi;
+      _rcStepAt = millis();
+      _rcScanAt = 0;
+      _rcScans = 0;
+    }
+
+    void runcheckStep(unsigned long now) {
+      if (_runcheck == Runcheck::Wifi) {
+        if (_rcScanAt == 0) {
+          if (millis() < kScanNotBeforeMs) return;
+          WiFi.scanNetworks(true, true);   // async, hidden networks too; the light connects to nothing
+          _rcScanAt = now ? now : 1;
+          _rcScans = 1;
+          return;
+        }
+        const int16_t st = WiFi.scanComplete();
+        const bool timedOut = now - _rcStepAt >= kScanTimeoutMs;
+        if (st == WIFI_SCAN_RUNNING && !timedOut) return;
+        if (st <= 0 && !timedOut && _rcScans < kScanTries) {   // failed, or found nothing: again
+          if (now - _rcScanAt < kScanRetryMs) return;
+          WiFi.scanNetworks(true, true);
+          _rcScanAt = now ? now : 1;
+          _rcScans++;
+          return;
+        }
+        const int networks = st > 0 ? st : 0;
+        int best = 0;
+        for (int i = 0; i < networks; i++) {
+          const int rssi = WiFi.RSSI(i);
+          if (i == 0 || rssi > best) best = rssi;
+        }
+        const bool ok = pixc::wifiScanPasses(networks, best);
+        const char* why = ok ? nullptr : st == WIFI_SCAN_RUNNING ? "scan timed out" : st < 0 ? "scan failed"
+                          : networks == 0 ? "no network found" : "rssi out of range";
+        char rssi[12], buf[200];
+        if (networks > 0) snprintf(rssi, sizeof(rssi), "%d", best);
+        else strlcpy(rssi, "null", sizeof(rssi));
+        snprintf(buf, sizeof(buf), "{\"check\":\"wifi\",\"ok\":%s,\"ms\":%lu,\"networks\":%d,\"best_rssi\":%s%s%s%s}",
+                 ok ? "true" : "false", now - _rcStepAt, networks, rssi, why ? ",\"error\":\"" : "", why ? why : "",
+                 why ? "\"" : "");
+        answer(buf);
+        checkDone("wifi", ok);
+        _runcheck = Runcheck::Led;   // next pass: the LED test holds the loop for about 2 s
+        return;
+      }
+      if (_runcheck == Runcheck::Led) {
+        const unsigned long t0 = millis();
+        const PixcLedResult led = pixcLedTest();
+        char buf[384];
+        snprintf(buf, sizeof(buf), "{\"check\":\"led\",\"ok\":%s,\"ms\":%lu,\"fps_dt1\":%.1f,\"fps_dt2\":%.1f,\"frame_us\":%u%s%s%s}",
+                 led.ok ? "true" : "false", millis() - t0, (double)led.fpsDt1, (double)led.fpsDt2, (unsigned)led.frameUs,
+                 led.error ? ",\"error\":\"" : "", led.error ? led.error : "", led.error ? "\"" : "");
+        answer(buf);
+        checkDone("led", led.ok);
+        char h[kIdJson], r[kIdJson];
+        jsonStringOrNull(pixcFactoryHuid(), h, sizeof(h));
+        jsonStringOrNull(pixcFactoryHwRev(), r, sizeof(r));
+        snprintf(buf, sizeof(buf), "{\"runcheck\":\"done\",\"ok\":%s,\"failed\":[%s],\"huid\":%s,\"hw_rev\":%s,\"fw_version\":\"%s\"}",
+                 _rcOk ? "true" : "false", _rcFailed, h, r, fwVersion());
+        answer(buf);
+        _runcheck = Runcheck::Idle;
+      }
+    }
+
+    void loadOtaCheck() {
+      Preferences p;
+      if (!p.begin("pixc_otack", true)) return;
+      pixc::OtaCheckState s;
+      if (p.getBytesLength("s") == sizeof(s) && p.getBytes("s", &s, sizeof(s)) == sizeof(s) && pixc::otaCheckStateValid(s)) {
+        _otaCheck = s;
+      }
+      p.end();
+    }
+
+    void storeOtaCheck() {
+      Preferences p;
+      if (!p.begin("pixc_otack", false)) return;
+      p.putBytes("s", &_otaCheck, sizeof(_otaCheck));
+      p.end();
+    }
+
+    static void otaStepLine(const char* step, bool ok, unsigned long ms) {
+      char buf[96];
+      snprintf(buf, sizeof(buf), "{\"otacheck\":\"step\",\"step\":\"%s\",\"ok\":%s,\"ms\":%lu}", step, ok ? "true" : "false", ms);
+      answer(buf);
+    }
+
+    static void otaRestartLine(const char* slot) {
+      char buf[64];
+      snprintf(buf, sizeof(buf), "{\"otacheck\":\"restart\",\"slot\":\"%s\"}", slot);
+      answer(buf);
+      Serial.flush();
+    }
+
+    // The check is over: stored (`pixc otacheck status` repeats it) and printed.
+    void finishOtaCheck(pixc::OtaCheckState& s) {
+      s.phase = pixc::OtaPhase::Done;
+      _otaCheck = s;
+      storeOtaCheck();
+      otacheckStatus();
+    }
+
+    void otacheckStatus() {
+      char buf[400];
+      if (_otaCheckRunning) answer("{\"otacheck\":\"running\"}");
+      else if (_otaCheck.phase == pixc::OtaPhase::Done && pixc::formatOtaCheckDone(buf, sizeof(buf), _otaCheck) > 0) answer(buf);
+      else answer("{\"otacheck\":\"none\"}");
+    }
+
+    // `pixc otacheck <signature>`: the signature and the copy on the network worker (doOtaCheck).
+    void otacheckStart(const char* arg, size_t argLen) {
+      if (_otaCheckRunning) { answer("{\"error\":\"busy\"}"); return; }
+      pixc::OtaCheckState s;
+      pixc_net::Job job = {};
+      job.kind = pixc_net::Job::OtaCheck;
+      const int n = pixc::base64Decode(arg, argLen, job.sig, sizeof(job.sig));
+      if (argLen == 0 || n <= 0) {
+        s.signature = pixc::OtaStep::Fail;
+        s.fail(argLen == 0 ? "no signature" : "signature is not base64");
+        finishOtaCheck(s);
+        return;
+      }
+      job.sigLen = (uint8_t)n;
+      if (!pixc_net::submit(job)) {   // provisioning or a cloud OTA has the worker
+        s.fail("busy");
+        finishOtaCheck(s);
+        return;
+      }
+      _otaCheckRunning = true;
+      answer("{\"otacheck\":\"started\"}");
+    }
+
+    // The worker's part is back: on to the boot from the spare slot, or the result.
+    void applyOtaCheck(const pixc_net::Result& r) {
+      _otaCheckRunning = false;
+      pixc::OtaCheckState s;
+      s.signature = r.signature;
+      s.copy = r.copy;
+      strlcpy(s.orig, r.orig, sizeof(s.orig));
+      strlcpy(s.spare, r.spare, sizeof(s.spare));
+      if (r.signature != pixc::OtaStep::NotRun) otaStepLine("signature", r.signature == pixc::OtaStep::Ok, r.msSignature);
+      if (r.copy != pixc::OtaStep::NotRun) otaStepLine("copy", r.copy == pixc::OtaStep::Ok, r.msCopy);
+      if (s.signature != pixc::OtaStep::Ok || s.copy != pixc::OtaStep::Ok) {
+        s.fail(r.err[0] ? r.err : "failed");
+        finishOtaCheck(s);
+        return;
+      }
+      // Stored before the boot slot changes, so whichever slot starts next finds it.
+      s.phase = pixc::OtaPhase::BootSpare;
+      _otaCheck = s;
+      storeOtaCheck();
+      const esp_partition_t* spare = esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_ANY, s.spare);
+      if (spare == nullptr || esp_ota_set_boot_partition(spare) != ESP_OK) {
+        s.bootSpare = pixc::OtaStep::Fail;
+        s.fail("spare slot: set boot failed");
+        finishOtaCheck(s);
+        return;
+      }
+      otaRestartLine(s.spare);
+      doReboot = true;
+    }
+
+    // The loop's first pass after a restart the check made (pixc::otaCheckOnBoot has the cases).
+    void continueOtaCheck() {
+      pixc::OtaCheckState s = _otaCheck;
+      const char* running = runningSlot();
+      switch (pixc::otaCheckOnBoot(s, running)) {
+        case pixc::OtaBootAction::None:
+          return;
+        case pixc::OtaBootAction::ReturnFromSpare:
+          _otaCheck = s;
+          storeOtaCheck();
+          otaStepLine("boot_spare", true, millis());
+          otaRestartLine(s.orig);
+          // Marked invalid, so the bootloader starts the original slot again; its own boot state is
+          // untouched and nothing raised the anti-rollback floor. Should the mark fail, a plain restart
+          // does the same, because the bootloader aborts an image it still finds PENDING_VERIFY.
+          esp_ota_mark_app_invalid_rollback_and_reboot();
+          esp_restart();
+        case pixc::OtaBootAction::SetBootOriginal: {
+          _otaCheck = s;
+          storeOtaCheck();
+          const esp_partition_t* orig = esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_ANY, s.orig);
+          if (orig != nullptr && esp_ota_set_boot_partition(orig) == ESP_OK) {
+            otaRestartLine(s.orig);
+            esp_restart();
+          }
+          s.back = pixc::OtaStep::Fail;
+          s.fail("original slot: set boot failed");
+          finishOtaCheck(s);
+          return;
+        }
+        case pixc::OtaBootAction::Report:
+          if (s.back == pixc::OtaStep::Ok) {
+            // Back on the original slot. Only after the set-boot return does it boot on probation;
+            // it is the image that ran before the check, so it is confirmed now (not on the broker).
+            esp_ota_img_states_t st;
+            const esp_partition_t* p = esp_ota_get_running_partition();
+            if (p != nullptr && esp_ota_get_state_partition(p, &st) == ESP_OK && st == ESP_OTA_IMG_PENDING_VERIFY &&
+                esp_ota_mark_app_valid_cancel_rollback() == ESP_OK) {
+              _awaitingConfirm = false;
+            }
+            otaStepLine("back", true, millis());
+          } else if (s.bootSpare == pixc::OtaStep::Fail) {
+            otaStepLine("boot_spare", false, millis());
+          } else {
+            otaStepLine("back", false, millis());
+          }
+          finishOtaCheck(s);
+          return;
+      }
+    }
+
+    void serialCommands() {
+      pixcSerialListen(pixc::serialCommandsOpen(uptimeMs(), WLED_WIFI_CONFIGURED));
+      const char* line = pixcSerialPoll();
+      if (line == nullptr) return;
+      const char* arg = "";
+      size_t argLen = 0;
+      switch (pixc::parseSerialCommand(line, &arg, &argLen)) {
+        case pixc::SerialCmd::NotPixc:        return;
+        case pixc::SerialCmd::Unknown:        answer("{\"error\":\"unknown command\"}"); return;
+        case pixc::SerialCmd::Info:           serialInfo(); return;
+        case pixc::SerialCmd::Runcheck:       runcheckStart(); return;
+        case pixc::SerialCmd::Otacheck:       otacheckStart(arg, argLen); return;
+        case pixc::SerialCmd::OtacheckStatus: otacheckStatus(); return;
+        case pixc::SerialCmd::Download:
+          answer("{\"download\":true}");
+          pixcRestartToDownload();
+      }
+    }
+    // AI: end
+
   public:
     void setup() override {
       // Five 1.5-6 s power-ons in a row, then one more: the offline factory reset (pixc::ResetGesture).
+      // Also the board's identity and the BOOT button (pixc_device.h).
       pixcBootCounterOnBoot();
+      loadOtaCheck();
       // The anti-rollback floor: read here, raised to this image's security version only once the
       // image is confirmed (raiseSecurityFloor()) - raising it while on probation would leave a
       // rolled-back previous image refusing its own security version.
@@ -1640,6 +2111,18 @@ class PixcConnectBlink : public Usermod {
       // (`serveJson` picks the target from the URL, so one handler answers them all). The rule
       // above stands anyway, and deliberately: a credential that is only safe because of a check
       // somewhere else is one flag away from not being safe, and this is the flag.
+    }
+
+    // /json/info (on the signed LAN API): the board's identity under `pixc`, null when the factory
+    // data has none or not in the Writer's form (vault: 08-Codebase/Board runcheck, 1).
+    void addToJsonInfo(JsonObject& root) override {
+      JsonObject p = root.createNestedObject("pixc");
+      const char* huid = pixcFactoryHuid();
+      const char* hwRev = pixcFactoryHwRev();
+      if (pixc::validHuid(huid)) p["huid"] = huid;
+      else p["huid"] = (const char*)nullptr;
+      if (pixc::validHwRev(hwRev)) p["hw_rev"] = hwRev;
+      else p["hw_rev"] = (const char*)nullptr;
     }
 
     bool readFromConfig(JsonObject& root) override {
@@ -1917,7 +2400,14 @@ class PixcConnectBlink : public Usermod {
 
     void loop() override {
       const unsigned long now = millis();
-      pixcDeviceLoop();   // the power-cycle gesture's 1.5 s and 6 s marks; runs a pending factory reset
+      if (_firstPass) {   // the board runcheck: the banner, then an OTA check that restarted the board
+        _firstPass = false;
+        banner();
+        continueOtaCheck();
+      }
+      pixcDeviceLoop();   // the power-cycle gesture's 1.5 s and 6 s marks, the BOOT button; runs a pending factory reset
+      serialCommands();
+      runcheckStep(now);
 #ifdef PIXC_LAN_AUTH
       pixcLanLoop();      // applies a pairing validated by /json/pixc/pair
 #endif

@@ -29,14 +29,19 @@ ePixC's code is in `usermods/pixc_connect_blink/`, in the `wled00/pixc_*` files 
   hotspot is `ePixC-XXXX`, WPA2/WPA3 mixed, with a password for each unit from factory NVS
   (printed on the label).
   `/json/pixc/pair` answers on the hotspot only, every other `/json` request must be signed with
-  the light's LAN key, and DDP is taken only from an address that holds a realtime lease.
+  the light's LAN key, and DDP is taken only from an address that holds a realtime lease. Also the
+  factory reset (from the cloud, five short power-ons, or the BOOT button held 10 to 30 s) and the
+  board's identity from factory NVS (`huid`, `hw_rev`).
+- **The board runcheck** (vault: 08-Codebase/Board runcheck): `pixc info`, `pixc runcheck`,
+  `pixc otacheck` and `pixc download` on UART0, which the Writer runs on a board it has just
+  written; accepted only in the first ten minutes after a boot or while no Wi-Fi is configured.
 - **`wled00/pixc_mqtt_client*`**: an esp-mqtt client with AsyncMqttClient's interface, for MQTT
   over WebSocket on 443 (`wss://api.epixc.in/mqtt`) or MQTT over TLS on 8883.
 - **Upstream files ePixC changed** (`wled.cpp`, `wled_server.cpp`, `json.cpp`, `mqtt.cpp`,
   `presets.cpp`, `udp.cpp`, `e131.cpp`, `cfg.cpp`, `util.cpp` and a few more): no CORS, no `/win`,
   no web UI, the UDP control inputs closed, and LAN, MQTT and preset writes filtered.
 - **`tools/factory_provision.py`**: writes the factory NVS image with the hotspot password and
-  prints the label.
+  the board's identity, and prints the label.
 - **`test/pixc/`**: host tests of the ePixC logic (`test/pixc/run.sh`).
 - **`platformio_override.ini`**: the `PixC_V1` target for the ESP32-S3 board ePixC ships, with
   WLED's web UI, Alexa, DMX input, E1.31 and Art-Net, ESP-NOW, the GIF *Image* effect and other

@@ -75,6 +75,15 @@ WIRE_KEYS_V2 = re.compile(
     # The two LAN header names, and the key named in code quotes (`pixc`).
     r"""\bX-PixC-(?:Auth|Sig)\b|`pixc`""")
 
+# The board runcheck's serial protocol (vault: 08-Codebase/Board runcheck): the Writer sends lines
+# `pixc <command>` on UART0 and reads only the answers that start `pixc {`. The word is the protocol,
+# fixed on the Writer's side as the cfg key is on the server's, and only a programming adapter on the
+# board's header ever reads it. Matched by its exact shapes: a command (`pixc info`, `pixc runcheck`,
+# `pixc otacheck`, `pixc download`), and the line as code prints it and comments quote it ("pixc %s,
+# "pixc {, "pixc <command>, "pixc ..., "pixc ").
+SERIAL_PROTOCOL = re.compile(
+    r'\bpixc (?:info|runcheck|otacheck|download)\b|"pixc (?:%s|\{|<command>|\.\.\.)|"pixc "')
+
 
 def main() -> int:
     hits = []
@@ -89,6 +98,7 @@ def main() -> int:
             flat = re.sub(r"\s+", " ", text)
             flat = WIRE_KEYS.sub(" ", flat)
             flat = WIRE_KEYS_V2.sub(" ", flat)
+            flat = SERIAL_PROTOCOL.sub(" ", flat)
             flat = IDENTIFIERS.sub(" ", flat)
             for m in FORBIDDEN.finditer(flat):
                 hits.append(f"  {path}: …{flat[max(0, m.start() - 50):m.start() + 50].strip()}…")
