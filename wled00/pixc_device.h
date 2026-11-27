@@ -74,13 +74,14 @@ bool pixcSerialListening();
 bool pixcSerialFeed(uint8_t b);
 const char* pixcSerialPoll();   // a complete line, or nullptr; valid until the next poll
 
-// The runcheck's `led` check: both outputs, DT1 (GPIO21) and DT2 (GPIO16), each driven alone with a
-// 300-LED frame for a measured frame rate, then both together. The live LED configuration is put
-// back afterwards, exactly as it was, without writing cfg.json. Blocks the loop for about 2 s.
+// The runcheck's `led` check: both outputs, DT1 (GPIO21) and DT2 (GPIO16), each driven on its own,
+// one after the other, with a 300-LED frame for a measured frame rate (two RMT outputs at once do not
+// work on the S3, pixc_device.cpp). The live LED configuration is put back afterwards, exactly as it
+// was, without writing cfg.json. Blocks the loop for about 1.5 s.
 struct PixcLedResult {
   bool ok;
   float fpsDt1, fpsDt2;   // frames per second, each output alone
-  uint32_t frameUs;       // one frame on both outputs together
+  uint32_t frameUs;       // one frame on DT2, the output the light drives
   const char* error;      // nullptr when ok
 };
 PixcLedResult pixcLedTest();

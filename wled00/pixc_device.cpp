@@ -331,47 +331,35 @@ PixcLedResult pixcLedTest() {
   }
   const bool aligned = strip.checkSegmentAlignment();
 
-  // The two test outputs, made the way WLED makes its own (WLED::loop, doInitBusses), each on an RMT
-  // channel: the driver of the shipped configuration (cfg.cpp, "drv" 0), and one that sends each
-  // output on its own, where the S3's parallel I2S sends all of them together.
-  busConfigs.clear();
-  for (uint8_t k = 0; k < 2; k++) {
-    uint8_t pins[OUTPUT_MAX_PINS] = {kTestPins[k], 255, 255, 255, 255};
-    busConfigs.emplace_back(TYPE_WS2812_RGB, pins, k * pixc::kTestLeds, pixc::kTestLeds, COL_ORDER_GRB, false, 0,
-                            RGBW_MODE_MANUAL_ONLY, 0, LED_MILLIAMPS_DEFAULT, ABL_MILLIAMPS_DEFAULT, 0);
-  }
-  strip.finalizeInit();
-  BusManager::setBrightness(255);   // the frame's own levels, whatever the light's brightness
-
-  Bus* out[2] = {nullptr, nullptr};
-  for (uint8_t k = 0; k < 2; k++) {
-    Bus* bus = BusManager::getBus(k);
-    uint8_t pins[OUTPUT_MAX_PINS] = {255, 255, 255, 255, 255};
-    if (bus != nullptr) bus->getPins(pins);
-    if (bus != nullptr && bus->isOk() && !bus->isPlaceholder() && pins[0] == kTestPins[k] &&
-        bus->getLength() == pixc::kTestLeds) out[k] = bus;
-  }
+  // One test output at a time, made the way WLED makes its own (WLED::loop, doInitBusses), on an RMT
+  // channel: the driver of the shipped configuration (cfg.cpp, "drv" 0). One at a time because
+  // NeoPixelBus's IDF 5 RMT method gives each channel all 192 TX memory symbols of the S3: with two
+  // outputs at once the second never sends, and deleting it waits out rmt_tx_wait_all_done's 10 s
+  // until the task watchdog restarts the board (bench, 2026-11-28).
   uint32_t us[2] = {0, 0};
-  for (uint8_t k = 0; k < 2; k++) if (out[k] != nullptr) us[k] = timeOutput(out[k]);
-  if (out[0] != nullptr && out[1] != nullptr && waitIdle(out[0]) && waitIdle(out[1])) {
-    // Both together, through BusManager as every frame of the light goes.
-    const unsigned total = 2 * pixc::kTestLeds;
-    const uint32_t t0 = micros();
-    for (uint16_t f = 0; f < kTestFrames; f++) {
-      for (unsigned i = 0; i < total; i++) BusManager::setPixelColor(i, i % pixc::kTestLeds == f ? kTestDot : kTestBase);
-      BusManager::show();
-    }
-    if (waitIdle(out[0]) && waitIdle(out[1])) r.frameUs = (micros() - t0) / kTestFrames;
-  }
-  // Dark before the outputs go back to the light's own configuration.
+  bool started[2] = {false, false};
   for (uint8_t k = 0; k < 2; k++) {
-    if (out[k] == nullptr) continue;
-    for (unsigned i = 0; i < out[k]->getLength(); i++) out[k]->setPixelColor(i, 0);
-    out[k]->show();
-    waitIdle(out[k]);
+    busConfigs.clear();
+    uint8_t pins[OUTPUT_MAX_PINS] = {kTestPins[k], 255, 255, 255, 255};
+    busConfigs.emplace_back(TYPE_WS2812_RGB, pins, 0, pixc::kTestLeds, COL_ORDER_GRB, false, 0,
+                            RGBW_MODE_MANUAL_ONLY, 0, LED_MILLIAMPS_DEFAULT, ABL_MILLIAMPS_DEFAULT, 0);
+    strip.finalizeInit();
+    BusManager::setBrightness(255);   // the frame's own levels, whatever the light's brightness
+    Bus* bus = BusManager::getBus(0);
+    uint8_t got[OUTPUT_MAX_PINS] = {255, 255, 255, 255, 255};
+    if (bus != nullptr) bus->getPins(got);
+    if (bus == nullptr || !bus->isOk() || bus->isPlaceholder() || got[0] != kTestPins[k] ||
+        bus->getLength() != pixc::kTestLeds) continue;
+    started[k] = true;
+    us[k] = timeOutput(bus);
+    // Dark before the next output, or the light's own configuration, takes the pin.
+    for (unsigned i = 0; i < bus->getLength(); i++) bus->setPixelColor(i, 0);
+    bus->show();
+    waitIdle(bus);
   }
   r.fpsDt1 = pixc::framesPerSecond(kTestFrames, us[0]);
   r.fpsDt2 = pixc::framesPerSecond(kTestFrames, us[1]);
+  r.frameUs = us[1] / kTestFrames;   // DT2 (GPIO16): the output the light drives (DATA_PINS=16)
 
   busConfigs.clear();
   for (const BusConfig& c : kept) busConfigs.push_back(c);
@@ -383,12 +371,11 @@ PixcLedResult pixcLedTest() {
 
   for (uint8_t k = 0; k < 2 && r.error == nullptr; k++) {
     const float fps = k == 0 ? r.fpsDt1 : r.fpsDt2;
-    if (out[k] == nullptr) snprintf(error, sizeof(error), "DT%u (GPIO%u) did not start", k + 1u, (unsigned)kTestPins[k]);
+    if (!started[k]) snprintf(error, sizeof(error), "DT%u (GPIO%u) did not start", k + 1u, (unsigned)kTestPins[k]);
     else if (!pixc::ledFpsPasses(fps)) snprintf(error, sizeof(error), "DT%u (GPIO%u) at %.1f fps", k + 1u, (unsigned)kTestPins[k], fps);
     else continue;
     r.error = error;
   }
-  if (r.error == nullptr && r.frameUs == 0) r.error = "both outputs together did not finish";
   if (BusManager::getNumBusses() != kept.size()) r.error = "LED settings not restored";
   r.ok = r.error == nullptr;
   return r;

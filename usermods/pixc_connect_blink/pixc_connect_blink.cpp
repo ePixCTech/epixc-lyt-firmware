@@ -10,6 +10,7 @@
 // esp_reset_reason(). Reached through Arduino's headers on ESP32 anyway, but named here because
 // this file uses it directly and an implicit include is a trap when the framework moves.
 #include <esp_system.h>
+#include <esp_log.h>
 // heap_caps_*: the health report's internal-RAM figures (free, largest block, low-water mark).
 #include <esp_heap_caps.h>
 // esp_ota_get_state_partition() / esp_ota_mark_app_valid_cancel_rollback(): the app half of
@@ -1984,6 +1985,12 @@ class PixcConnectBlink : public Usermod {
 
   public:
     void setup() override {
+      // NeoPixelBus's IDF 5 RMT method asks whether an output is free with rmt_tx_wait_all_done(channel, 0),
+      // and IDF logs every such poll that finds a frame still sending as "rmt: ... flush timeout". WLED polls
+      // before each frame (four lines a frame on the bench, 2026-11-28), so the UART flooded, the runcheck's
+      // LED test blocked on it until the task watchdog restarted the board, and the runcheck's answers drowned. The
+      // driver's own results are still checked by its callers; only the log goes.
+      esp_log_level_set("rmt", ESP_LOG_NONE);
       // Five 1.5-6 s power-ons in a row, then one more: the offline factory reset (pixc::ResetGesture).
       // Also the board's identity and the BOOT button (pixc_device.h).
       pixcBootCounterOnBoot();
