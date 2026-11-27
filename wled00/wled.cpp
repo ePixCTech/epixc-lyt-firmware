@@ -602,9 +602,9 @@ void WLED::setup()
   WiFi.setScanMethod(WIFI_ALL_CHANNEL_SCAN);
 #ifdef PIXC_LAN_AUTH
   // ePixC (review 2026-11-10): the Wi-Fi driver never stores the home network's name and password
-  // in NVS. wsec.json already holds them, on the filesystem that flash encryption covers (the
-  // `spiffs` row is `encrypted`); NVS is not encrypted (the prebuilt framework has no NVS
-  // encryption), so upstream's copy at the first connection would stay readable from the chip.
+  // in NVS. wsec.json already holds them, on the filesystem; NVS is not encrypted (the prebuilt
+  // framework has no NVS encryption), so upstream's copy at the first connection would be one
+  // more place to read them from the chip.
   // With persistent(false) the driver starts with RAM storage (WiFi.mode() below). Upstream keeps
   // the copy for a faster first connection; bench: cold-boot connect time, and the reconnect after
   // a router restart.
