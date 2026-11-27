@@ -23,6 +23,7 @@
 
 void testLanAuthVectors();   // test_lan_auth.cpp
 void testLanLogic();         // test_lan.cpp
+void testRuncheck();         // test_runcheck.cpp
 
 // ---------------------------------------------------------------------------------------------
 // S1: the usermod must see its own topics after WLED strips the device prefix.
@@ -1055,6 +1056,7 @@ int main() {
   testPinGuardBackoff();
   testPinGuardOwnerNeverLockedOut();
   testPinGuardCeiling();
+  testRuncheck();
   if (g_failures == 0) {
     std::printf("pixc host tests: %d checks passed\n", g_checks);
     return EXIT_SUCCESS;

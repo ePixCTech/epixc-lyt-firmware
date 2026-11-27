@@ -1061,5 +1061,377 @@ inline bool capState(uint8_t& bri, uint8_t& briLast, uint8_t cap) {
   return true;
 }
 
+// ---------------------------------------------------------------------------------------------
+// The board's identity (vault: 08-Codebase/Board runcheck, 1)
+// ---------------------------------------------------------------------------------------------
+// The Writer adds two strings to the factory data (NVS pixc_fac, beside ap_psk): `huid`, "EPX-" and
+// the chip's factory base MAC as 12 upper-case hex digits (esptool read-mac), and `hw_rev`, the
+// batch's board revision, "H" and two digits, "-", a letter and a digit ("H01-E1"). A unit written
+// before them has neither and still runs; its runcheck fails.
+
+constexpr size_t kHuidLen = 16;    // "EPX-" + 12
+constexpr size_t kHwRevLen = 6;    // "H01-E1"
+
+// The HUID a chip with this base MAC carries.
+inline void huidFromMac(const uint8_t mac[6], char* out, size_t cap) {
+  if (out == nullptr || cap == 0) return;
+  if (mac == nullptr || cap < kHuidLen + 1) { out[0] = 0; return; }
+  snprintf(out, cap, "EPX-%02X%02X%02X%02X%02X%02X", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+}
+
+// The MAC as the cloud names the light: 12 lower-case hex digits (WLED's escapedMac).
+inline void macHex(const uint8_t mac[6], char* out, size_t cap) {
+  if (out == nullptr || cap == 0) return;
+  if (mac == nullptr || cap < 13) { out[0] = 0; return; }
+  snprintf(out, cap, "%02x%02x%02x%02x%02x%02x", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+}
+
+// "EPX-" and 12 upper-case hex digits, nothing else.
+inline bool validHuid(const char* s) {
+  if (s == nullptr || strncmp(s, "EPX-", 4) != 0) return false;
+  for (size_t i = 4; i < kHuidLen; i++) {
+    const char c = s[i];
+    if (!((c >= '0' && c <= '9') || (c >= 'A' && c <= 'F'))) return false;
+  }
+  return s[kHuidLen] == 0;
+}
+
+// "H", two digits, "-", an upper-case letter, a digit.
+inline bool validHwRev(const char* s) {
+  if (s == nullptr) return false;
+  const auto digit = [](char c) { return c >= '0' && c <= '9'; };
+  return s[0] == 'H' && digit(s[1]) && digit(s[2]) && s[3] == '-' && s[4] >= 'A' && s[4] <= 'Z' &&
+         digit(s[5]) && s[6] == 0;
+}
+
+// The factory data names this chip: a well-formed HUID made from `mac`. False for data copied from
+// another board.
+inline bool huidMatchesMac(const char* huid, const uint8_t mac[6]) {
+  if (!validHuid(huid) || mac == nullptr) return false;
+  char mine[kHuidLen + 1];
+  huidFromMac(mac, mine, sizeof(mine));
+  return strcmp(huid, mine) == 0;
+}
+
+// ---------------------------------------------------------------------------------------------
+// The serial commands (vault: 08-Codebase/Board runcheck, 2)
+// ---------------------------------------------------------------------------------------------
+// UART0 at 115200. A command is one line, "pixc <command>[ <argument>]"; every answer is one line,
+// "pixc " and one JSON object. Accepted only in the first ten minutes after a boot, or while no
+// Wi-Fi is configured, so a unit in a home stops listening once it has run ten minutes.
+
+constexpr uint32_t kSerialWindowMs = 10UL * 60 * 1000;
+// "pixc otacheck " and a P-256 signature in base64 (72 bytes of DER: 96 characters), with room.
+constexpr size_t kSerialLineMax = 160;
+
+inline bool serialCommandsOpen(uint32_t uptimeMs, bool wifiConfigured) {
+  return uptimeMs < kSerialWindowMs || !wifiConfigured;
+}
+
+// Assembles lines from UART bytes. A line ends at '\n' or '\r' (so "\r\n" is a line and an empty
+// one); an empty line is no line. A line longer than kSerialLineMax is dropped whole, with nothing
+// of it taken for a command. A byte outside printable ASCII spoils its line the same way: it is boot
+// noise or a byte of another protocol, and no command contains one.
+class LineReader {
+ public:
+  // One byte. True when this byte completed a line: line() holds it until the next feed().
+  bool feed(uint8_t b) {
+    if (_done) { _len = 0; _bad = false; _done = false; }
+    if (b == '\n' || b == '\r') {
+      const bool ok = _len > 0 && !_bad;
+      _buf[_len < kSerialLineMax ? _len : kSerialLineMax] = 0;
+      if (ok) { _done = true; return true; }
+      _len = 0;
+      _bad = false;
+      return false;
+    }
+    if (b < 0x20 || b > 0x7e || _len >= kSerialLineMax) { _bad = true; return false; }
+    _buf[_len++] = static_cast<char>(b);
+    return false;
+  }
+  const char* line() const { return _done ? _buf : ""; }
+  void reset() { _len = 0; _bad = false; _done = false; _buf[0] = 0; }
+
+ private:
+  char _buf[kSerialLineMax + 1] = {};
+  size_t _len = 0;
+  bool _bad = false;
+  bool _done = false;
+};
+
+enum class SerialCmd : uint8_t { NotPixc, Unknown, Info, Runcheck, Otacheck, OtacheckStatus, Download };
+
+// What a line asks for. NotPixc for a line that is not "pixc ..." (left alone: it is somebody else's
+// text). `arg` and `argLen` get the argument (Otacheck only; empty when there is none). Words are
+// split by spaces; a command that takes no argument and has one is Unknown.
+inline SerialCmd parseSerialCommand(const char* line, const char** arg, size_t* argLen) {
+  if (arg) *arg = "";
+  if (argLen) *argLen = 0;
+  if (line == nullptr || strncmp(line, "pixc", 4) != 0 || (line[4] != ' ' && line[4] != 0)) return SerialCmd::NotPixc;
+  const char* p = line + 4;
+  while (*p == ' ') p++;
+  const char* word = p;
+  while (*p && *p != ' ') p++;
+  const size_t n = static_cast<size_t>(p - word);
+  while (*p == ' ') p++;
+  const char* rest = p;
+  // The argument without trailing spaces: one word at most.
+  const char* end = rest + strlen(rest);
+  while (end > rest && end[-1] == ' ') end--;
+  bool oneWord = true;
+  for (const char* q = rest; q < end; q++) if (*q == ' ') oneWord = false;
+  const bool none = end == rest;
+  const auto is = [&](const char* w) { return strlen(w) == n && strncmp(word, w, n) == 0; };
+  if (is("info")) return none ? SerialCmd::Info : SerialCmd::Unknown;
+  if (is("runcheck")) return none ? SerialCmd::Runcheck : SerialCmd::Unknown;
+  if (is("download")) return none ? SerialCmd::Download : SerialCmd::Unknown;
+  if (is("otacheck")) {
+    if (!oneWord) return SerialCmd::Unknown;
+    if (static_cast<size_t>(end - rest) == 6 && strncmp(rest, "status", 6) == 0) return SerialCmd::OtacheckStatus;
+    if (arg) *arg = rest;
+    if (argLen) *argLen = static_cast<size_t>(end - rest);
+    return SerialCmd::Otacheck;
+  }
+  return SerialCmd::Unknown;
+}
+
+// Standard base64 (RFC 4648, '+' and '/'), '=' padding optional, nothing else allowed: no spaces,
+// no line breaks. `n` characters of `in` (stops at a NUL before that). Returns the bytes written, or
+// -1 for anything malformed or longer than `cap`.
+inline int base64Decode(const char* in, size_t n, uint8_t* out, size_t cap) {
+  if (in == nullptr || out == nullptr) return -1;
+  size_t len = 0;
+  while (len < n && in[len] != 0) len++;
+  size_t pad = 0;                                    // '=' at the end only; one inside is refused below
+  while (len > 0 && in[len - 1] == '=') { len--; pad++; }
+  if (pad > 2 || (pad > 0 && (len + pad) % 4 != 0) || len % 4 == 1) return -1;
+  uint32_t acc = 0;
+  int bits = 0;
+  size_t o = 0;
+  for (size_t i = 0; i < len; i++) {
+    const char c = in[i];
+    int v;
+    if (c >= 'A' && c <= 'Z') v = c - 'A';
+    else if (c >= 'a' && c <= 'z') v = c - 'a' + 26;
+    else if (c >= '0' && c <= '9') v = c - '0' + 52;
+    else if (c == '+') v = 62;
+    else if (c == '/') v = 63;
+    else return -1;
+    acc = (acc << 6) | static_cast<uint32_t>(v);
+    bits += 6;
+    if (bits >= 8) {
+      bits -= 8;
+      if (o >= cap) return -1;
+      out[o++] = static_cast<uint8_t>((acc >> bits) & 0xFF);
+    }
+  }
+  return static_cast<int>(o);
+}
+
+// ---------------------------------------------------------------------------------------------
+// The runcheck's verdicts (vault: 08-Codebase/Board runcheck, 3)
+// ---------------------------------------------------------------------------------------------
+
+// wifi: a scan found at least one network, and the best one's RSSI is a reading a working radio
+// gives (-95 to -10 dBm; 0 or a positive value is no reading).
+inline bool wifiScanPasses(int networks, int bestRssi) {
+  return networks > 0 && bestRssi >= -95 && bestRssi <= -10;
+}
+
+// led: one output's measured frame rate for a 300-LED frame. At least 60 fps, and no more than the
+// wire allows: 300 LEDs x 24 bits x 1.25 us is 9.0 ms a frame, at most 111 fps, so a rate above
+// kLedFpsMax means the driver returned without sending the frame (an output that never started).
+constexpr uint16_t kTestLeds = 300;
+constexpr float kLedFpsMin = 60.0f;
+constexpr float kLedFpsMax = 125.0f;
+inline bool ledFpsPasses(float fps) { return fps >= kLedFpsMin && fps <= kLedFpsMax; }
+// Frames per second from `frames` frames sent in `us` microseconds; 0 when nothing was measured.
+inline float framesPerSecond(uint32_t frames, uint32_t us) {
+  return us == 0 ? 0.0f : static_cast<float>(frames) * 1000000.0f / static_cast<float>(us);
+}
+
+// ---------------------------------------------------------------------------------------------
+// The BOOT button, SW2 on GPIO0 (vault: 08-Codebase/Board runcheck, 6)
+// ---------------------------------------------------------------------------------------------
+// Held 10 s, the light shows solid amber ("release now"); released between 10 and 30 s, it does the
+// factory reset of the five-power-on gesture. Held 30 s or more, it is ignored: a stuck button or a
+// programming adapter's DTR held low never wipes a unit. Not read in the first 2 s after boot, and a
+// press counts only if it began after the button was seen released then (a level held low through a
+// software restart is not a press). The level is debounced: a change counts once it has held 50 ms,
+// and a hold is timed from the moment the pin went low.
+constexpr uint32_t kButtonIgnoreMs = 2000;
+constexpr uint32_t kButtonHoldMs = 10000;
+constexpr uint32_t kButtonMaxHoldMs = 30000;
+constexpr uint32_t kButtonDebounceMs = 50;
+
+enum class ButtonEvent : uint8_t { None, Amber, Cancel, Reset };
+
+class BootButton {
+ public:
+  // Every loop: the uptime and whether the pin reads pressed (low). Returns what to do now: show
+  // the amber (Amber), stop showing it (Cancel: held too long), or the factory reset (Reset).
+  ButtonEvent tick(uint32_t nowMs, bool pressed) {
+    if (!_started) {
+      if (nowMs < kButtonIgnoreMs) return ButtonEvent::None;
+      _started = true;
+      _raw = _level = pressed;
+      _rawSince = _levelSince = nowMs;
+    }
+    if (pressed != _raw) { _raw = pressed; _rawSince = nowMs; }
+    if (_raw != _level && nowMs - _rawSince >= kButtonDebounceMs) { _level = _raw; _levelSince = _rawSince; }
+    switch (_phase) {
+      case Phase::Wait:
+        if (!_level) _phase = Phase::Idle;
+        return ButtonEvent::None;
+      case Phase::Idle:
+        if (_level) { _phase = Phase::Held; _pressAt = _levelSince; }
+        return ButtonEvent::None;
+      // Timing moves on only while the pin itself reads pressed: a release still inside its debounce
+      // is timed from when it happened, not from when it was confirmed.
+      case Phase::Held:
+        if (!_level) { _phase = Phase::Idle; return ButtonEvent::None; }
+        if (_raw && nowMs - _pressAt >= kButtonHoldMs) { _phase = Phase::Amber; return ButtonEvent::Amber; }
+        return ButtonEvent::None;
+      case Phase::Amber:
+        if (!_level) {
+          const uint32_t held = _levelSince - _pressAt;
+          if (held >= kButtonHoldMs && held < kButtonMaxHoldMs) { _phase = Phase::Done; return ButtonEvent::Reset; }
+          _phase = Phase::Idle;
+          return ButtonEvent::Cancel;
+        }
+        if (_raw && nowMs - _pressAt >= kButtonMaxHoldMs) { _phase = Phase::Ignored; return ButtonEvent::Cancel; }
+        return ButtonEvent::None;
+      case Phase::Ignored:
+        if (!_level) _phase = Phase::Idle;
+        return ButtonEvent::None;
+      case Phase::Done:
+        return ButtonEvent::None;
+    }
+    return ButtonEvent::None;
+  }
+
+ private:
+  enum class Phase : uint8_t { Wait, Idle, Held, Amber, Ignored, Done };
+  Phase _phase = Phase::Wait;
+  bool _started = false;
+  bool _raw = false, _level = false;   // the pin as read, and debounced
+  uint32_t _rawSince = 0, _levelSince = 0, _pressAt = 0;
+};
+
+// ---------------------------------------------------------------------------------------------
+// The OTA check (vault: 08-Codebase/Board runcheck, 4)
+// ---------------------------------------------------------------------------------------------
+// `pixc otacheck <signature>` checks the update path on the board with no Wi-Fi: the running image
+// against the build's signature (the OTA's own verify code and key), a copy into the spare OTA slot
+// verified the same way, then one boot from the spare slot and back. The state crosses the two
+// restarts in NVS (pixc_otack), and the boot after each restart decides from it and the slot it
+// runs from (otaCheckOnBoot):
+//   - the copy verified: the loop sets the spare slot to boot (phase BootSpare) and restarts. The
+//     bootloader starts it on probation (PENDING_VERIFY), so any reset before it is confirmed - a
+//     crash, a power cut - takes the board back to the original slot by itself.
+//   - running the spare slot in BootSpare: boot_spare passed (at the first pass of the loop, so the
+//     whole setup ran); phase Back; the image marks itself invalid and restarts
+//     (esp_ota_mark_app_invalid_rollback_and_reboot), so the bootloader returns to the original
+//     slot, whose own boot state is never touched. Nothing confirms the copy and nothing raises the
+//     anti-rollback floor (pixc_ota/sec): the spare boot is a probation that is ended, not passed.
+//   - running the original slot in Back: back passed, the check is done.
+//   - running the spare slot in Back: the return failed. Once, the original slot is set to boot
+//     again the ordinary way (esp_ota_set_boot_partition) and the board restarts; the original then
+//     boots on probation and the check confirms it at once. A second time, back failed.
+//   - running the original slot in BootSpare: the spare slot did not start (the bootloader rejected
+//     it or it was reset before its loop ran): boot_spare failed.
+// Any failed step ends the check on the original slot.
+
+enum class OtaPhase : uint8_t { None = 0, BootSpare = 1, Back = 2, Done = 3 };
+enum class OtaStep : int8_t { NotRun = -1, Fail = 0, Ok = 1 };
+
+constexpr size_t kOtaLabelMax = 16;   // esp_partition_t.label, less NUL
+constexpr size_t kOtaErrorMax = 47;
+
+struct OtaCheckState {
+  uint8_t version = 1;        // of this layout, as stored
+  OtaPhase phase = OtaPhase::None;
+  OtaStep signature = OtaStep::NotRun;
+  OtaStep copy = OtaStep::NotRun;
+  OtaStep bootSpare = OtaStep::NotRun;
+  OtaStep back = OtaStep::NotRun;
+  uint8_t returns = 0;        // ordinary set-boot returns tried from the spare slot
+  char orig[kOtaLabelMax + 1] = {};
+  char spare[kOtaLabelMax + 1] = {};
+  char error[kOtaErrorMax + 1] = {};
+
+  bool ok() const {
+    return signature == OtaStep::Ok && copy == OtaStep::Ok && bootSpare == OtaStep::Ok && back == OtaStep::Ok;
+  }
+  void fail(const char* why) {
+    if (error[0] == 0 && why != nullptr) strncpy(error, why, kOtaErrorMax);
+    error[kOtaErrorMax] = 0;
+    phase = OtaPhase::Done;
+  }
+};
+
+// A state read back from flash is used only if every field is one this code writes; the strings
+// are terminated here whatever was stored.
+inline bool otaCheckStateValid(OtaCheckState& s) {
+  const auto step = [](OtaStep v) { return v == OtaStep::NotRun || v == OtaStep::Fail || v == OtaStep::Ok; };
+  s.orig[kOtaLabelMax] = 0;
+  s.spare[kOtaLabelMax] = 0;
+  s.error[kOtaErrorMax] = 0;
+  return s.version == 1 && static_cast<uint8_t>(s.phase) <= static_cast<uint8_t>(OtaPhase::Done) &&
+         step(s.signature) && step(s.copy) && step(s.bootSpare) && step(s.back) && s.returns <= 1;
+}
+
+// What a boot does about the check, at the loop's first pass: ReturnFromSpare and SetBootOriginal
+// restart the board, Report prints the result (the check is done).
+enum class OtaBootAction : uint8_t { None, ReturnFromSpare, SetBootOriginal, Report };
+
+// The decision at boot, from the stored state and the label of the slot this boot runs from. It
+// changes `s` to what has to be stored before the action is taken.
+inline OtaBootAction otaCheckOnBoot(OtaCheckState& s, const char* running) {
+  if (s.phase != OtaPhase::BootSpare && s.phase != OtaPhase::Back) return OtaBootAction::None;
+  const bool onOrig = running != nullptr && strcmp(running, s.orig) == 0;
+  const bool onSpare = running != nullptr && strcmp(running, s.spare) == 0;
+  if (s.phase == OtaPhase::BootSpare) {
+    if (onSpare) {
+      s.bootSpare = OtaStep::Ok;
+      s.phase = OtaPhase::Back;
+      return OtaBootAction::ReturnFromSpare;
+    }
+    s.bootSpare = OtaStep::Fail;
+    s.fail(onOrig ? "the spare slot did not start" : "started from an unexpected slot");
+    return OtaBootAction::Report;
+  }
+  if (onOrig) {
+    s.back = OtaStep::Ok;
+    s.phase = OtaPhase::Done;
+    return OtaBootAction::Report;
+  }
+  if (onSpare && s.returns == 0) {
+    s.returns = 1;
+    return OtaBootAction::SetBootOriginal;
+  }
+  s.back = OtaStep::Fail;
+  s.fail(onSpare ? "still on the spare slot" : "started from an unexpected slot");
+  return OtaBootAction::Report;
+}
+
+// {"otacheck":"done","ok":true,"steps":{"signature":true,"copy":true,"boot_spare":true,"back":true}},
+// a step not reached is null, and a failed check carries "error". Returns the length, or 0 when it
+// did not fit (nothing is printed: a cut line is not JSON).
+inline size_t formatOtaCheckDone(char* buf, size_t cap, const OtaCheckState& s) {
+  if (buf == nullptr || cap == 0) return 0;
+  const auto v = [](OtaStep st) { return st == OtaStep::Ok ? "true" : st == OtaStep::Fail ? "false" : "null"; };
+  char err[kOtaErrorMax * 6 + 1];
+  jsonEscape(s.error, err, sizeof(err));
+  const bool ok = s.ok();
+  const int n = snprintf(buf, cap,
+                         "{\"otacheck\":\"done\",\"ok\":%s,\"steps\":{\"signature\":%s,\"copy\":%s,\"boot_spare\":%s,"
+                         "\"back\":%s}%s%s%s}",
+                         ok ? "true" : "false", v(s.signature), v(s.copy), v(s.bootSpare), v(s.back),
+                         (!ok && err[0]) ? ",\"error\":\"" : "", (!ok && err[0]) ? err : "", (!ok && err[0]) ? "\"" : "");
+  if (n <= 0 || static_cast<size_t>(n) >= cap) { buf[0] = 0; return 0; }
+  return static_cast<size_t>(n);
+}
+
 }  // namespace pixc
 // AI: end
