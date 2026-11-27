@@ -5,16 +5,16 @@
 // ePixC device lifecycle: factory reset (every path funnels here), the power-cycle reset counter,
 // the factory hotspot password, and this boot's random id. Compiled with PIXC_LAN_AUTH.
 //
-// One wipe for both triggers - the cloud (`<base>/reset` with {"reset":true}, admin, checked by the
-// server) and five short power-ons in a row, each 1.5-6 s - so they cannot drift apart. There is
-// no LAN reset. The old usermod reset removed cfg.json and wsec.json only, leaving presets, every
-// other file and the Wi-Fi credentials the ESP32 keeps in NVS (audit S12).
+// One wipe for every trigger - the cloud (`<base>/reset` with {"reset":true}, admin, checked by the
+// server), five short power-ons in a row, each 1.5-6 s, and the BOOT button held 10-30 s - so they
+// cannot drift apart. There is no LAN reset. The old usermod reset removed cfg.json and wsec.json
+// only, leaving presets, every other file and the Wi-Fi credentials the ESP32 keeps in NVS (audit S12).
 
 #include <stddef.h>
 #include <stdint.h>
 
 // Ask for a factory reset. The strip flashes amber three times, then pixcFactoryWipeNow() runs
-// from the loop. `why` goes to the debug log ("cloud", "power-cycle").
+// from the loop. `why` goes to the debug log ("cloud", "power-cycle", "button").
 void pixcRequestFactoryReset(const char* why);
 bool pixcFactoryResetPending();
 
@@ -30,8 +30,11 @@ void pixcRebootAfter(uint32_t ms);
 
 // Call once, early in setup: loads the power-cycle gesture from NVS, counts the previous boot if
 // it stayed up 1.5-6 s, and requests the reset when that made five in a row (pixc::ResetGesture).
+// Also reads the board's identity and sets up the BOOT button (GPIO0, internal pull-up).
 void pixcBootCounterOnBoot();
-// Call every loop: arms this boot at 1.5 s, clears the chain at 6 s, and runs a pending reset.
+// Call every loop: arms this boot at 1.5 s, clears the chain at 6 s, times the BOOT button
+// (pixc::BootButton: solid amber at 10 s, the reset on a release before 30 s), and runs a pending
+// reset.
 void pixcDeviceLoop();
 
 // The per-unit hotspot password from factory NVS (`pixc_fac/ap_psk`), or the dev fallback
@@ -52,4 +55,37 @@ extern uint8_t pixcBriMax;
 // A cap from the cloud (pixc::validBriMax, else ignored). A light above it dims to it at once and
 // reports the new level; a stream (DDP) is capped at once too. True when the cap changed.
 bool pixcSetBriMax(int cap);
+
+// --- The board runcheck (vault: 08-Codebase/Board runcheck) ------------------------------------
+
+// The board's identity, read once at boot (pixcBootCounterOnBoot): `huid` and `hw_rev` from factory
+// NVS (pixc_fac) exactly as stored, "" when absent (check them with pixc::validHuid and validHwRev),
+// and the chip's factory base MAC from eFuse (6 bytes, what esptool read-mac prints).
+const char* pixcFactoryHuid();
+const char* pixcFactoryHwRev();
+const uint8_t* pixcBaseMac();
+
+// The serial command line. The usermod says whether commands are taken now (pixc::serialCommandsOpen)
+// and polls for a complete line. With WLED's own serial input compiled in (WLED_ENABLE_ADALIGHT),
+// handleSerial() owns the UART and hands it every byte of a line that starts with 'p'
+// (pixcSerialFeed, true when the line ended); without it (PixC_V1), the poll reads the UART itself.
+void pixcSerialListen(bool on);
+bool pixcSerialListening();
+bool pixcSerialFeed(uint8_t b);
+const char* pixcSerialPoll();   // a complete line, or nullptr; valid until the next poll
+
+// The runcheck's `led` check: both outputs, DT1 (GPIO21) and DT2 (GPIO16), each driven alone with a
+// 300-LED frame for a measured frame rate, then both together. The live LED configuration is put
+// back afterwards, exactly as it was, without writing cfg.json. Blocks the loop for about 2 s.
+struct PixcLedResult {
+  bool ok;
+  float fpsDt1, fpsDt2;   // frames per second, each output alone
+  uint32_t frameUs;       // one frame on both outputs together
+  const char* error;      // nullptr when ok
+};
+PixcLedResult pixcLedTest();
+
+// Restart into the ROM's serial download mode (RTC_CNTL_FORCE_DOWNLOAD_BOOT), so a board running
+// this firmware is written again with no button. Does not return.
+[[noreturn]] void pixcRestartToDownload();
 // AI: end

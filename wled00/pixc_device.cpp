@@ -8,14 +8,21 @@
 
 #include <Preferences.h>
 #include <esp_core_dump.h>
+#include <esp_mac.h>
 #include <esp_random.h>
 #include <esp_system.h>
 #include <esp_wifi.h>
 #include <nvs_flash.h>
+#include <soc/rtc_cntl_reg.h>
 
 namespace {
 constexpr const char* kNsReset = "pixc_rst";      // the power-cycle gesture (pixc::ResetGesture)
-constexpr const char* kNsFactory = "pixc_fac";    // written by tools/factory_provision.py
+constexpr const char* kNsFactory = "pixc_fac";    // written by the Writer (tools/factory_provision.py on the bench)
+constexpr const char* kNsOtaCheck = "pixc_otack"; // the OTA check across its restarts (the usermod)
+constexpr uint8_t kBootButtonPin = 0;             // SW2, BOOT: a strapping pin, low at reset = download mode
+constexpr uint32_t kAmber = RGBW32(255, 110, 0, 0);
+constexpr uint8_t kAmberBri = 160;
+constexpr uint32_t kAmberRepaintMs = 100;
 
 bool resetPending = false;
 uint32_t rebootAt = 0;
@@ -24,17 +31,90 @@ bool gestureLoaded = false;
 const char* resetWhy = "";
 char bootId[9] = "";
 
+// The board's identity (pixcFactoryHuid and friends).
+char factoryHuid[33] = "";
+char factoryHwRev[33] = "";
+uint8_t baseMac[6] = {};
+
+pixc::BootButton bootButton;
+bool buttonReady = false;
+bool amberHeld = false;            // held 10 s: solid amber until it is released
+uint32_t amberPaintedAt = 0;
+
+pixc::LineReader serialLine;
+bool serialListening = false;
+
+// Every LED one colour, straight to the outputs, at `b` (0-255, as strip.setBrightness() takes it:
+// the power plan's cap and the gamma applied here too). Not strip.setPixelColor() and strip.show():
+// show() builds the frame again from the segments (WS2812FX::show), so pixels set before it never
+// reach the LEDs.
+void paintAll(uint32_t col, uint8_t b) {
+  b = pixc::capBri(b, pixcBriMax);
+  if (gammaCorrectBri) b = gamma8(b);
+  BusManager::setBrightness(scaledBri(b));
+  const unsigned n = strip.getLengthTotal();
+  for (unsigned i = 0; i < n; i++) BusManager::setPixelColor(i, col);
+  BusManager::show();
+}
+
 void flashAmberThreeTimes() {
   // Blocking on purpose: nothing else matters now, and the loop watchdog is 20 s.
-  const uint16_t n = strip.getLengthTotal();
-  strip.setBrightness(160, true);
   for (uint8_t k = 0; k < 3; k++) {
-    for (uint16_t i = 0; i < n; i++) strip.setPixelColor(i, RGBW32(255, 110, 0, 0));
-    strip.show();
+    paintAll(kAmber, kAmberBri);
     delay(350);
-    for (uint16_t i = 0; i < n; i++) strip.setPixelColor(i, 0);
-    strip.show();
+    paintAll(0, kAmberBri);
     delay(250);
+  }
+}
+
+void readIdentity() {
+  Preferences p;
+  if (p.begin(kNsFactory, true)) {
+    // A value too long for the buffer reads as absent (Preferences::getString leaves it empty).
+    if (p.isKey("huid")) p.getString("huid", factoryHuid, sizeof(factoryHuid));
+    if (p.isKey("hw_rev")) p.getString("hw_rev", factoryHwRev, sizeof(factoryHwRev));
+    p.end();
+  }
+  // Reported as stored, so a wrong value can be read on the serial line, but printable: a byte
+  // outside printable ASCII becomes '?'.
+  for (char* v : {factoryHuid, factoryHwRev}) {
+    for (char* c = v; *c; c++) if (*c < 0x20 || *c > 0x7e) *c = '?';
+  }
+  // The factory MAC from eFuse, as esptool read-mac reads it: not the station MAC WLED uses, which a
+  // custom base MAC could change.
+  if (esp_efuse_mac_get_default(baseMac) != ESP_OK) memset(baseMac, 0, sizeof(baseMac));
+}
+
+void buttonLoop() {
+  if (!buttonReady || resetPending) return;
+  const uint32_t now = millis();
+  switch (bootButton.tick(now, digitalRead(kBootButtonPin) == LOW)) {
+    case pixc::ButtonEvent::Amber:
+      DEBUG_PRINTLN(F("[ePixC] BOOT held 10 s: release to reset"));
+      amberHeld = true;
+      amberPaintedAt = 0;
+      break;
+    case pixc::ButtonEvent::Cancel:
+      // Held 30 s: a stuck button or a programming adapter's DTR. The light goes back to its state.
+      DEBUG_PRINTLN(F("[ePixC] BOOT held 30 s: ignored"));
+      amberHeld = false;
+      BusManager::setBrightness(scaledBri(strip.getBrightness()));
+      strip.resume();
+      strip.trigger();
+      break;
+    case pixc::ButtonEvent::Reset:
+      amberHeld = false;
+      pixcRequestFactoryReset("button");   // the three flashes and the wipe follow in this pass
+      break;
+    case pixc::ButtonEvent::None:
+      break;
+  }
+  if (amberHeld) {
+    strip.suspend();   // every pass: a state change elsewhere resumes the strip (restartRuntime)
+    if (amberPaintedAt == 0 || now - amberPaintedAt >= kAmberRepaintMs) {
+      paintAll(kAmber, kAmberBri);
+      amberPaintedAt = now ? now : 1;
+    }
   }
 }
 }  // namespace
@@ -54,10 +134,11 @@ void pixcFactoryWipeNow() {
   // driver stores no credentials there (wled.cpp: WiFi.persistent(false)); a board that ran an
   // older image may still hold the copy upstream WLED writes at the first connection.
   esp_wifi_restore();
-  // The reset counter, a pending broker login, and the energy log: its hours not yet acknowledged
-  // would otherwise reach the cloud under the next owner's pairing (review 2026-11-10). pixc_fac
-  // (the label's data) and pixc_ota (the anti-rollback floor) stay.
-  for (const char* ns : {kNsReset, "pixc_prov", "pixc_e"}) {
+  // The reset counter, a pending broker login, the energy log (its hours not yet acknowledged
+  // would otherwise reach the cloud under the next owner's pairing, review 2026-11-10) and the last
+  // OTA check. pixc_fac (the label's data and the board's identity) and pixc_ota (the anti-rollback
+  // floor) stay.
+  for (const char* ns : {kNsReset, "pixc_prov", "pixc_e", kNsOtaCheck}) {
     Preferences p;
     if (p.begin(ns, false)) { p.clear(); p.end(); }
   }
@@ -81,6 +162,17 @@ void storeGesture() {
 }
 
 void pixcBootCounterOnBoot() {
+  readIdentity();
+  // A board started from the ROM's download mode without a reset (esptool's `run`) still has the
+  // force-download flag of `pixc download` set, and would drop into download mode again at its
+  // next software restart - the OTA check's two among them.
+  REG_CLR_BIT(RTC_CNTL_OPTION1_REG, RTC_CNTL_FORCE_DOWNLOAD_BOOT);
+  // SW2 (BOOT) on GPIO0, which the light did not use before (BTNPIN=-1). The internal pull-up holds it
+  // high; the button and the programming adapter's DTR can only pull it low.
+  if (PinManager::allocatePin(kBootButtonPin, false, PinOwner::UM_Unspecified)) {
+    pinMode(kBootButtonPin, INPUT_PULLUP);
+    buttonReady = true;
+  }
   // Only a power-up counts, and only one that stayed up 1.5-6 s (pixc::ResetGesture). RTC memory does
   // not survive a power cut on the ESP32-S3 - the cut is the very event being counted - so the
   // state lives in NVS: one or two one-byte writes per boot. A crash, watchdog or software reboot
@@ -105,6 +197,7 @@ void pixcRebootAfter(uint32_t ms) { rebootAt = millis() + (ms ? ms : 1); }
 void pixcDeviceLoop() {
   if (rebootAt != 0 && (long)(millis() - rebootAt) >= 0) { rebootAt = 0; doReboot = true; }
   if (gestureLoaded && gesture.tick(millis())) storeGesture();
+  buttonLoop();
   if (resetPending) {
     flashAmberThreeTimes();
     pixcFactoryWipeNow();
@@ -146,6 +239,168 @@ bool pixcSetBriMax(int cap) {
   if (pixc::capState(bri, briLast, pixcBriMax)) stateUpdated(CALL_MODE_DIRECT_CHANGE);
   DEBUG_PRINTF("[ePixC] brightness cap %u\n", (unsigned)pixcBriMax);
   return true;
+}
+
+// --- The board runcheck (vault: 08-Codebase/Board runcheck) ------------------------------------
+
+const char* pixcFactoryHuid() { return factoryHuid; }
+const char* pixcFactoryHwRev() { return factoryHwRev; }
+const uint8_t* pixcBaseMac() { return baseMac; }
+
+namespace {
+bool serialPending = false;   // serialLine holds a complete line nobody has taken yet
+}  // namespace
+
+void pixcSerialListen(bool on) {
+  if (serialListening && !on) { serialLine.reset(); serialPending = false; }
+  serialListening = on;
+}
+
+bool pixcSerialListening() { return serialListening; }
+
+bool pixcSerialFeed(uint8_t b) {
+  const bool done = serialLine.feed(b);
+  if (done) serialPending = true;
+  return done;
+}
+
+const char* pixcSerialPoll() {
+  if (!serialListening) return nullptr;
+#ifndef WLED_ENABLE_ADALIGHT
+  // WLED's serial input is compiled out (WLED_DISABLE_ADALIGHT in PixC_V1: no Adalight, Improv or
+  // JSON over the UART), so nothing else reads it. One line at a time: the rest waits in the UART.
+  while (!serialPending && serialCanRX && Serial.available() > 0) pixcSerialFeed((uint8_t)Serial.read());
+#endif
+  if (!serialPending) return nullptr;
+  serialPending = false;
+  return serialLine.line();
+}
+
+namespace {
+// H01 Rev E1: DT1 is driven from GPIO21 and DT2 from GPIO16 (the shipped DATA_PINS), both through
+// the TXS0102. A frame is a dim strip with one brighter dot that moves a LED each frame, so a strip
+// on the bench shows both outputs working; none needs to be attached.
+constexpr uint8_t kTestPins[2] = {21, 16};
+constexpr uint16_t kTestFrames = 60;
+constexpr uint32_t kTestBase = RGBW32(4, 4, 4, 0);
+constexpr uint32_t kTestDot = RGBW32(48, 48, 48, 0);
+constexpr uint32_t kTestIdleTimeoutUs = 100000;   // ten frames' time for the last one to leave
+
+bool waitIdle(Bus* bus) {
+  const uint32_t t0 = micros();
+  while (!bus->canShow()) {
+    if (micros() - t0 > kTestIdleTimeoutUs) return false;
+  }
+  return true;
+}
+
+// kTestFrames frames on one output alone: the microseconds from the first frame's start to the
+// last one's end, 0 when the output never went idle. The driver sends a frame in the background
+// and its next show() waits for it, so this is the rate the output really reaches.
+uint32_t timeOutput(Bus* bus) {
+  const unsigned len = bus->getLength();
+  if (len == 0 || !waitIdle(bus)) return 0;
+  const uint32_t t0 = micros();
+  for (uint16_t f = 0; f < kTestFrames; f++) {
+    for (unsigned i = 0; i < len; i++) bus->setPixelColor(i, i == f % len ? kTestDot : kTestBase);
+    bus->show();
+  }
+  if (!waitIdle(bus)) return 0;
+  return micros() - t0;
+}
+}  // namespace
+
+PixcLedResult pixcLedTest() {
+  static char error[48];
+  PixcLedResult r = {false, 0.0f, 0.0f, 0, nullptr};
+  if (doInitBusses) { r.error = "LED settings are being changed"; return r; }
+
+  // The live configuration, read back off the buses as the usermod's applyLedWidth() does, to put
+  // back afterwards. cfg.json is not touched: the configuration does not change.
+  std::vector<BusConfig> kept;
+  kept.reserve(BusManager::getNumBusses());
+  for (size_t i = 0; i < BusManager::getNumBusses(); i++) {
+    const Bus* bus = BusManager::getBus(i);
+    if (bus == nullptr) break;
+    uint8_t pins[OUTPUT_MAX_PINS] = {255, 255, 255, 255, 255};
+    bus->getPins(pins);
+    const uint8_t type = (bus->getType() & 0x7F) | (bus->isOffRefreshRequired() ? 0x80 : 0x00);
+    kept.emplace_back(type, pins, bus->getStart(), bus->getLength(), bus->getColorOrder(), bus->isReversed(),
+                      bus->skippedLeds(), bus->getAutoWhiteMode(), bus->getFrequency(), bus->getLEDCurrent(),
+                      bus->getMaxCurrent(), bus->getDriverType());
+  }
+  const bool aligned = strip.checkSegmentAlignment();
+
+  // The two test outputs, made the way WLED makes its own (WLED::loop, doInitBusses), each on an RMT
+  // channel: the driver of the shipped configuration (cfg.cpp, "drv" 0), and one that sends each
+  // output on its own, where the S3's parallel I2S sends all of them together.
+  busConfigs.clear();
+  for (uint8_t k = 0; k < 2; k++) {
+    uint8_t pins[OUTPUT_MAX_PINS] = {kTestPins[k], 255, 255, 255, 255};
+    busConfigs.emplace_back(TYPE_WS2812_RGB, pins, k * pixc::kTestLeds, pixc::kTestLeds, COL_ORDER_GRB, false, 0,
+                            RGBW_MODE_MANUAL_ONLY, 0, LED_MILLIAMPS_DEFAULT, ABL_MILLIAMPS_DEFAULT, 0);
+  }
+  strip.finalizeInit();
+  BusManager::setBrightness(255);   // the frame's own levels, whatever the light's brightness
+
+  Bus* out[2] = {nullptr, nullptr};
+  for (uint8_t k = 0; k < 2; k++) {
+    Bus* bus = BusManager::getBus(k);
+    uint8_t pins[OUTPUT_MAX_PINS] = {255, 255, 255, 255, 255};
+    if (bus != nullptr) bus->getPins(pins);
+    if (bus != nullptr && bus->isOk() && !bus->isPlaceholder() && pins[0] == kTestPins[k] &&
+        bus->getLength() == pixc::kTestLeds) out[k] = bus;
+  }
+  uint32_t us[2] = {0, 0};
+  for (uint8_t k = 0; k < 2; k++) if (out[k] != nullptr) us[k] = timeOutput(out[k]);
+  if (out[0] != nullptr && out[1] != nullptr && waitIdle(out[0]) && waitIdle(out[1])) {
+    // Both together, through BusManager as every frame of the light goes.
+    const unsigned total = 2 * pixc::kTestLeds;
+    const uint32_t t0 = micros();
+    for (uint16_t f = 0; f < kTestFrames; f++) {
+      for (unsigned i = 0; i < total; i++) BusManager::setPixelColor(i, i % pixc::kTestLeds == f ? kTestDot : kTestBase);
+      BusManager::show();
+    }
+    if (waitIdle(out[0]) && waitIdle(out[1])) r.frameUs = (micros() - t0) / kTestFrames;
+  }
+  // Dark before the outputs go back to the light's own configuration.
+  for (uint8_t k = 0; k < 2; k++) {
+    if (out[k] == nullptr) continue;
+    for (unsigned i = 0; i < out[k]->getLength(); i++) out[k]->setPixelColor(i, 0);
+    out[k]->show();
+    waitIdle(out[k]);
+  }
+  r.fpsDt1 = pixc::framesPerSecond(kTestFrames, us[0]);
+  r.fpsDt2 = pixc::framesPerSecond(kTestFrames, us[1]);
+
+  busConfigs.clear();
+  for (const BusConfig& c : kept) busConfigs.push_back(c);
+  strip.finalizeInit();
+  if (aligned) strip.makeAutoSegments();
+  else strip.fixInvalidSegments();
+  BusManager::setBrightness(scaledBri(bri));
+  strip.trigger();
+
+  for (uint8_t k = 0; k < 2 && r.error == nullptr; k++) {
+    const float fps = k == 0 ? r.fpsDt1 : r.fpsDt2;
+    if (out[k] == nullptr) snprintf(error, sizeof(error), "DT%u (GPIO%u) did not start", k + 1u, (unsigned)kTestPins[k]);
+    else if (!pixc::ledFpsPasses(fps)) snprintf(error, sizeof(error), "DT%u (GPIO%u) at %.1f fps", k + 1u, (unsigned)kTestPins[k], fps);
+    else continue;
+    r.error = error;
+  }
+  if (r.error == nullptr && r.frameUs == 0) r.error = "both outputs together did not finish";
+  if (BusManager::getNumBusses() != kept.size()) r.error = "LED settings not restored";
+  r.ok = r.error == nullptr;
+  return r;
+}
+
+void pixcRestartToDownload() {
+  Serial.flush();
+  // Read by the ROM at the next reset: it starts its serial download mode, as with BOOT held. A
+  // reset does not clear it: esptool clears it before its own hard reset (arduino-esp32 issue 6762,
+  // boards stuck in download mode), and pixcBootCounterOnBoot at our next boot.
+  REG_SET_BIT(RTC_CNTL_OPTION1_REG, RTC_CNTL_FORCE_DOWNLOAD_BOOT);
+  esp_restart();
 }
 // AI: end
 

@@ -1,4 +1,7 @@
 #include "wled.h"
+#ifdef PIXC_LAN_AUTH
+#include "pixc_device.h"
+#endif
 
 // forward declarations
 static void sendBytes();
@@ -20,6 +23,9 @@ enum class AdaState {
   TPM2_Header_Type,
   TPM2_Header_CountHi,
   TPM2_Header_CountLo,
+#ifdef PIXC_LAN_AUTH
+  Pixc_Line,           // ePixC: a "pixc ..." command line, to its end (pixc_device.h)
+#endif
 };
 
 static uint16_t currentBaud = 1152; //default baudrate 115200 (divided by 100)
@@ -90,6 +96,11 @@ void handleSerial()
         if      (next == 'A')  { state = AdaState::Header_d; }
         else if (next == 0xC9) { state = AdaState::TPM2_Header_Type; } //TPM2 start byte
         else if (next == 'I')  { handleImprovPacket(); return; }
+#ifdef PIXC_LAN_AUTH
+        // ePixC: the runcheck's command lines ("pixc info"). 'p' starts nothing else here, and the line's
+        // other bytes ('l', 'O', 'I', '{', ...) must not be read as single-byte commands.
+        else if (next == 'p' && pixcSerialListening()) { pixcSerialFeed(next); state = AdaState::Pixc_Line; }
+#endif
         else if (next == 'v')  { Serial.print("WLED"); Serial.write(' '); Serial.println(VERSION); }
         else if (next == 0xB0) { updateBaudRate( 115200); }
         else if (next == 0xB1) { updateBaudRate( 230400); }
@@ -165,6 +176,16 @@ void handleSerial()
         count += next /3;
         state = AdaState::Data_Red;
         break;
+#ifdef PIXC_LAN_AUTH
+      case AdaState::Pixc_Line:
+        if (!pixcSerialListening()) { state = AdaState::Header_A; break; }
+        if (pixcSerialFeed(next) || next == '\n' || next == '\r') {
+          state = AdaState::Header_A;
+          Serial.read(); // the line's end; the usermod takes the line (pixcSerialPoll) before more is read
+          return;
+        }
+        break;
+#endif
       case AdaState::Data_Red:
         red   = next;
         state = AdaState::Data_Green;
